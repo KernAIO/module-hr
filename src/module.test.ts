@@ -17,15 +17,15 @@
 import type { Kernel } from '@kernhq/kernel'
 import { describe, expect, it } from 'vitest'
 import {
-  MODULE_ID,
   hrCapabilities,
   hrCapabilityProcedures,
   hrContract,
   hrEvents,
   hrPermissions,
-} from './contract.js'
-import { implement_ } from './server/_impl.js'
+  MODULE_ID,
+} from './contract/index.js'
 import { hrModule } from './server/index.js'
+import { implement_ } from './server/router.js'
 
 /** An oRPC procedure (contract or implementation) carries `~orpc`; a router group does not. */
 interface Leaf {
@@ -67,11 +67,34 @@ describe('the contract and the router agree', () => {
 /** Procedure names the contract says sit behind some capability. */
 const gated = new Set(Object.values(hrCapabilityProcedures).flat())
 
+/**
+ * Procedures that deliberately carry no `requires()`.
+ *
+ * An allowlist rather than a looser rule, because "this one is fine without a permission" is a claim
+ * that deserves to be written down and reviewed. Each entry is a procedure that acts on the caller's
+ * own record, where a permission nobody could ever lack would be noise in the role editor — the
+ * handler checks identity instead, which is stronger than any grantable key.
+ */
+const SELF_SERVICE = new Set(['people.me'])
+
 describe('every procedure is authorised', () => {
   it('carries both the workspace/module gate and a permission check', () => {
     for (const [name, leaf] of Object.entries(implemented)) {
+      if (SELF_SERVICE.has(name)) continue
       // `workspaceScoped(MODULE_ID)` + `requires('<permission>')`
       expect(leaf['~orpc'].middlewares?.length ?? 0, `${name} middlewares`).toBeGreaterThanOrEqual(2)
+    }
+  })
+
+  it('still puts every self-service procedure behind the workspace gate', () => {
+    // No permission is not the same as no check: these must still prove a real membership and that
+    // the workspace has HR switched on.
+    for (const name of SELF_SERVICE) {
+      expect(implemented[name], `${name} is allowlisted but not implemented`).toBeDefined()
+      expect(
+        implemented[name]?.['~orpc'].middlewares?.length ?? 0,
+        `${name} still needs workspaceScoped()`,
+      ).toBeGreaterThanOrEqual(1)
     }
   })
 
@@ -102,8 +125,7 @@ describe('every procedure is authorised', () => {
 describe('the module declares what it uses', () => {
   it('names its permissions and events under its own module id', () => {
     for (const p of hrPermissions) expect(p.key.startsWith(`${MODULE_ID}.`), p.key).toBe(true)
-    for (const e of Object.values(hrEvents))
-      expect(e.name.startsWith(`${MODULE_ID}.`), e.name).toBe(true)
+    for (const e of Object.values(hrEvents)) expect(e.name.startsWith(`${MODULE_ID}.`), e.name).toBe(true)
   })
 
   it('registers those permissions and events on the server module', () => {

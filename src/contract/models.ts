@@ -18,7 +18,10 @@ export type IsoDate = z.infer<typeof IsoDate>
 export const TimeZone = z.string().min(1).max(64)
 
 /** ISO 3166-1 alpha-2, upper case: `TR`, `NL`, `DE`. */
-export const CountryCode = z.string().length(2).regex(/^[A-Z]{2}$/)
+export const CountryCode = z
+  .string()
+  .length(2)
+  .regex(/^[A-Z]{2}$/)
 /** ISO 3166-2 subdivision, without the country prefix: `34` for Istanbul, `BY` for Bavaria. */
 export const RegionCode = z.string().min(1).max(8)
 
@@ -31,13 +34,7 @@ const ws = { workspaceId: WorkspaceId }
 // people
 // =====================================================================================
 
-export const PersonStatus = z.enum([
-  'onboarding',
-  'active',
-  'on_leave',
-  'offboarding',
-  'terminated',
-])
+export const PersonStatus = z.enum(['onboarding', 'active', 'on_leave', 'offboarding', 'terminated'])
 export type PersonStatus = z.infer<typeof PersonStatus>
 
 export const Person = z.object({
@@ -287,7 +284,11 @@ export const FieldType = z.enum(['text', 'number', 'date', 'select', 'multi_sele
 export const CustomFieldDef = z.object({
   id: z.uuid(),
   ...ws,
-  key: z.string().min(1).max(48).regex(/^[a-z][a-z0-9_]*$/),
+  key: z
+    .string()
+    .min(1)
+    .max(48)
+    .regex(/^[a-z][a-z0-9_]*$/),
   name: z.string().min(1).max(120),
   type: FieldType,
   options: z.array(z.object({ value: z.string(), label: z.string() })).nullable(),
@@ -398,7 +399,14 @@ export type ResolvedCalendarDay = z.infer<typeof ResolvedCalendarDay>
 // resolution — the ladder, made inspectable
 // =====================================================================================
 
-export const ResolutionRung = z.enum(['person', 'office', 'legal_entity', 'org_unit', 'position', 'workspace'])
+export const ResolutionRung = z.enum([
+  'person',
+  'office',
+  'legal_entity',
+  'org_unit',
+  'position',
+  'workspace',
+])
 export type ResolutionRung = z.infer<typeof ResolutionRung>
 
 /**

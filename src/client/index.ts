@@ -1,6 +1,6 @@
 import { createModuleClient, type KernClientOptions } from '@kernhq/sdk'
 import type { ContractRouterClient } from '@orpc/contract'
-import type { HrContract } from '../contract.js'
+import type { HrContract } from '../contract/index.js'
 
 /**
  * The client half.
@@ -23,26 +23,40 @@ export function createHrClient(opts: KernClientOptions): HrApi {
 }
 
 export {
-  MODULE_ID,
-  type Note,
+  type Calendar,
+  type CalendarDay,
+  type CostCenter,
+  type CustomFieldDef,
+  type Employment,
+  HR_PERMISSIONS,
   hrCapabilities,
   hrPermissions,
-} from '../contract.js'
-
-/** The permission keys, so the app gates on a constant rather than a string it retyped. */
-export const HR_PERMISSIONS = {
-  view: 'hr.note.view',
-  manage: 'hr.note.manage',
-} as const
+  type IsoDate,
+  type LegalEntity,
+  MODULE_ID,
+  type Office,
+  type OfficeAssignment,
+  type OrgUnit,
+  type Person,
+  type PersonDocument,
+  type PersonResolution,
+  type PersonStatus,
+  type Position,
+  type ResolvedCalendarDay,
+  type WorkingWeek,
+} from '../contract/index.js'
 
 /**
- * The capability ids, for the same reason.
+ * The capability ids, so a client contribution gates on a constant rather than a retyped string.
  *
- * A client contribution names its own module's capability unqualified — `capability: 'archive'` —
- * because from inside a module there is only one namespace. The shell prefixes it with this
- * module's id when it builds the workspace's set, which is where several modules' capabilities meet.
+ * Named unqualified — `capability: HR_CAPABILITIES.offices` gives `'offices'`, not `'hr.offices'` —
+ * because from inside a module there is only one namespace. The shell adds this module's id when it
+ * builds the workspace's set, which is where several modules' capabilities meet.
  */
 export const HR_CAPABILITIES = {
-  notes: 'notes',
-  archive: 'archive',
+  core: 'core',
+  offices: 'offices',
+  legalEntities: 'legal_entities',
+  calendars: 'calendars',
+  documents: 'documents',
 } as const
