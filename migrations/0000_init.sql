@@ -1,3 +1,16 @@
+-- Extensions this module's own schema needs.
+--
+-- `core` creates these too, and in a real instance it migrates first — but a module must not depend
+-- on another module's migration having run. `hr` can be hosted by a service that does not carry
+-- core, and its tests boot it alone against a scratch database, where `ltree` would not exist.
+-- `if not exists` makes saying so twice free.
+--
+-- Re-add this block after `pnpm db:generate`: drizzle-kit rewrites this file and does not know
+-- about it, the same way it does not know the schema is created before migrations run.
+CREATE EXTENSION IF NOT EXISTS ltree;
+--> statement-breakpoint
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+--> statement-breakpoint
 CREATE SCHEMA IF NOT EXISTS "mod_hr";
 --> statement-breakpoint
 CREATE TABLE "mod_hr"."calendar_days" (

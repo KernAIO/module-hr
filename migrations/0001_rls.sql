@@ -98,8 +98,6 @@ create policy "calendar_days_ws_isolation" on "mod_hr"."calendar_days"
 -- them here means the loser gets a constraint violation instead of the system holding two
 -- contradictory answers to a question an auditor will eventually ask.
 
-create extension if not exists btree_gist;--> statement-breakpoint
-
 -- One workspace, one default office. It is where a person with no assignment lands and where the
 -- resolution ladder bottoms out, so two of them would make "which calendar applies" ambiguous.
 create unique index "hr_offices_one_default_per_ws"
