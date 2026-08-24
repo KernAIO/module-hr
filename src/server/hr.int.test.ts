@@ -232,14 +232,12 @@ describe('the constraints refuse what application code must not have to', () => 
   it('refuses two employment rows that overlap', async () => {
     const person = randomUUID()
     await run((tx) =>
-      tx
-        .insert(employments)
-        .values({
-          workspaceId: WS_A,
-          personId: person,
-          effectiveFrom: '2026-01-01',
-          effectiveTo: '2026-06-30',
-        }),
+      tx.insert(employments).values({
+        workspaceId: WS_A,
+        personId: person,
+        effectiveFrom: '2026-01-01',
+        effectiveTo: '2026-06-30',
+      }),
     )
     const name = await constraintViolated(() =>
       run((tx) =>
