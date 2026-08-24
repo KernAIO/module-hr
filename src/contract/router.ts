@@ -1,6 +1,23 @@
 import { baseContract, PageInput, page, WorkspaceId } from '@kernhq/contracts'
 import { z } from 'zod'
 import {
+  ApprovalChain,
+  ApprovalChainSpec,
+  ApprovalRequest,
+  ApprovalSubjectType,
+  Delegation,
+} from './approvals.js'
+import {
+  DayPart,
+  LeaveBalance,
+  LeaveLedgerEntry,
+  LeaveRequest,
+  LeaveSimulation,
+  LeaveType,
+  LeaveUnit,
+  LedgerKind,
+} from './leave.js'
+import {
   Calendar,
   CalendarDayKind,
   CostCenter,
@@ -565,6 +582,274 @@ export const hrContract = {
     remove: baseContract
       .route({ method: 'DELETE', path: '/people/{personId}/documents/{documentId}', tags: t })
       .input(ws.extend({ personId: z.uuid(), documentId: z.uuid() }))
+      .output(ok),
+  },
+
+  // ---------------------------------------------------------------- leave
+  leave: {
+    types: {
+      list: baseContract
+        .route({ method: 'GET', path: '/leave/types', tags: t })
+        .input(ws.extend({ includeArchived: z.boolean().default(false) }))
+        .output(z.array(LeaveType)),
+      create: baseContract
+        .route({ method: 'POST', path: '/leave/types', tags: t })
+        .input(
+          ws.extend({
+            key: z.string().min(1).max(48),
+            name: z.string().min(1).max(120),
+            paid: z.boolean().default(true),
+            unit: LeaveUnit.default('day'),
+            color: z.string().max(32).nullish(),
+            icon: z.string().max(48).nullish(),
+            requiresDocumentAfterDays: z.number().int().min(1).nullish(),
+            countsWorkingDaysOnly: z.boolean().default(true),
+            allowNegative: z.boolean().default(false),
+            maxNegativeMinutes: z.number().int().min(0).default(0),
+          }),
+        )
+        .output(LeaveType),
+      update: baseContract
+        .route({ method: 'PATCH', path: '/leave/types/{leaveTypeId}', tags: t })
+        .input(
+          ws.extend({
+            leaveTypeId: z.uuid(),
+            name: z.string().min(1).max(120).optional(),
+            paid: z.boolean().optional(),
+            color: z.string().max(32).nullish(),
+            icon: z.string().max(48).nullish(),
+            requiresDocumentAfterDays: z.number().int().min(1).nullish(),
+            countsWorkingDaysOnly: z.boolean().optional(),
+            allowNegative: z.boolean().optional(),
+            maxNegativeMinutes: z.number().int().min(0).optional(),
+            order: z.number().int().optional(),
+          }),
+        )
+        .output(LeaveType),
+      archive: baseContract
+        .route({ method: 'DELETE', path: '/leave/types/{leaveTypeId}', tags: t })
+        .input(ws.extend({ leaveTypeId: z.uuid() }))
+        .output(ok),
+    },
+
+    /** Everything a person has, per type. Defaults to the caller when `personId` is omitted. */
+    balance: {
+      get: baseContract
+        .route({ method: 'GET', path: '/leave/balance', tags: t })
+        .input(ws.extend({ personId: z.uuid().optional(), periodYear: z.number().int().optional() }))
+        .output(z.array(LeaveBalance)),
+    },
+
+    /**
+     * The movements behind a balance.
+     *
+     * The reason the ledger is append-only: when somebody disputes a number, this is the answer —
+     * a list of what happened, in order, that nobody edited.
+     */
+    ledger: {
+      list: baseContract
+        .route({ method: 'GET', path: '/leave/ledger', tags: t })
+        .input(
+          ws.extend({
+            personId: z.uuid(),
+            leaveTypeId: z.uuid().optional(),
+            periodYear: z.number().int().optional(),
+            ...PageInput.shape,
+          }),
+        )
+        .output(page(LeaveLedgerEntry)),
+    },
+
+    /** A manual movement. Always carries a reason — an unexplained balance change is the thing HR gets asked about. */
+    adjust: baseContract
+      .route({ method: 'POST', path: '/leave/adjust', tags: t })
+      .input(
+        ws.extend({
+          personId: z.uuid(),
+          leaveTypeId: z.uuid(),
+          kind: LedgerKind.default('adjustment'),
+          amountMinutes: z.number().int(),
+          effectiveOn: IsoDate,
+          reason: z.string().min(1).max(500),
+        }),
+      )
+      .output(LeaveLedgerEntry),
+
+    requests: {
+      list: baseContract
+        .route({ method: 'GET', path: '/leave/requests', tags: t })
+        .input(
+          ws.extend({
+            ...PageInput.shape,
+            personId: z.uuid().optional(),
+            officeId: z.uuid().optional(),
+            status: z.array(LeaveRequest.shape.status).optional(),
+            from: IsoDate.optional(),
+            to: IsoDate.optional(),
+          }),
+        )
+        .output(page(LeaveRequest)),
+      get: baseContract
+        .route({ method: 'GET', path: '/leave/requests/{requestId}', tags: t })
+        .input(ws.extend({ requestId: z.uuid() }))
+        .output(LeaveRequest),
+      /** What it would cost and whether it would be refused — before anybody submits. */
+      simulate: baseContract
+        .route({ method: 'POST', path: '/leave/requests/simulate', tags: t })
+        .input(
+          ws.extend({
+            personId: z.uuid().optional(),
+            leaveTypeId: z.uuid(),
+            startsOn: IsoDate,
+            endsOn: IsoDate,
+            startPart: DayPart.default('full'),
+            endPart: DayPart.default('full'),
+            hours: z.number().min(0).max(24).nullish(),
+          }),
+        )
+        .output(LeaveSimulation),
+      create: baseContract
+        .route({ method: 'POST', path: '/leave/requests', tags: t })
+        .input(
+          ws.extend({
+            personId: z.uuid().optional(),
+            leaveTypeId: z.uuid(),
+            startsOn: IsoDate,
+            endsOn: IsoDate,
+            startPart: DayPart.default('full'),
+            endPart: DayPart.default('full'),
+            hours: z.number().min(0).max(24).nullish(),
+            reason: z.string().max(1000).nullish(),
+            documentFileId: z.uuid().nullish(),
+            /**
+             * Makes a retried submission safe. Two clicks on a slow connection must not book the
+             * same week twice and spend the balance twice.
+             */
+            idempotencyKey: z.string().min(8).max(128).optional(),
+          }),
+        )
+        .output(LeaveRequest),
+      /**
+       * Cancels a request. An approved one is reversed in the ledger rather than deleted, so the
+       * balance goes back up and the history still says what happened.
+       */
+      cancel: baseContract
+        .route({ method: 'POST', path: '/leave/requests/{requestId}/cancel', tags: t })
+        .input(ws.extend({ requestId: z.uuid(), reason: z.string().max(500).nullish() }))
+        .output(LeaveRequest),
+    },
+
+    /** Who is off, over a range — the answer a team actually looks at. */
+    team: {
+      calendar: baseContract
+        .route({ method: 'GET', path: '/leave/calendar', tags: t })
+        .input(
+          ws.extend({
+            from: IsoDate,
+            to: IsoDate,
+            officeId: z.uuid().optional(),
+            orgUnitId: z.uuid().optional(),
+          }),
+        )
+        .output(
+          z.array(
+            z.object({
+              personId: z.uuid(),
+              displayName: z.string(),
+              requestId: z.uuid(),
+              startsOn: IsoDate,
+              endsOn: IsoDate,
+              status: LeaveRequest.shape.status,
+              /**
+               * The type's name, or null when the viewer may not see it. Most companies want the
+               * team to know somebody is away without knowing it is sick leave.
+               */
+              leaveTypeName: z.string().nullable(),
+              color: z.string().nullable(),
+            }),
+          ),
+        ),
+    },
+  },
+
+  // ---------------------------------------------------------------- approvals
+  approvals: {
+    /** Everything waiting on the caller, across every subject type. */
+    inbox: baseContract
+      .route({ method: 'GET', path: '/approvals/inbox', tags: t })
+      .input(ws.extend({ ...PageInput.shape, includeDecided: z.boolean().default(false) }))
+      .output(page(ApprovalRequest)),
+    get: baseContract
+      .route({ method: 'GET', path: '/approvals/{requestId}', tags: t })
+      .input(ws.extend({ requestId: z.uuid() }))
+      .output(ApprovalRequest),
+    /**
+     * Approve or reject. Idempotent per approver per step — a double click is one decision, and the
+     * database refuses the second rather than counting it twice.
+     */
+    decide: baseContract
+      .route({ method: 'POST', path: '/approvals/{requestId}/decide', tags: t })
+      .input(
+        ws.extend({
+          requestId: z.uuid(),
+          decision: z.enum(['approve', 'reject']),
+          comment: z.string().max(1000).nullish(),
+          /** Deciding in somebody's place, through a delegation they created. */
+          onBehalfOfId: z.uuid().nullish(),
+        }),
+      )
+      .output(ApprovalRequest),
+    chains: {
+      list: baseContract
+        .route({ method: 'GET', path: '/approvals/chains', tags: t })
+        .input(ws.extend({ subjectType: ApprovalSubjectType.optional() }))
+        .output(z.array(ApprovalChain)),
+      create: baseContract
+        .route({ method: 'POST', path: '/approvals/chains', tags: t })
+        .input(
+          ws.extend({
+            name: z.string().min(1).max(120),
+            subjectType: ApprovalSubjectType,
+            spec: ApprovalChainSpec,
+            isDefault: z.boolean().default(false),
+          }),
+        )
+        .output(ApprovalChain),
+      update: baseContract
+        .route({ method: 'PATCH', path: '/approvals/chains/{chainId}', tags: t })
+        .input(
+          ws.extend({
+            chainId: z.uuid(),
+            name: z.string().min(1).max(120).optional(),
+            spec: ApprovalChainSpec.optional(),
+            isDefault: z.boolean().optional(),
+          }),
+        )
+        .output(ApprovalChain),
+      archive: baseContract
+        .route({ method: 'DELETE', path: '/approvals/chains/{chainId}', tags: t })
+        .input(ws.extend({ chainId: z.uuid() }))
+        .output(ok),
+    },
+    delegations: baseContract
+      .route({ method: 'GET', path: '/approvals/delegations', tags: t })
+      .input(ws.extend({ personId: z.uuid().optional() }))
+      .output(z.array(Delegation)),
+    delegate: baseContract
+      .route({ method: 'POST', path: '/approvals/delegations', tags: t })
+      .input(
+        ws.extend({
+          toPersonId: z.uuid(),
+          subjectType: ApprovalSubjectType.nullish(),
+          startsOn: IsoDate,
+          endsOn: IsoDate,
+          reason: z.string().max(200).nullish(),
+        }),
+      )
+      .output(Delegation),
+    revokeDelegation: baseContract
+      .route({ method: 'DELETE', path: '/approvals/delegations/{delegationId}', tags: t })
+      .input(ws.extend({ delegationId: z.uuid() }))
       .output(ok),
   },
 

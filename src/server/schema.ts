@@ -383,6 +383,257 @@ export const calendarDays = schema.table(
   ],
 )
 
+// =====================================================================================
+// leave
+// =====================================================================================
+
+export const leaveTypes = schema.table(
+  'leave_types',
+  {
+    id: id(),
+    workspaceId: ws(),
+    key: text('key').notNull(),
+    name: text('name').notNull(),
+    paid: boolean('paid').notNull().default(true),
+    unit: text('unit').notNull().default('day'),
+    color: text('color'),
+    icon: text('icon'),
+    requiresDocumentAfterDays: integer('requires_document_after_days'),
+    countsWorkingDaysOnly: boolean('counts_working_days_only').notNull().default(true),
+    allowNegative: boolean('allow_negative').notNull().default(false),
+    maxNegativeMinutes: integer('max_negative_minutes').notNull().default(0),
+    order: integer('order').notNull().default(0),
+    archivedAt: ts('archived_at'),
+    createdAt: created(),
+    updatedAt: updated(),
+  },
+  (t) => [uniqueIndex('hr_leave_types_ws_key_uq').on(t.workspaceId, t.key)],
+)
+
+/**
+ * Append-only. **A balance is the sum of this table and nothing else.**
+ *
+ * No row is ever updated or deleted. Cancelling approved leave inserts a `reversal` pointing at the
+ * `consumption` it undoes; a retroactive correction inserts an `adjustment`. That costs a little
+ * arithmetic and buys the only thing that matters when an employee and HR disagree about a number:
+ * a list of what happened, in order, that nobody edited.
+ *
+ * Minutes rather than days because half-days, hourly leave and part-time fractions all divide a day,
+ * and a decimal day accumulates rounding error across a year of them.
+ */
+export const leaveLedger = schema.table(
+  'leave_ledger',
+  {
+    id: id(),
+    workspaceId: ws(),
+    personId: uuid('person_id').notNull(),
+    leaveTypeId: uuid('leave_type_id').notNull(),
+    kind: text('kind').notNull(),
+    amountMinutes: integer('amount_minutes').notNull(),
+    effectiveOn: date('effective_on').notNull(),
+    periodYear: integer('period_year').notNull(),
+    requestId: uuid('request_id'),
+    reversesEntryId: uuid('reverses_entry_id'),
+    policyHash: text('policy_hash'),
+    reason: text('reason'),
+    createdBy: uuid('created_by'),
+    createdAt: created(),
+  },
+  (t) => [
+    index('hr_ledger_person_idx').on(t.workspaceId, t.personId, t.leaveTypeId, t.effectiveOn),
+    index('hr_ledger_request_idx').on(t.workspaceId, t.requestId),
+    index('hr_ledger_year_idx').on(t.workspaceId, t.periodYear),
+  ],
+)
+
+/**
+ * A cached balance **and** the lock two concurrent requests contend on.
+ *
+ * `SELECT … FOR UPDATE` on this row is what serialises "spend the last day": without it, two
+ * overlapping requests both read the same balance, both see enough, and both succeed. Rebuildable
+ * from the ledger at any time, so it is a cache in the sense that losing it costs a re-sum, not
+ * data.
+ */
+export const leaveBalanceCursor = schema.table(
+  'leave_balance_cursor',
+  {
+    id: id(),
+    workspaceId: ws(),
+    personId: uuid('person_id').notNull(),
+    leaveTypeId: uuid('leave_type_id').notNull(),
+    periodYear: integer('period_year').notNull(),
+    cachedBalanceMinutes: integer('cached_balance_minutes').notNull().default(0),
+    asOfEntryId: uuid('as_of_entry_id'),
+    version: integer('version').notNull().default(0),
+    updatedAt: updated(),
+  },
+  (t) => [uniqueIndex('hr_balance_cursor_uq').on(t.workspaceId, t.personId, t.leaveTypeId, t.periodYear)],
+)
+
+export const leaveRequests = schema.table(
+  'leave_requests',
+  {
+    id: id(),
+    workspaceId: ws(),
+    personId: uuid('person_id').notNull(),
+    leaveTypeId: uuid('leave_type_id').notNull(),
+    startsOn: date('starts_on').notNull(),
+    endsOn: date('ends_on').notNull(),
+    startPart: text('start_part').notNull().default('full'),
+    endPart: text('end_part').notNull().default('full'),
+    hours: numeric('hours', { precision: 5, scale: 2 }),
+    workingDays: numeric('working_days', { precision: 6, scale: 2 }).notNull().default('0'),
+    minutes: integer('minutes').notNull().default(0),
+    status: text('status').notNull().default('pending'),
+    reason: text('reason'),
+    documentFileId: uuid('document_file_id'),
+    approvalRequestId: uuid('approval_request_id'),
+    /** Makes a retried submission safe: two clicks must not book the week twice. */
+    idempotencyKey: text('idempotency_key'),
+    decidedAt: ts('decided_at'),
+    createdAt: created(),
+    updatedAt: updated(),
+  },
+  (t) => [
+    index('hr_leave_requests_person_idx').on(t.workspaceId, t.personId, t.startsOn),
+    index('hr_leave_requests_status_idx').on(t.workspaceId, t.status, t.startsOn),
+    uniqueIndex('hr_leave_requests_idem_uq').on(t.workspaceId, t.idempotencyKey),
+  ],
+)
+
+/**
+ * A request exploded into days.
+ *
+ * Overlap detection is then an index lookup rather than a range comparison, and — more importantly —
+ * migration 0002 puts a partial unique index across `(person, date)` for counted days in a live
+ * status, so **the database refuses to double-book somebody**. Two concurrent requests for the same
+ * Tuesday cannot both win, whatever the application layer believes.
+ */
+export const leaveRequestDays = schema.table(
+  'leave_request_days',
+  {
+    id: id(),
+    workspaceId: ws(),
+    requestId: uuid('request_id').notNull(),
+    personId: uuid('person_id').notNull(),
+    date: date('date').notNull(),
+    fraction: numeric('fraction', { precision: 3, scale: 2 }).notNull().default('1'),
+    /** False for a weekend or holiday inside the range: part of the request, costs nothing. */
+    counted: boolean('counted').notNull().default(true),
+    /** Denormalised from the request so the partial unique index can be built on this table alone. */
+    status: text('status').notNull().default('pending'),
+  },
+  (t) => [
+    index('hr_leave_days_person_idx').on(t.workspaceId, t.personId, t.date),
+    index('hr_leave_days_request_idx').on(t.requestId),
+  ],
+)
+
+// =====================================================================================
+// approvals — one engine, keyed by subject
+// =====================================================================================
+
+export const approvalChains = schema.table(
+  'approval_chains',
+  {
+    id: id(),
+    workspaceId: ws(),
+    name: text('name').notNull(),
+    subjectType: text('subject_type').notNull(),
+    spec: jsonb('spec').$type<Record<string, unknown>>().notNull(),
+    isDefault: boolean('is_default').notNull().default(false),
+    archivedAt: ts('archived_at'),
+    createdAt: created(),
+    updatedAt: updated(),
+  },
+  (t) => [index('hr_approval_chains_idx').on(t.workspaceId, t.subjectType, t.archivedAt)],
+)
+
+export const approvalRequests = schema.table(
+  'approval_requests',
+  {
+    id: id(),
+    workspaceId: ws(),
+    /** The seam: regularization, overtime and timesheets attach here without a schema change. */
+    subjectType: text('subject_type').notNull(),
+    subjectId: uuid('subject_id').notNull(),
+    summary: text('summary').notNull().default(''),
+    /**
+     * The chain as it was when the request was raised.
+     *
+     * Snapshotted on purpose: editing the workflow afterwards must not change who has to sign
+     * something already in flight. The version of that mistake where approved leave silently needs
+     * another signature is very hard to explain to the person who took the week off.
+     */
+    chain: jsonb('chain').$type<Record<string, unknown>>().notNull(),
+    status: text('status').notNull().default('pending'),
+    currentStep: integer('current_step').notNull().default(0),
+    requestedBy: uuid('requested_by'),
+    requestedAt: created(),
+    decidedAt: ts('decided_at'),
+    version: integer('version').notNull().default(0),
+  },
+  (t) => [
+    index('hr_approval_requests_subject_idx').on(t.workspaceId, t.subjectType, t.subjectId),
+    index('hr_approval_requests_status_idx').on(t.workspaceId, t.status),
+  ],
+)
+
+export const approvalSteps = schema.table(
+  'approval_steps',
+  {
+    id: id(),
+    workspaceId: ws(),
+    requestId: uuid('request_id').notNull(),
+    stepIndex: integer('step_index').notNull(),
+    name: text('name').notNull().default(''),
+    mode: text('mode').notNull().default('any'),
+    minApprovals: integer('min_approvals').notNull().default(1),
+    /** Expanded at request time; a later reorganisation does not move an in-flight approval. */
+    approverIds: uuid('approver_ids').array().notNull().default(sql`'{}'::uuid[]`),
+    status: text('status').notNull().default('pending'),
+    dueAt: ts('due_at'),
+    escalatedAt: ts('escalated_at'),
+  },
+  (t) => [
+    uniqueIndex('hr_approval_steps_uq').on(t.requestId, t.stepIndex),
+    index('hr_approval_steps_due_idx').on(t.workspaceId, t.status, t.dueAt),
+  ],
+)
+
+/** Append-only, and unique per approver per step — a double click is one decision, not two. */
+export const approvalDecisions = schema.table(
+  'approval_decisions',
+  {
+    id: id(),
+    workspaceId: ws(),
+    stepId: uuid('step_id').notNull(),
+    approverId: uuid('approver_id').notNull(),
+    onBehalfOfId: uuid('on_behalf_of_id'),
+    decision: text('decision').notNull(),
+    comment: text('comment'),
+    at: created(),
+  },
+  (t) => [uniqueIndex('hr_approval_decisions_uq').on(t.stepId, t.approverId)],
+)
+
+export const delegations = schema.table(
+  'delegations',
+  {
+    id: id(),
+    workspaceId: ws(),
+    fromPersonId: uuid('from_person_id').notNull(),
+    toPersonId: uuid('to_person_id').notNull(),
+    /** Null delegates every subject type. */
+    subjectType: text('subject_type'),
+    startsOn: date('starts_on').notNull(),
+    endsOn: date('ends_on').notNull(),
+    reason: text('reason'),
+    createdAt: created(),
+  },
+  (t) => [index('hr_delegations_idx').on(t.workspaceId, t.toPersonId, t.startsOn)],
+)
+
 /** Every tenant table, so the RLS migration is checked against one list rather than memory. */
 export const TENANT_TABLES = [
   'legal_entities',
@@ -399,4 +650,14 @@ export const TENANT_TABLES = [
   'custom_field_defs',
   'calendars',
   'calendar_days',
+  'leave_types',
+  'leave_ledger',
+  'leave_balance_cursor',
+  'leave_requests',
+  'leave_request_days',
+  'approval_chains',
+  'approval_requests',
+  'approval_steps',
+  'approval_decisions',
+  'delegations',
 ] as const

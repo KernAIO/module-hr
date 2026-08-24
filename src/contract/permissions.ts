@@ -181,6 +181,69 @@ export const hrPermissions = definePermissions([
     dangerous: true,
   },
 
+  // ---------------------------------------------------------------- leave
+  {
+    key: 'hr.leave.request',
+    label: 'Request time off',
+    // Everybody. A permission an employee cannot lack is noise, but this one is genuinely revocable
+    // — a contractor who books time off through their agency should not have the button.
+    scope: 'workspace',
+    defaultRoles: ['owner', 'admin', 'member'],
+    dangerous: false,
+  },
+  {
+    key: 'hr.leave.view',
+    label: 'View leave types and your own balance',
+    scope: 'workspace',
+    defaultRoles: ['owner', 'admin', 'member'],
+    dangerous: false,
+  },
+  {
+    key: 'hr.leave.view_team',
+    label: "View your team's leave and balances",
+    scope: 'object',
+    defaultRoles: ['owner', 'admin'],
+    dangerous: false,
+  },
+  {
+    key: 'hr.leave.view_ledger',
+    label: "View the movements behind somebody's balance",
+    scope: 'workspace',
+    defaultRoles: ['owner', 'admin'],
+    dangerous: false,
+  },
+  {
+    key: 'hr.leave.manage',
+    label: 'Configure leave types',
+    scope: 'workspace',
+    defaultRoles: ['owner', 'admin'],
+    dangerous: false,
+  },
+  {
+    key: 'hr.leave.adjust',
+    label: "Change somebody's balance by hand",
+    description: 'Adds or removes leave directly. Every adjustment is recorded with its reason.',
+    scope: 'workspace',
+    defaultRoles: [],
+    dangerous: true,
+  },
+
+  // ---------------------------------------------------------------- approvals
+  {
+    key: 'hr.approval.manage',
+    label: 'Configure approval chains',
+    scope: 'workspace',
+    defaultRoles: ['owner', 'admin'],
+    dangerous: false,
+  },
+  {
+    key: 'hr.approval.delegate',
+    label: 'Hand your approvals to somebody else while away',
+    scope: 'workspace',
+    defaultRoles: ['owner', 'admin', 'member'],
+    dangerous: false,
+  },
+
   // ---------------------------------------------------------------- fields
   {
     key: 'hr.field.manage',
@@ -214,4 +277,12 @@ export const HR_PERMISSIONS = {
   documentView: 'hr.document.view',
   documentManage: 'hr.document.manage',
   fieldManage: 'hr.field.manage',
+  leaveRequest: 'hr.leave.request',
+  leaveView: 'hr.leave.view',
+  leaveViewTeam: 'hr.leave.view_team',
+  leaveViewLedger: 'hr.leave.view_ledger',
+  leaveManage: 'hr.leave.manage',
+  leaveAdjust: 'hr.leave.adjust',
+  approvalManage: 'hr.approval.manage',
+  approvalDelegate: 'hr.approval.delegate',
 } as const

@@ -75,7 +75,16 @@ const gated = new Set(Object.values(hrCapabilityProcedures).flat())
  * own record, where a permission nobody could ever lack would be noise in the role editor — the
  * handler checks identity instead, which is stronger than any grantable key.
  */
-const SELF_SERVICE = new Set(['people.me'])
+const SELF_SERVICE = new Set([
+  'people.me',
+  // An inbox of what *you* must decide is yours by definition, and the engine only ever lists steps
+  // you are named on — a permission here could only ever be one nobody may lack.
+  'approvals.inbox',
+  'approvals.get',
+  // `decide` checks that the caller is on the step, which is stronger than any grantable key: a
+  // permission would let somebody approve a request they were never asked about.
+  'approvals.decide',
+])
 
 describe('every procedure is authorised', () => {
   it('carries both the workspace/module gate and a permission check', () => {

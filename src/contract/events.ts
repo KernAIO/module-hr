@@ -72,6 +72,63 @@ export const hrEvents = {
    * sheet) is stale from here. The payload names the date range touched so a consumer can recompute
    * that window rather than everything.
    */
+  leaveRequested: defineEvent(
+    'hr.leave.requested',
+    z.object({
+      requestId: z.uuid(),
+      workspaceId: WorkspaceId,
+      personId: z.uuid(),
+      startsOn: z.iso.date(),
+      endsOn: z.iso.date(),
+    }),
+  ),
+  /**
+   * Decided either way, with the outcome in the payload.
+   *
+   * One event rather than approved/rejected pairs: every consumer so far cares that a decision
+   * happened and then branches, and two events means two subscriptions to keep in step.
+   */
+  leaveDecided: defineEvent(
+    'hr.leave.decided',
+    z.object({
+      requestId: z.uuid(),
+      workspaceId: WorkspaceId,
+      personId: z.uuid(),
+      status: z.string(),
+      startsOn: z.iso.date(),
+      endsOn: z.iso.date(),
+    }),
+  ),
+  /** A balance moved. Carries the delta so a consumer need not re-sum the ledger. */
+  leaveBalanceChanged: defineEvent(
+    'hr.leave.balance_changed',
+    z.object({
+      workspaceId: WorkspaceId,
+      personId: z.uuid(),
+      leaveTypeId: z.uuid(),
+      deltaMinutes: z.number().int(),
+    }),
+  ),
+  approvalRequested: defineEvent(
+    'hr.approval.requested',
+    z.object({
+      requestId: z.uuid(),
+      workspaceId: WorkspaceId,
+      subjectType: z.string(),
+      subjectId: z.uuid(),
+      approverIds: z.array(z.uuid()),
+    }),
+  ),
+  approvalDecided: defineEvent(
+    'hr.approval.decided',
+    z.object({
+      requestId: z.uuid(),
+      workspaceId: WorkspaceId,
+      subjectType: z.string(),
+      subjectId: z.uuid(),
+      status: z.string(),
+    }),
+  ),
   calendarChanged: defineEvent(
     'hr.calendar.changed',
     z.object({

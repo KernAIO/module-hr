@@ -9,11 +9,18 @@ import {
   calendarDays,
   calendars,
   employments,
+  leaveBalanceCursor,
+  leaveLedger,
+  leaveRequestDays,
+  leaveRequests,
+  leaveTypes,
   officeAssignments,
   offices,
   people,
   TENANT_TABLES,
 } from './schema.js'
+import { ApprovalService } from './services/approvals.js'
+import { LedgerService } from './services/ledger.js'
 import { PeopleService } from './services/people.js'
 import { ResolveService } from './services/resolve.js'
 
@@ -130,6 +137,18 @@ describe('the module boots', () => {
       'person_documents',
       'person_history',
       'positions',
+      // 0002 — if these are missing the leave migration did not run, and every leave test below
+      // would pass vacuously against a schema that is not there.
+      'leave_types',
+      'leave_ledger',
+      'leave_balance_cursor',
+      'leave_requests',
+      'leave_request_days',
+      'approval_chains',
+      'approval_requests',
+      'approval_steps',
+      'approval_decisions',
+      'delegations',
     ])
       expect(names, `mod_hr.${t}`).toContain(t)
   })
@@ -146,13 +165,26 @@ describe('the module boots', () => {
     for (const t of TENANT_TABLES) expect(secured.get(t), `mod_hr.${t} has RLS`).toBe(true)
   })
 
-  it('secures every table the schema declares, with none forgotten', () => {
-    // Guards the other direction: a table added to schema.ts but left out of TENANT_TABLES would
-    // pass the test above by simply never being asked about.
+  it('leaves no table in the schema out of TENANT_TABLES', async () => {
+    /**
+     * Guards the other direction, and does it against the **database** rather than a count.
+     *
+     * A table added to `schema.ts` but left out of `TENANT_TABLES` passes the test above by simply
+     * never being asked about — which is exactly how a table ships without a policy. Comparing what
+     * actually exists to what is declared cannot go stale, where a hardcoded number goes stale the
+     * first time anybody adds a table (it did, on the very next commit).
+     */
+    const { rows } = await kernel.database.pool.query<{ table_name: string }>(
+      `select table_name from information_schema.tables
+        where table_schema = 'mod_hr' and table_type = 'BASE TABLE'`,
+    )
     const declared = new Set<string>(TENANT_TABLES)
-    for (const t of ['people', 'offices', 'employments', 'office_assignments', 'calendars'])
-      expect(declared.has(t), `${t} is in TENANT_TABLES`).toBe(true)
-    expect(declared.size).toBe(14)
+    const undeclared = rows
+      .map((r) => r.table_name)
+      // drizzle's own bookkeeping is not tenant data and correctly has no policy.
+      .filter((t) => t !== '__drizzle_migrations' && !t.startsWith('__'))
+      .filter((t) => !declared.has(t))
+    expect(undeclared, 'tables missing from TENANT_TABLES').toEqual([])
   })
 })
 
@@ -512,3 +544,232 @@ describe('effective-dated employment', () => {
     )
   })
 })
+
+/**
+ * Leave, end to end, against the database.
+ *
+ * The arithmetic is unit-tested; what needs a real Postgres is everything that can go wrong when
+ * two things happen at once, or when somebody cancels — the parts where a balance stops being a
+ * number and starts being an argument.
+ */
+describe('leave', () => {
+  const svcLedger = new LedgerService()
+  let annual: string
+  let alice: string
+  let manager: string
+
+  beforeAll(async () => {
+    const ids = await run(async (tx) => {
+      const [type] = await tx
+        .insert(leaveTypes)
+        .values({
+          workspaceId: WS_A,
+          key: 'annual',
+          name: 'Annual leave',
+          paid: true,
+          unit: 'day',
+        })
+        .returning()
+
+      const [boss] = await tx.insert(people).values({ workspaceId: WS_A, displayName: 'Manager' }).returning()
+      const [person] = await tx.insert(people).values({ workspaceId: WS_A, displayName: 'Alice' }).returning()
+      await tx.insert(employments).values({
+        workspaceId: WS_A,
+        personId: person!.id,
+        effectiveFrom: '2026-01-01',
+        managerPersonId: boss!.id,
+      })
+      const [home] = await tx.select().from(offices).where(eq(offices.isDefault, true))
+      await tx.insert(officeAssignments).values({
+        workspaceId: WS_A,
+        personId: person!.id,
+        officeId: home!.id,
+        isPrimary: true,
+        effectiveFrom: '2026-01-01',
+      })
+      return { annual: type!.id, alice: person!.id, manager: boss!.id }
+    })
+    annual = ids.annual
+    alice = ids.alice
+    manager = ids.manager
+
+    // 20 days of allowance.
+    await run(async (tx) => {
+      await svcLedger.lockAndRead(tx, WS_A, alice, annual, 2026)
+      await svcLedger.append(tx, WS_A, {
+        personId: alice,
+        leaveTypeId: annual,
+        kind: 'grant',
+        amountMinutes: 20 * 8 * 60,
+        effectiveOn: '2026-01-01',
+        periodYear: 2026,
+      })
+    })
+  }, 60_000)
+
+  it('sums the ledger into a balance', async () => {
+    const balances = await run((tx) => svcLedger.balances(tx, WS_A, alice, 2026))
+    const annualBalance = balances.find((b) => b.leaveTypeId === annual)
+    expect(annualBalance?.balanceMinutes).toBe(20 * 8 * 60)
+    expect(annualBalance?.balance).toBe(20)
+  })
+
+  it('does not let two live requests cover the same day', async () => {
+    // The application checks this too, but the index is what makes it true under concurrency — so
+    // this asserts the constraint fires rather than that the check ran.
+    await run((tx) =>
+      tx.insert(leaveRequests).values({
+        id: FIXED_REQUEST,
+        workspaceId: WS_A,
+        personId: alice,
+        leaveTypeId: annual,
+        startsOn: '2026-06-01',
+        endsOn: '2026-06-01',
+        minutes: 480,
+        status: 'pending',
+      }),
+    )
+    await run((tx) =>
+      tx.insert(leaveRequestDays).values({
+        workspaceId: WS_A,
+        requestId: FIXED_REQUEST,
+        personId: alice,
+        date: '2026-06-01',
+        counted: true,
+        status: 'pending',
+      }),
+    )
+
+    const name = await constraintViolated(() =>
+      run((tx) =>
+        tx.insert(leaveRequestDays).values({
+          workspaceId: WS_A,
+          requestId: FIXED_REQUEST_2,
+          personId: alice,
+          date: '2026-06-01',
+          counted: true,
+          status: 'pending',
+        }),
+      ),
+    )
+    expect(name).toBe('hr_leave_days_no_double_booking')
+  })
+
+  it('lets the same day be rebooked once the first request is cancelled', async () => {
+    // The index is partial for exactly this reason: a cancelled request must not block the date
+    // for ever.
+    await run((tx) =>
+      tx
+        .update(leaveRequestDays)
+        .set({ status: 'cancelled' })
+        .where(eq(leaveRequestDays.requestId, FIXED_REQUEST)),
+    )
+    await expect(
+      run((tx) =>
+        tx.insert(leaveRequestDays).values({
+          workspaceId: WS_A,
+          requestId: FIXED_REQUEST_2,
+          personId: alice,
+          date: '2026-06-01',
+          counted: true,
+          status: 'pending',
+        }),
+      ),
+    ).resolves.toBeDefined()
+  })
+
+  it('reverses rather than deletes when approved leave is cancelled', async () => {
+    const entry = await run(async (tx) => {
+      await svcLedger.lockAndRead(tx, WS_A, alice, annual, 2026)
+      return svcLedger.append(tx, WS_A, {
+        personId: alice,
+        leaveTypeId: annual,
+        kind: 'consumption',
+        amountMinutes: -(5 * 8 * 60),
+        effectiveOn: '2026-07-01',
+        periodYear: 2026,
+      })
+    })
+
+    const spent = await run((tx) => svcLedger.balances(tx, WS_A, alice, 2026))
+    expect(spent.find((b) => b.leaveTypeId === annual)?.balance).toBe(15)
+
+    await run(async (tx) => {
+      await svcLedger.lockAndRead(tx, WS_A, alice, annual, 2026)
+      return svcLedger.reverse(tx, WS_A, entry.id, 'Cancelled', null, '2026-07-02')
+    })
+
+    const restored = await run((tx) => svcLedger.balances(tx, WS_A, alice, 2026))
+    expect(restored.find((b) => b.leaveTypeId === annual)?.balance).toBe(20)
+
+    // Both movements are still there. "She booked it and cancelled" and "she never booked it" are
+    // different facts, and the ledger has to be able to tell them apart.
+    const entries = await run((tx) =>
+      tx
+        .select()
+        .from(leaveLedger)
+        .where(and(eq(leaveLedger.workspaceId, WS_A), eq(leaveLedger.personId, alice))),
+    )
+    expect(entries.filter((e) => e.kind === 'consumption')).toHaveLength(1)
+    expect(entries.filter((e) => e.kind === 'reversal')).toHaveLength(1)
+  })
+
+  it('refuses to reverse the same entry twice', async () => {
+    const entry = await run(async (tx) => {
+      await svcLedger.lockAndRead(tx, WS_A, alice, annual, 2026)
+      return svcLedger.append(tx, WS_A, {
+        personId: alice,
+        leaveTypeId: annual,
+        kind: 'consumption',
+        amountMinutes: -480,
+        effectiveOn: '2026-08-03',
+        periodYear: 2026,
+      })
+    })
+    await run((tx) => svcLedger.reverse(tx, WS_A, entry.id, 'once', null, '2026-08-04'))
+    // Reversing twice would credit the balance twice, which is how a cancelled day becomes two.
+    await expect(
+      run((tx) => svcLedger.reverse(tx, WS_A, entry.id, 'again', null, '2026-08-05')),
+    ).rejects.toThrow(/already been reversed/)
+  })
+
+  it('rebuilds a cursor from the ledger', async () => {
+    await run((tx) =>
+      tx
+        .update(leaveBalanceCursor)
+        .set({ cachedBalanceMinutes: 999999 })
+        .where(eq(leaveBalanceCursor.personId, alice)),
+    )
+    await run((tx) => svcLedger.rebuildCursors(tx, WS_A, [alice]))
+    const [cursor] = await run((tx) =>
+      tx.select().from(leaveBalanceCursor).where(eq(leaveBalanceCursor.personId, alice)),
+    )
+    const balances = await run((tx) => svcLedger.balances(tx, WS_A, alice, 2026))
+    expect(cursor?.cachedBalanceMinutes).toBe(balances.find((b) => b.leaveTypeId === annual)?.balanceMinutes)
+  })
+
+  it('resolves the manager as the approver, and never the requester', async () => {
+    const approvals = new ApprovalService(kernel)
+    const ids = await run((tx) =>
+      approvals.resolveSubject(tx, WS_A, { kind: 'manager' }, alice, '2026-06-01'),
+    )
+    expect(ids).toEqual([manager])
+
+    // A manager requesting their own leave must not be their own approver. The step is dropped and
+    // the next one up decides — an approval nobody can grant is worse than one nobody needs.
+    const raised = await run((tx) =>
+      approvals.raise(tx, WS_A, {
+        subjectType: 'leave',
+        subjectId: FIXED_REQUEST_2,
+        summary: 'test',
+        requesterPersonId: manager,
+        requestedBy: null,
+        on: '2026-06-01',
+      }),
+    )
+    expect(raised.autoApproved).toBe(true)
+  })
+})
+
+const FIXED_REQUEST = '01920000-0000-7000-8000-00000000fa01'
+const FIXED_REQUEST_2 = '01920000-0000-7000-8000-00000000fa02'

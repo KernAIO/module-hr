@@ -65,6 +65,26 @@ export const hrCapabilities = defineCapabilities([
     level: 1,
   },
   {
+    id: 'leave',
+    label: 'Leave',
+    description: 'Time off: types, balances, requests and approvals',
+    dependsOn: ['core', 'calendars'],
+    // On by default. Leave is what most companies come to an HR system for, and a directory that
+    // cannot answer "who is off next week" is answering a question nobody asked.
+    defaultEnabled: true,
+    level: 1,
+  },
+  {
+    id: 'approvals',
+    label: 'Approval chains',
+    description: 'Named multi-step approvals with delegation, instead of a single manager',
+    dependsOn: ['core'],
+    // Off by default: at Level 1 the requester's manager approves, implicitly, and a company with
+    // one approver does not need a chain editor to find out that it has one.
+    defaultEnabled: false,
+    level: 2,
+  },
+  {
     id: 'documents',
     label: 'Employee documents',
     description: 'Contracts, identity documents and certificates against a person',
@@ -114,4 +134,28 @@ export const hrCapabilityProcedures: Record<string, readonly string[]> = {
     'calendars.workingDays',
   ],
   documents: ['documents.list', 'documents.attach', 'documents.remove'],
+  leave: [
+    'leave.types.list',
+    'leave.types.create',
+    'leave.types.update',
+    'leave.types.archive',
+    'leave.balance.get',
+    'leave.ledger.list',
+    'leave.adjust',
+    'leave.requests.list',
+    'leave.requests.get',
+    'leave.requests.simulate',
+    'leave.requests.create',
+    'leave.requests.cancel',
+    'leave.team.calendar',
+  ],
+  approvals: [
+    'approvals.chains.list',
+    'approvals.chains.create',
+    'approvals.chains.update',
+    'approvals.chains.archive',
+    'approvals.delegate',
+    'approvals.revokeDelegation',
+    'approvals.delegations',
+  ],
 }

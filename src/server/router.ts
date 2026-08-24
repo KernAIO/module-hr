@@ -10,16 +10,25 @@ import {
   workspaceScoped,
 } from '@kernhq/kernel'
 import { implement } from '@orpc/server'
-import { and, asc, count, desc, eq, gte, ilike, inArray, isNull, lte, sql } from 'drizzle-orm'
+import { and, asc, count, desc, eq, gte, ilike, inArray, isNull, lte, or, sql } from 'drizzle-orm'
 import { HrSettings, hrContract, hrEvents, MODULE_ID, type WorkingWeek } from '../contract/index.js'
 import { countWorkingDays, workingDays } from '../policy/calendar.js'
 import { COUNTRY_PACKS, packDays } from './packs/index.js'
 import {
+  approvalChains,
+  approvalDecisions,
+  approvalRequests,
+  approvalSteps,
   calendarDays,
   calendars,
   costCenters,
   customFieldDefs,
+  delegations,
   employments,
+  leaveLedger,
+  leaveRequestDays,
+  leaveRequests,
+  leaveTypes,
   legalEntities,
   officeAssignments,
   offices,
@@ -30,7 +39,9 @@ import {
   personHistory,
   positions,
 } from './schema.js'
+import { ApprovalService } from './services/approvals.js'
 import { inForceOn, todayIso } from './services/db.js'
+import { LedgerService, MINUTES_PER_DAY, yearOf } from './services/ledger.js'
 import { PeopleService } from './services/people.js'
 import { DEFAULT_WORKING_WEEK, ResolveService } from './services/resolve.js'
 
@@ -53,6 +64,8 @@ export function implement_(kernel: Kernel) {
   const cap = (id: string) => requiresCapability(MODULE_ID, id)
   const resolve = new ResolveService()
   const svc = new PeopleService(kernel)
+  const ledger = new LedgerService()
+  const approvals = new ApprovalService(kernel)
   const db = kernel.database
   const settingsOf = (workspaceId: string) => kernel.settings.module(workspaceId, MODULE_ID, HrSettings)
 
@@ -1506,6 +1519,686 @@ export function implement_(kernel: Kernel) {
         }),
     },
 
+    // ================================================================= leave
+    leave: {
+      types: {
+        list: scoped.leave.types.list
+          .use(cap('leave'))
+          .use(requires('hr.leave.view'))
+          .handler(({ input }) =>
+            db.withWorkspace(input.workspaceId, async (tx) => {
+              const where = [eq(leaveTypes.workspaceId, input.workspaceId)]
+              if (!input.includeArchived) where.push(isNull(leaveTypes.archivedAt))
+              const rows = await tx
+                .select()
+                .from(leaveTypes)
+                .where(and(...where))
+                .orderBy(asc(leaveTypes.order), asc(leaveTypes.name))
+              return rows.map(toLeaveType)
+            }),
+          ),
+        create: scoped.leave.types.create
+          .use(cap('leave'))
+          .use(requires('hr.leave.manage'))
+          .handler(async ({ input }) => {
+            const row = await db.withWorkspace(input.workspaceId, async (tx) => {
+              const [created] = await tx
+                .insert(leaveTypes)
+                .values({
+                  id: uuidv7(),
+                  workspaceId: input.workspaceId,
+                  key: input.key,
+                  name: input.name,
+                  paid: input.paid,
+                  unit: input.unit,
+                  color: input.color ?? null,
+                  icon: input.icon ?? null,
+                  requiresDocumentAfterDays: input.requiresDocumentAfterDays ?? null,
+                  countsWorkingDaysOnly: input.countsWorkingDaysOnly,
+                  allowNegative: input.allowNegative,
+                  maxNegativeMinutes: input.maxNegativeMinutes,
+                })
+                .returning()
+              return created!
+            })
+            await changed(input.workspaceId, 'leave_type', row.id, 'created')
+            return toLeaveType(row)
+          }),
+        update: scoped.leave.types.update
+          .use(cap('leave'))
+          .use(requires('hr.leave.manage'))
+          .handler(async ({ input }) => {
+            const row = await db.withWorkspace(input.workspaceId, async (tx) => {
+              const { workspaceId, leaveTypeId, ...patch } = input
+              const set: Record<string, unknown> = { updatedAt: new Date() }
+              for (const [k, v] of Object.entries(patch)) if (v !== undefined) set[k] = v
+              const [updated] = await tx
+                .update(leaveTypes)
+                .set(set)
+                .where(and(eq(leaveTypes.workspaceId, workspaceId), eq(leaveTypes.id, leaveTypeId)))
+                .returning()
+              if (!updated) throw KernError.notFound('Leave type')
+              return updated
+            })
+            await changed(input.workspaceId, 'leave_type', row.id, 'updated')
+            return toLeaveType(row)
+          }),
+        archive: scoped.leave.types.archive
+          .use(cap('leave'))
+          .use(requires('hr.leave.manage'))
+          .handler(async ({ input }) => {
+            // Archived, never deleted: the ledger points at it, and a balance whose type has
+            // vanished is a number nobody can explain.
+            await db.withWorkspace(input.workspaceId, (tx) =>
+              tx
+                .update(leaveTypes)
+                .set({ archivedAt: new Date() })
+                .where(
+                  and(eq(leaveTypes.workspaceId, input.workspaceId), eq(leaveTypes.id, input.leaveTypeId)),
+                ),
+            )
+            await changed(input.workspaceId, 'leave_type', input.leaveTypeId, 'deleted')
+            return { ok: true as const }
+          }),
+      },
+
+      balance: {
+        get: scoped.leave.balance.get
+          .use(cap('leave'))
+          .use(requires('hr.leave.view'))
+          .handler(({ input, context }) =>
+            db.withWorkspace(input.workspaceId, async (tx) => {
+              const personId = await personFor(tx, input.workspaceId, context, input.personId)
+              const year = input.periodYear ?? new Date().getUTCFullYear()
+              return ledger.balances(tx, input.workspaceId, personId, year)
+            }),
+          ),
+      },
+
+      ledger: {
+        list: scoped.leave.ledger.list
+          .use(cap('leave'))
+          .use(requires('hr.leave.view_ledger'))
+          .handler(({ input }) =>
+            db.withWorkspace(input.workspaceId, async (tx) => {
+              const where = [
+                eq(leaveLedger.workspaceId, input.workspaceId),
+                eq(leaveLedger.personId, input.personId),
+              ]
+              if (input.leaveTypeId) where.push(eq(leaveLedger.leaveTypeId, input.leaveTypeId))
+              if (input.periodYear) where.push(eq(leaveLedger.periodYear, input.periodYear))
+              const rows = await tx
+                .select()
+                .from(leaveLedger)
+                .where(and(...where))
+                .orderBy(desc(leaveLedger.effectiveOn), desc(leaveLedger.createdAt))
+                .limit(input.limit)
+              return { items: rows.map(toLedgerEntry), nextCursor: null }
+            }),
+          ),
+      },
+
+      adjust: scoped.leave.adjust
+        .use(cap('leave'))
+        .use(requires('hr.leave.adjust'))
+        .handler(async ({ input, context }) => {
+          const row = await db.withWorkspace(input.workspaceId, async (tx) => {
+            const year = yearOf(input.effectiveOn)
+            await ledger.lockAndRead(tx, input.workspaceId, input.personId, input.leaveTypeId, year)
+            return ledger.append(tx, input.workspaceId, {
+              personId: input.personId,
+              leaveTypeId: input.leaveTypeId,
+              kind: input.kind,
+              amountMinutes: input.amountMinutes,
+              effectiveOn: input.effectiveOn,
+              periodYear: year,
+              reason: input.reason,
+              createdBy: context.principal.userId ?? null,
+            })
+          })
+          await kernel.emit(
+            hrEvents.leaveBalanceChanged,
+            {
+              workspaceId: input.workspaceId,
+              personId: input.personId,
+              leaveTypeId: input.leaveTypeId,
+              deltaMinutes: input.amountMinutes,
+            },
+            { workspaceId: input.workspaceId, actorId: context.principal.userId },
+          )
+          await changed(input.workspaceId, 'leave_balance', input.personId, 'updated')
+          return toLedgerEntry(row)
+        }),
+
+      requests: {
+        list: scoped.leave.requests.list
+          .use(cap('leave'))
+          .use(requires('hr.leave.view'))
+          .handler(({ input, context }) =>
+            db.withWorkspace(input.workspaceId, async (tx) => {
+              const where = [eq(leaveRequests.workspaceId, input.workspaceId)]
+              if (input.personId) where.push(eq(leaveRequests.personId, input.personId))
+              else if (!context.principal.instanceAdmin) {
+                // Without an explicit person, this is "my requests". Seeing everybody's by default
+                // would leak the whole company's absences to any member with hr.leave.view.
+                const me = await svc.byUserId(tx, input.workspaceId, context.principal.userId ?? '')
+                where.push(me ? eq(leaveRequests.personId, me.id) : sql`false`)
+              }
+              if (input.status?.length) where.push(inArray(leaveRequests.status, input.status))
+              if (input.from) where.push(gte(leaveRequests.endsOn, input.from))
+              if (input.to) where.push(lte(leaveRequests.startsOn, input.to))
+              const rows = await tx
+                .select()
+                .from(leaveRequests)
+                .where(and(...where))
+                .orderBy(desc(leaveRequests.startsOn))
+                .limit(input.limit)
+              return { items: rows.map(toLeaveRequest), nextCursor: null }
+            }),
+          ),
+
+        get: scoped.leave.requests.get
+          .use(cap('leave'))
+          .use(requires('hr.leave.view'))
+          .handler(({ input }) =>
+            db.withWorkspace(input.workspaceId, async (tx) =>
+              toLeaveRequest(await loadRequest(tx, input.workspaceId, input.requestId)),
+            ),
+          ),
+
+        simulate: scoped.leave.requests.simulate
+          .use(cap('leave'))
+          .use(requires('hr.leave.request'))
+          .handler(({ input, context }) =>
+            db.withWorkspace(input.workspaceId, async (tx) => {
+              const personId = await personFor(tx, input.workspaceId, context, input.personId)
+              return simulate(tx, input.workspaceId, personId, input)
+            }),
+          ),
+
+        create: scoped.leave.requests.create
+          .use(cap('leave'))
+          .use(requires('hr.leave.request'))
+          .handler(async ({ input, context }) => {
+            const result = await db.withWorkspace(input.workspaceId, async (tx) => {
+              const personId = await personFor(tx, input.workspaceId, context, input.personId)
+
+              // Everything that spends balance takes the cursor lock first, inside this
+              // transaction. Two overlapping requests for the last day cannot both read "enough".
+              const year = yearOf(input.startsOn)
+              await ledger.lockAndRead(tx, input.workspaceId, personId, input.leaveTypeId, year)
+
+              const sim = await simulate(tx, input.workspaceId, personId, input)
+              if (sim.blockers.length)
+                throw KernError.conflict(sim.blockers[0]!.message, `hr.leave.${sim.blockers[0]!.code}`)
+
+              const [request] = await tx
+                .insert(leaveRequests)
+                .values({
+                  id: uuidv7(),
+                  workspaceId: input.workspaceId,
+                  personId,
+                  leaveTypeId: input.leaveTypeId,
+                  startsOn: input.startsOn,
+                  endsOn: input.endsOn,
+                  startPart: input.startPart,
+                  endPart: input.endPart,
+                  hours: input.hours === null || input.hours === undefined ? null : String(input.hours),
+                  workingDays: String(sim.workingDays),
+                  minutes: sim.minutes,
+                  status: 'pending',
+                  reason: input.reason ?? null,
+                  documentFileId: input.documentFileId ?? null,
+                  idempotencyKey: input.idempotencyKey ?? null,
+                })
+                .returning()
+
+              // The exploded days are what the partial unique index guards, so this insert is what
+              // actually refuses a double booking — before any approval happens.
+              await tx.insert(leaveRequestDays).values(
+                sim.days.map((d) => ({
+                  id: uuidv7(),
+                  workspaceId: input.workspaceId,
+                  requestId: request!.id,
+                  personId,
+                  date: d.date,
+                  fraction: String(d.fraction),
+                  counted: d.counted,
+                  status: 'pending',
+                })),
+              )
+
+              const raised = await approvals.raise(tx, input.workspaceId, {
+                subjectType: 'leave',
+                subjectId: request!.id,
+                summary: `${sim.workingDays} day(s) from ${input.startsOn}`,
+                requesterPersonId: personId,
+                requestedBy: context.principal.userId ?? null,
+                on: input.startsOn,
+              })
+
+              await tx
+                .update(leaveRequests)
+                .set({ approvalRequestId: raised.request.id })
+                .where(eq(leaveRequests.id, request!.id))
+
+              // A chain that resolves to nobody approves immediately — a one-person company has no
+              // manager and still has to be able to book time off.
+              if (raised.autoApproved)
+                await applyApproval(tx, input.workspaceId, request!.id, context.principal.userId ?? null)
+
+              const [fresh] = await tx.select().from(leaveRequests).where(eq(leaveRequests.id, request!.id))
+              return { request: fresh!, approvers: raised.firstStepApprovers, personId }
+            })
+
+            await kernel.emit(
+              hrEvents.leaveRequested,
+              {
+                requestId: result.request.id,
+                workspaceId: input.workspaceId,
+                personId: result.personId,
+                startsOn: input.startsOn,
+                endsOn: input.endsOn,
+              },
+              { workspaceId: input.workspaceId, actorId: context.principal.userId },
+            )
+            await changed(input.workspaceId, 'leave_request', result.request.id, 'created')
+            return toLeaveRequest(result.request)
+          }),
+
+        cancel: scoped.leave.requests.cancel
+          .use(cap('leave'))
+          .use(requires('hr.leave.request'))
+          .handler(async ({ input, context }) => {
+            const row = await db.withWorkspace(input.workspaceId, async (tx) => {
+              const request = await loadRequest(tx, input.workspaceId, input.requestId)
+              if (request.status === 'cancelled' || request.status === 'withdrawn')
+                throw KernError.conflict('That request is already cancelled')
+
+              const year = yearOf(request.startsOn)
+              await ledger.lockAndRead(tx, input.workspaceId, request.personId, request.leaveTypeId, year)
+
+              // Approved leave is *reversed*, not deleted. "She booked it and cancelled" and "she
+              // never booked it" are different facts, and only one of them is true.
+              if (request.status === 'approved')
+                for (const entry of await ledger.entriesFor(tx, input.workspaceId, request.id))
+                  if (entry.kind === 'consumption')
+                    await ledger.reverse(
+                      tx,
+                      input.workspaceId,
+                      entry.id,
+                      input.reason ?? 'Leave cancelled',
+                      context.principal.userId ?? null,
+                      todayIso(),
+                    )
+
+              await approvals.cancel(tx, input.workspaceId, 'leave', request.id)
+              const next = request.status === 'approved' ? 'withdrawn' : 'cancelled'
+              await tx
+                .update(leaveRequestDays)
+                .set({ status: next })
+                .where(eq(leaveRequestDays.requestId, request.id))
+              const [updated] = await tx
+                .update(leaveRequests)
+                .set({ status: next, decidedAt: new Date(), updatedAt: new Date() })
+                .where(eq(leaveRequests.id, request.id))
+                .returning()
+              return updated!
+            })
+            await kernel.emit(
+              hrEvents.leaveDecided,
+              {
+                requestId: row.id,
+                workspaceId: input.workspaceId,
+                personId: row.personId,
+                status: row.status,
+                startsOn: row.startsOn,
+                endsOn: row.endsOn,
+              },
+              { workspaceId: input.workspaceId, actorId: context.principal.userId },
+            )
+            await changed(input.workspaceId, 'leave_request', row.id, 'updated')
+            return toLeaveRequest(row)
+          }),
+      },
+
+      team: {
+        calendar: scoped.leave.team.calendar
+          .use(cap('leave'))
+          .use(requires('hr.leave.view_team'))
+          .handler(({ input, context }) =>
+            db.withWorkspace(input.workspaceId, async (tx) => {
+              const rows = await tx
+                .select()
+                .from(leaveRequests)
+                .where(
+                  and(
+                    eq(leaveRequests.workspaceId, input.workspaceId),
+                    inArray(leaveRequests.status, ['pending', 'approved']),
+                    lte(leaveRequests.startsOn, input.to),
+                    gte(leaveRequests.endsOn, input.from),
+                  ),
+                )
+              if (!rows.length) return []
+
+              const personIds = [...new Set(rows.map((r) => r.personId))]
+              const persons = await tx
+                .select({ id: people.id, displayName: people.displayName })
+                .from(people)
+                .where(and(eq(people.workspaceId, input.workspaceId), inArray(people.id, personIds)))
+              const nameById = new Map(persons.map((p) => [p.id, p.displayName]))
+              const types = await tx
+                .select()
+                .from(leaveTypes)
+                .where(eq(leaveTypes.workspaceId, input.workspaceId))
+              const typeById = new Map(types.map((t) => [t.id, t]))
+
+              // Most companies want the team to know somebody is away without knowing it is sick
+              // leave, so the type is named only for somebody who may read the ledger.
+              const maySeeType = await kernel.authz.can(context.principal, 'hr.leave.view_ledger', {
+                kind: 'workspace',
+                id: input.workspaceId,
+                workspaceId: input.workspaceId,
+              })
+
+              let filtered = rows
+              if (input.officeId) {
+                const here = await tx
+                  .select({ personId: officeAssignments.personId })
+                  .from(officeAssignments)
+                  .where(
+                    and(
+                      eq(officeAssignments.workspaceId, input.workspaceId),
+                      eq(officeAssignments.officeId, input.officeId),
+                      isNull(officeAssignments.effectiveTo),
+                    ),
+                  )
+                const ids = new Set(here.map((h) => h.personId))
+                filtered = filtered.filter((r) => ids.has(r.personId))
+              }
+              if (input.orgUnitId) {
+                const ids = new Set(await unitMemberIds(tx, input.workspaceId, input.orgUnitId, true))
+                filtered = filtered.filter((r) => ids.has(r.personId))
+              }
+
+              return filtered.map((r) => {
+                const type = typeById.get(r.leaveTypeId)
+                return {
+                  personId: r.personId,
+                  displayName: nameById.get(r.personId) ?? 'Unknown',
+                  requestId: r.id,
+                  startsOn: r.startsOn,
+                  endsOn: r.endsOn,
+                  status: r.status as never,
+                  leaveTypeName: maySeeType ? (type?.name ?? null) : null,
+                  color: type?.color ?? null,
+                }
+              })
+            }),
+          ),
+      },
+    },
+
+    // ================================================================= approvals
+    approvals: {
+      /**
+       * Everything waiting on the caller. No permission: an inbox of what *you* must decide is
+       * yours by definition, and the engine only lists steps you are named on.
+       */
+      inbox: scoped.approvals.inbox.handler(({ input, context }) =>
+        db.withWorkspace(input.workspaceId, async (tx) => {
+          const me = await svc.byUserId(tx, input.workspaceId, context.principal.userId ?? '')
+          if (!me) return { items: [], nextCursor: null }
+          const rows = await approvals.inboxFor(
+            tx,
+            input.workspaceId,
+            me.id,
+            input.includeDecided,
+            input.limit,
+          )
+          const items = []
+          for (const r of rows) items.push(await hydrateApproval(tx, r))
+          return { items, nextCursor: null }
+        }),
+      ),
+
+      get: scoped.approvals.get.handler(({ input }) =>
+        db.withWorkspace(input.workspaceId, async (tx) => {
+          const [row] = await tx
+            .select()
+            .from(approvalRequests)
+            .where(
+              and(
+                eq(approvalRequests.workspaceId, input.workspaceId),
+                eq(approvalRequests.id, input.requestId),
+              ),
+            )
+            .limit(1)
+          if (!row) throw KernError.notFound('Approval request')
+          return hydrateApproval(tx, row)
+        }),
+      ),
+
+      decide: scoped.approvals.decide.handler(async ({ input, context }) => {
+        const outcome = await db.withWorkspace(input.workspaceId, async (tx) => {
+          const me = await svc.byUserId(tx, input.workspaceId, context.principal.userId ?? '')
+          if (!me) throw KernError.forbidden('You have no employee record in this workspace')
+
+          const result = await approvals.decide(
+            tx,
+            input.workspaceId,
+            input.requestId,
+            me.id,
+            input.decision,
+            input.comment ?? null,
+            input.onBehalfOfId ?? null,
+          )
+
+          // The approval engine knows nothing about leave. Applying the decision to the subject is
+          // the caller's job, which is what keeps the engine reusable for regularization and
+          // overtime later.
+          const request = result.request
+          if (request.subjectType === 'leave') {
+            if (result.status === 'approved')
+              await applyApproval(tx, input.workspaceId, request.subjectId, context.principal.userId ?? null)
+            else if (result.status === 'rejected')
+              await tx
+                .update(leaveRequests)
+                .set({ status: 'rejected', decidedAt: new Date(), updatedAt: new Date() })
+                .where(eq(leaveRequests.id, request.subjectId))
+          }
+
+          const [fresh] = await tx
+            .select()
+            .from(approvalRequests)
+            .where(eq(approvalRequests.id, input.requestId))
+          return { hydrated: await hydrateApproval(tx, fresh!), request: fresh! }
+        })
+
+        await kernel.emit(
+          hrEvents.approvalDecided,
+          {
+            requestId: outcome.request.id,
+            workspaceId: input.workspaceId,
+            subjectType: outcome.request.subjectType,
+            subjectId: outcome.request.subjectId,
+            status: outcome.request.status,
+          },
+          { workspaceId: input.workspaceId, actorId: context.principal.userId },
+        )
+        await changed(input.workspaceId, 'approval', outcome.request.id, 'updated')
+        return outcome.hydrated
+      }),
+
+      chains: {
+        list: scoped.approvals.chains.list
+          .use(cap('approvals'))
+          .use(requires('hr.approval.manage'))
+          .handler(({ input }) =>
+            db.withWorkspace(input.workspaceId, async (tx) => {
+              const where = [
+                eq(approvalChains.workspaceId, input.workspaceId),
+                isNull(approvalChains.archivedAt),
+              ]
+              if (input.subjectType) where.push(eq(approvalChains.subjectType, input.subjectType))
+              const rows = await tx
+                .select()
+                .from(approvalChains)
+                .where(and(...where))
+                .orderBy(asc(approvalChains.name))
+              return rows.map(toChain)
+            }),
+          ),
+        create: scoped.approvals.chains.create
+          .use(cap('approvals'))
+          .use(requires('hr.approval.manage'))
+          .handler(async ({ input }) => {
+            const row = await db.withWorkspace(input.workspaceId, async (tx) => {
+              if (input.isDefault) await clearDefaultChain(tx, input.workspaceId, input.subjectType)
+              const [created] = await tx
+                .insert(approvalChains)
+                .values({
+                  id: uuidv7(),
+                  workspaceId: input.workspaceId,
+                  name: input.name,
+                  subjectType: input.subjectType,
+                  spec: input.spec as unknown as Record<string, unknown>,
+                  isDefault: input.isDefault,
+                })
+                .returning()
+              return created!
+            })
+            await changed(input.workspaceId, 'approval_chain', row.id, 'created')
+            return toChain(row)
+          }),
+        update: scoped.approvals.chains.update
+          .use(cap('approvals'))
+          .use(requires('hr.approval.manage'))
+          .handler(async ({ input }) => {
+            const row = await db.withWorkspace(input.workspaceId, async (tx) => {
+              const [existing] = await tx
+                .select()
+                .from(approvalChains)
+                .where(
+                  and(
+                    eq(approvalChains.workspaceId, input.workspaceId),
+                    eq(approvalChains.id, input.chainId),
+                  ),
+                )
+                .limit(1)
+              if (!existing) throw KernError.notFound('Approval chain')
+              if (input.isDefault) await clearDefaultChain(tx, input.workspaceId, existing.subjectType)
+              const set: Record<string, unknown> = { updatedAt: new Date() }
+              if (input.name !== undefined) set.name = input.name
+              if (input.spec !== undefined) set.spec = input.spec
+              if (input.isDefault !== undefined) set.isDefault = input.isDefault
+              const [updated] = await tx
+                .update(approvalChains)
+                .set(set)
+                .where(eq(approvalChains.id, input.chainId))
+                .returning()
+              return updated!
+            })
+            await changed(input.workspaceId, 'approval_chain', row.id, 'updated')
+            return toChain(row)
+          }),
+        archive: scoped.approvals.chains.archive
+          .use(cap('approvals'))
+          .use(requires('hr.approval.manage'))
+          .handler(async ({ input }) => {
+            // In-flight requests carry their own snapshot of the chain, so archiving one cannot
+            // strand an approval half-signed.
+            await db.withWorkspace(input.workspaceId, (tx) =>
+              tx
+                .update(approvalChains)
+                .set({ archivedAt: new Date(), isDefault: false })
+                .where(
+                  and(
+                    eq(approvalChains.workspaceId, input.workspaceId),
+                    eq(approvalChains.id, input.chainId),
+                  ),
+                ),
+            )
+            await changed(input.workspaceId, 'approval_chain', input.chainId, 'deleted')
+            return { ok: true as const }
+          }),
+      },
+
+      delegations: scoped.approvals.delegations
+        .use(cap('approvals'))
+        .use(requires('hr.approval.delegate'))
+        .handler(({ input, context }) =>
+          db.withWorkspace(input.workspaceId, async (tx) => {
+            const personId = await personFor(tx, input.workspaceId, context, input.personId)
+            const rows = await tx
+              .select()
+              .from(delegations)
+              .where(
+                and(
+                  eq(delegations.workspaceId, input.workspaceId),
+                  or(eq(delegations.fromPersonId, personId), eq(delegations.toPersonId, personId)),
+                ),
+              )
+              .orderBy(desc(delegations.startsOn))
+            return rows.map(toDelegation)
+          }),
+        ),
+
+      delegate: scoped.approvals.delegate
+        .use(cap('approvals'))
+        .use(requires('hr.approval.delegate'))
+        .handler(async ({ input, context }) => {
+          const row = await db.withWorkspace(input.workspaceId, async (tx) => {
+            const me = await svc.byUserId(tx, input.workspaceId, context.principal.userId ?? '')
+            if (!me) throw KernError.forbidden('You have no employee record in this workspace')
+            if (me.id === input.toPersonId)
+              throw KernError.badRequest('You cannot delegate your approvals to yourself.')
+            if (input.endsOn < input.startsOn)
+              throw KernError.badRequest('A delegation cannot end before it starts.')
+            const [created] = await tx
+              .insert(delegations)
+              .values({
+                id: uuidv7(),
+                workspaceId: input.workspaceId,
+                fromPersonId: me.id,
+                toPersonId: input.toPersonId,
+                subjectType: input.subjectType ?? null,
+                startsOn: input.startsOn,
+                endsOn: input.endsOn,
+                reason: input.reason ?? null,
+              })
+              .returning()
+            return created!
+          })
+          await changed(input.workspaceId, 'delegation', row.id, 'created')
+          return toDelegation(row)
+        }),
+
+      revokeDelegation: scoped.approvals.revokeDelegation
+        .use(cap('approvals'))
+        .use(requires('hr.approval.delegate'))
+        .handler(async ({ input, context }) => {
+          await db.withWorkspace(input.workspaceId, async (tx) => {
+            const me = await svc.byUserId(tx, input.workspaceId, context.principal.userId ?? '')
+            const [row] = await tx
+              .select()
+              .from(delegations)
+              .where(
+                and(eq(delegations.workspaceId, input.workspaceId), eq(delegations.id, input.delegationId)),
+              )
+              .limit(1)
+            if (!row) throw KernError.notFound('Delegation')
+            // Only the person who gave it away may take it back — otherwise a delegate could quietly
+            // extend their own authority by revoking the competition.
+            if (row.fromPersonId !== me?.id)
+              throw KernError.forbidden('Only the person who delegated may revoke it')
+            await tx.delete(delegations).where(eq(delegations.id, row.id))
+          })
+          await changed(input.workspaceId, 'delegation', input.delegationId, 'deleted')
+          return { ok: true as const }
+        }),
+    },
+
     // ================================================================= custom fields
     fields: {
       list: scoped.fields.list.use(requires('hr.person.view')).handler(({ input }) =>
@@ -1824,6 +2517,265 @@ export function implement_(kernel: Kernel) {
     return parent ? `${parent}.${label}` : label
   }
 
+  /**
+   * The person a call is about: the one named, or the caller.
+   *
+   * Reading somebody else's balance needs `hr.leave.view_team`; reading your own needs nothing
+   * beyond being an employee. Collapsing those into one permission would either hide your own
+   * balance from you or show you everybody's.
+   */
+  async function personFor(
+    tx: Tx,
+    workspaceId: string,
+    context: RequestContext,
+    personId: string | undefined,
+  ): Promise<string> {
+    const me = await svc.byUserId(tx, workspaceId, context.principal.userId ?? '')
+    if (!personId) {
+      if (!me) throw KernError.notFound('Your employee record')
+      return me.id
+    }
+    if (me && me.id === personId) return personId
+    await kernel.authz.require(context.principal, 'hr.leave.view_team', {
+      kind: 'workspace',
+      id: workspaceId,
+      workspaceId,
+    })
+    return personId
+  }
+
+  async function loadRequest(tx: Tx, workspaceId: string, requestId: string) {
+    const [row] = await tx
+      .select()
+      .from(leaveRequests)
+      .where(and(eq(leaveRequests.workspaceId, workspaceId), eq(leaveRequests.id, requestId)))
+      .limit(1)
+    if (!row) throw KernError.notFound('Leave request')
+    return row
+  }
+
+  /**
+   * What a request would cost, and every reason it would be refused.
+   *
+   * Used by `simulate` *and* by `create`, deliberately: a preview that runs different code from the
+   * submission is a preview that eventually lies. The blockers are returned rather than thrown here
+   * so the screen can show all of them at once instead of one per round trip.
+   */
+  async function simulate(
+    tx: Tx,
+    workspaceId: string,
+    personId: string,
+    input: {
+      leaveTypeId: string
+      startsOn: string
+      endsOn: string
+      startPart: 'full' | 'morning' | 'afternoon'
+      endPart: 'full' | 'morning' | 'afternoon'
+      hours?: number | null
+    },
+  ) {
+    const blockers: Array<{ code: string; message: string }> = []
+    if (input.endsOn < input.startsOn)
+      blockers.push({ code: 'range', message: 'The end date is before the start date.' })
+
+    const [type] = await tx
+      .select()
+      .from(leaveTypes)
+      .where(and(eq(leaveTypes.workspaceId, workspaceId), eq(leaveTypes.id, input.leaveTypeId)))
+      .limit(1)
+    if (!type) throw KernError.notFound('Leave type')
+    if (type.archivedAt) blockers.push({ code: 'archived', message: `${type.name} is no longer available.` })
+
+    const resolution = await resolve.forPerson(tx, workspaceId, personId, input.startsOn)
+    const calendarDaysInRange = resolution.calendarId
+      ? await composedDays(tx, workspaceId, resolution.calendarId, input.startsOn, input.endsOn)
+      : []
+
+    const results = workingDays(
+      input.startsOn,
+      input.endsOn,
+      resolution.workingWeek,
+      type.countsWorkingDaysOnly
+        ? calendarDaysInRange.map((d) => ({
+            date: d.date,
+            name: d.name,
+            workingFraction: d.workingFraction,
+          }))
+        : [],
+    )
+
+    // Half-days trim the ends. Applied after the calendar, so asking for a half day on a public
+    // holiday still costs nothing rather than costing half of nothing.
+    const days = results.map((r) => {
+      let fraction = r.fraction
+      if (r.date === input.startsOn && input.startPart === 'afternoon') fraction = Math.min(fraction, 0.5)
+      if (r.date === input.endsOn && input.endPart === 'morning') fraction = Math.min(fraction, 0.5)
+      return { date: r.date, fraction, counted: fraction > 0, reason: r.reason }
+    })
+
+    const workingDaysTotal = Math.round(days.reduce((sum, d) => sum + d.fraction, 0) * 100) / 100
+    const minutes =
+      type.unit === 'hour' && input.hours
+        ? Math.round(input.hours * 60)
+        : Math.round(workingDaysTotal * MINUTES_PER_DAY)
+
+    if (minutes <= 0)
+      blockers.push({
+        code: 'empty',
+        message: 'That range contains no working days.',
+      })
+
+    const year = yearOf(input.startsOn)
+    const balances = await ledger.balances(tx, workspaceId, personId, year)
+    const balance = balances.find((b) => b.leaveTypeId === input.leaveTypeId)
+    const before = balance?.availableMinutes ?? 0
+    const after = before - minutes
+    if (after < 0 && !type.allowNegative)
+      blockers.push({
+        code: 'insufficient',
+        message: `Not enough ${type.name}: this would leave ${Math.round((after / MINUTES_PER_DAY) * 100) / 100} days.`,
+      })
+    if (after < 0 && type.allowNegative && Math.abs(after) > type.maxNegativeMinutes)
+      blockers.push({
+        code: 'below_floor',
+        message: `${type.name} cannot go further than ${Math.round(type.maxNegativeMinutes / MINUTES_PER_DAY)} days negative.`,
+      })
+
+    // Overlap is refused by a unique index as well; checking here turns a constraint violation into
+    // a sentence naming the dates.
+    const counted = days.filter((d) => d.counted).map((d) => d.date)
+    if (counted.length) {
+      const clash = await tx
+        .select({ date: leaveRequestDays.date })
+        .from(leaveRequestDays)
+        .where(
+          and(
+            eq(leaveRequestDays.workspaceId, workspaceId),
+            eq(leaveRequestDays.personId, personId),
+            eq(leaveRequestDays.counted, true),
+            inArray(leaveRequestDays.status, ['pending', 'approved']),
+            inArray(leaveRequestDays.date, counted),
+          ),
+        )
+        .limit(3)
+      if (clash.length)
+        blockers.push({
+          code: 'overlap',
+          message: `You already have leave booked on ${clash.map((c) => c.date).join(', ')}.`,
+        })
+    }
+
+    if (type.requiresDocumentAfterDays !== null && workingDaysTotal > type.requiresDocumentAfterDays)
+      blockers.push({
+        code: 'document_required',
+        message: `${type.name} longer than ${type.requiresDocumentAfterDays} days needs a document.`,
+      })
+
+    return {
+      workingDays: workingDaysTotal,
+      minutes,
+      days,
+      balanceBeforeMinutes: before,
+      balanceAfterMinutes: after,
+      blockers,
+    }
+  }
+
+  /**
+   * Turn an approved request into a ledger consumption.
+   *
+   * The working days are **recomputed here** rather than trusted from submission time: a holiday
+   * can be added to the calendar between asking and approving, and the number that costs somebody
+   * balance should be the one that was true when it was granted.
+   */
+  async function applyApproval(tx: Tx, workspaceId: string, leaveRequestId: string, actorId: string | null) {
+    const request = await loadRequest(tx, workspaceId, leaveRequestId)
+    if (request.status === 'approved') return
+
+    const sim = await simulate(tx, workspaceId, request.personId, {
+      leaveTypeId: request.leaveTypeId,
+      startsOn: request.startsOn,
+      endsOn: request.endsOn,
+      startPart: request.startPart as 'full' | 'morning' | 'afternoon',
+      endPart: request.endPart as 'full' | 'morning' | 'afternoon',
+      hours: request.hours === null ? null : Number.parseFloat(request.hours),
+    })
+
+    await ledger.append(tx, workspaceId, {
+      personId: request.personId,
+      leaveTypeId: request.leaveTypeId,
+      kind: 'consumption',
+      amountMinutes: -sim.minutes,
+      effectiveOn: request.startsOn,
+      periodYear: yearOf(request.startsOn),
+      requestId: request.id,
+      reason: null,
+      createdBy: actorId,
+    })
+
+    await tx
+      .update(leaveRequestDays)
+      .set({ status: 'approved' })
+      .where(eq(leaveRequestDays.requestId, request.id))
+    await tx
+      .update(leaveRequests)
+      .set({
+        status: 'approved',
+        minutes: sim.minutes,
+        workingDays: String(sim.workingDays),
+        decidedAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .where(eq(leaveRequests.id, request.id))
+  }
+
+  async function clearDefaultChain(tx: Tx, workspaceId: string, subjectType: string) {
+    await tx
+      .update(approvalChains)
+      .set({ isDefault: false })
+      .where(
+        and(
+          eq(approvalChains.workspaceId, workspaceId),
+          eq(approvalChains.subjectType, subjectType),
+          eq(approvalChains.isDefault, true),
+        ),
+      )
+  }
+
+  /** An approval request with its steps and decisions, which is the only useful shape. */
+  async function hydrateApproval(tx: Tx, row: typeof approvalRequests.$inferSelect) {
+    const steps = await tx
+      .select()
+      .from(approvalSteps)
+      .where(eq(approvalSteps.requestId, row.id))
+      .orderBy(asc(approvalSteps.stepIndex))
+    const stepIds = steps.map((s) => s.id)
+    const decisions = stepIds.length
+      ? await tx.select().from(approvalDecisions).where(inArray(approvalDecisions.stepId, stepIds))
+      : []
+    return {
+      ...row,
+      subjectType: row.subjectType as never,
+      status: row.status as never,
+      requestedAt: row.requestedAt.toISOString(),
+      decidedAt: row.decidedAt?.toISOString() ?? null,
+      steps: steps.map((s) => ({
+        ...s,
+        mode: s.mode as never,
+        status: s.status as never,
+        dueAt: s.dueAt?.toISOString() ?? null,
+        escalatedAt: s.escalatedAt?.toISOString() ?? null,
+        decisions: decisions
+          .filter((d) => d.stepId === s.id)
+          .map((d) => ({
+            ...d,
+            decision: d.decision as 'approve' | 'reject',
+            at: d.at.toISOString(),
+          })),
+      })),
+    }
+  }
+
   async function emitCalendarChanged(
     workspaceId: WorkspaceId,
     calendarId: string,
@@ -1883,4 +2835,41 @@ const toResolvedDay = (
   fromCalendarId,
   fromCalendarName,
   overrides,
+})
+
+const toLeaveType = (r: typeof leaveTypes.$inferSelect) => ({
+  ...r,
+  unit: r.unit as never,
+  archivedAt: r.archivedAt?.toISOString() ?? null,
+})
+
+const toLedgerEntry = (r: typeof leaveLedger.$inferSelect) => ({
+  ...r,
+  kind: r.kind as never,
+  createdAt: r.createdAt.toISOString(),
+})
+
+const toLeaveRequest = (r: typeof leaveRequests.$inferSelect) => ({
+  ...r,
+  startPart: r.startPart as never,
+  endPart: r.endPart as never,
+  status: r.status as never,
+  hours: r.hours === null ? null : Number.parseFloat(r.hours),
+  workingDays: Number.parseFloat(r.workingDays),
+  decidedAt: r.decidedAt?.toISOString() ?? null,
+  createdAt: r.createdAt.toISOString(),
+  updatedAt: r.updatedAt.toISOString(),
+})
+
+const toChain = (r: typeof approvalChains.$inferSelect) => ({
+  ...r,
+  subjectType: r.subjectType as never,
+  spec: r.spec as never,
+  archivedAt: r.archivedAt?.toISOString() ?? null,
+})
+
+const toDelegation = (r: typeof delegations.$inferSelect) => ({
+  ...r,
+  subjectType: (r.subjectType ?? null) as never,
+  createdAt: r.createdAt.toISOString(),
 })
