@@ -1,5 +1,11 @@
 # @kernhq/module-hr
 
+## 0.6.0
+
+### Minor Changes
+
+- feat(hr): the accrual, carry-forward and overtime arithmetic
+
 ## 0.5.0
 
 ### Minor Changes
