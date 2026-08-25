@@ -1,5 +1,11 @@
 # @kernhq/module-hr
 
+## 0.5.0
+
+### Minor Changes
+
+- feat(hr): resolve each person's primary office in the directory list
+
 ## 0.4.0
 
 ### Minor Changes
