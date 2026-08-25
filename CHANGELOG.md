@@ -1,5 +1,11 @@
 # @kernhq/module-hr
 
+## 0.9.1
+
+### Patch Changes
+
+- fix(deps): reach the framework that was just published
+
 ## 0.9.0
 
 ### Minor Changes
