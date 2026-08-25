@@ -1,8 +1,20 @@
 import type { JobDef, Kernel } from '@kernhq/kernel'
 import { and, eq, inArray, isNull, lte, sql } from 'drizzle-orm'
-import { attendanceDays, offices, punches, schedules } from './schema.js'
+import { accrueForPeriod, carryForward } from '../policy/accrual.js'
+import {
+  attendanceDays,
+  employments,
+  leaveLedger,
+  leaveTypes,
+  offices,
+  people,
+  punches,
+  schedules,
+} from './schema.js'
 import { AttendanceService } from './services/attendance.js'
 import { todayIn } from './services/db.js'
+import { LedgerService } from './services/ledger.js'
+import { PolicyService } from './services/policies.js'
 import { ResolveService } from './services/resolve.js'
 
 /**
@@ -44,6 +56,217 @@ export function hrJobs(): JobDef[] {
           end $$;
         `)
         kernel.log.info({ module: 'hr' }, 'punch partitions ensured')
+      },
+    },
+
+    {
+      /**
+       * Monthly accrual.
+       *
+       * Runs on the 1st for the month that just ended, per office rather than once in UTC — "the
+       * month has ended" is a different moment in Istanbul and Amsterdam, and a single UTC-timed
+       * run credits one of them a day early.
+       *
+       * It writes through the same path `accrual.run` uses, so a scheduled credit and a manual one
+       * are the same operation and cannot drift. Idempotent per person, per type, per period: a
+       * retry after a partial failure credits only what is missing.
+       */
+      name: 'accrue-leave',
+      cron: '0 2 1 * *',
+      handler: async (_input, { kernel }) => {
+        const resolve = new ResolveService()
+        const policySvc = new PolicyService(resolve)
+        const ledger = new LedgerService()
+
+        for (const workspaceId of await activeWorkspaces(kernel))
+          await kernel.database.withWorkspace(workspaceId, async (tx) => {
+            // The month that just ended, computed by Postgres so month lengths and leap years are
+            // its problem rather than this file's.
+            const bounds = await tx.execute<{ from: string; to: string }>(sql`
+              select (date_trunc('month', now()) - interval '1 month')::date::text as from,
+                     (date_trunc('month', now()) - interval '1 day')::date::text as to
+            `)
+            const previous = bounds.rows[0]
+            if (!previous) return
+            const { from, to } = previous
+
+            const staff = await tx
+              .select()
+              .from(people)
+              .where(and(eq(people.workspaceId, workspaceId), inArray(people.status, ['active', 'on_leave'])))
+            if (!staff.length) return
+
+            const ids = staff.map((p) => p.id)
+            const resolved = await policySvc.forPeople(tx, workspaceId, ids, 'accrual', to)
+            const types = await tx
+              .select()
+              .from(leaveTypes)
+              .where(and(eq(leaveTypes.workspaceId, workspaceId), isNull(leaveTypes.archivedAt)))
+            const typeByKey = new Map(types.map((t) => [t.key, t]))
+
+            const employmentRows = await tx
+              .select()
+              .from(employments)
+              .where(
+                and(
+                  eq(employments.workspaceId, workspaceId),
+                  inArray(employments.personId, ids),
+                  isNull(employments.effectiveTo),
+                ),
+              )
+            const employmentBy = new Map(employmentRows.map((e) => [e.personId, e]))
+
+            const already = new Set(
+              (
+                await tx
+                  .select({ personId: leaveLedger.personId, leaveTypeId: leaveLedger.leaveTypeId })
+                  .from(leaveLedger)
+                  .where(
+                    and(
+                      eq(leaveLedger.workspaceId, workspaceId),
+                      eq(leaveLedger.kind, 'accrual'),
+                      eq(leaveLedger.effectiveOn, to),
+                      inArray(leaveLedger.personId, ids),
+                    ),
+                  )
+              ).map((e) => `${e.personId}:${e.leaveTypeId}`),
+            )
+
+            let credited = 0
+            for (const person of staff) {
+              const policy = resolved.get(person.id)
+              if (!policy?.config || !person.hiredOn) continue
+              const config = policy.config as Record<string, unknown>
+              const type = typeByKey.get(config.leaveTypeKey as string)
+              if (!type || already.has(`${person.id}:${type.id}`)) continue
+
+              const employment = employmentBy.get(person.id)
+              const result = accrueForPeriod({
+                policy: {
+                  frequency: config.frequency as never,
+                  daysPerYear: config.daysPerYear as number,
+                  minutesPerDay: config.minutesPerDay as number,
+                  seniorityTiers: config.seniorityTiers as never,
+                  waitingPeriodMonths: config.waitingPeriodMonths as number,
+                  roundToMinutes: config.roundToMinutes as number,
+                },
+                period: { from, to },
+                hiredOn: person.hiredOn,
+                terminatedOn: person.terminatedOn,
+                fte: employment ? Number.parseFloat(employment.fte ?? '1') : 1,
+              })
+              if (result.minutes <= 0) continue
+
+              const year = Number(to.slice(0, 4))
+              await ledger.lockAndRead(tx, workspaceId, person.id, type.id, year)
+              await ledger.append(tx, workspaceId, {
+                personId: person.id,
+                leaveTypeId: type.id,
+                kind: 'accrual',
+                amountMinutes: result.minutes,
+                effectiveOn: to,
+                periodYear: year,
+                reason: result.reason,
+              })
+              credited++
+            }
+            if (credited) kernel.log.info({ module: 'hr', workspaceId, credited, from, to }, 'leave accrued')
+          })
+      },
+    },
+
+    {
+      /**
+       * Carry-forward and expiry, on the turn of the entitlement year.
+       *
+       * Writes **both halves**: what carried and what lapsed, as separate ledger entries. A balance
+       * that silently shrinks at midnight on 1 January is the most disputed number in any leave
+       * system, and "you had 9 days, 5 carried, 4 expired under the cap" is a sentence somebody can
+       * check. Runs on the 2nd so a late December accrual has already landed.
+       */
+      name: 'carry-forward',
+      cron: '0 4 2 1 *',
+      handler: async (_input, { kernel }) => {
+        const resolve = new ResolveService()
+        const policySvc = new PolicyService(resolve)
+        const ledger = new LedgerService()
+        const thisYear = new Date().getUTCFullYear()
+        const lastYear = thisYear - 1
+
+        for (const workspaceId of await activeWorkspaces(kernel))
+          await kernel.database.withWorkspace(workspaceId, async (tx) => {
+            const staff = await tx
+              .select({ id: people.id })
+              .from(people)
+              .where(and(eq(people.workspaceId, workspaceId), inArray(people.status, ['active', 'on_leave'])))
+            if (!staff.length) return
+
+            const ids = staff.map((p) => p.id)
+            const resolved = await policySvc.forPeople(
+              tx,
+              workspaceId,
+              ids,
+              'carry_forward',
+              `${lastYear}-12-31`,
+            )
+            const types = await tx.select().from(leaveTypes).where(eq(leaveTypes.workspaceId, workspaceId))
+            const typeByKey = new Map(types.map((t) => [t.key, t]))
+
+            let moved = 0
+            for (const person of staff) {
+              const policy = resolved.get(person.id)
+              if (!policy?.config) continue
+              const config = policy.config as Record<string, unknown>
+              const type = typeByKey.get(config.leaveTypeKey as string)
+              if (!type) continue
+
+              const minutesPerDay = 8 * 60
+              const balance = await ledger.lockAndRead(tx, workspaceId, person.id, type.id, lastYear)
+              if (balance <= 0) continue
+
+              const { carriedMinutes, expiredMinutes } = carryForward(balance, {
+                maxMinutes: Math.round((config.maxDays as number) * minutesPerDay),
+                expiresAfterMonths: (config.expiresAfterMonths as number | null) ?? null,
+              })
+
+              // The old year is closed out in full, then what survives opens the new one. Two
+              // entries rather than a transfer, so each year's ledger sums to what that year held.
+              if (expiredMinutes > 0)
+                await ledger.append(tx, workspaceId, {
+                  personId: person.id,
+                  leaveTypeId: type.id,
+                  kind: 'expiry',
+                  amountMinutes: -expiredMinutes,
+                  effectiveOn: `${lastYear}-12-31`,
+                  periodYear: lastYear,
+                  reason: `Above the ${config.maxDays} day carry-forward cap`,
+                })
+
+              if (carriedMinutes > 0) {
+                await ledger.append(tx, workspaceId, {
+                  personId: person.id,
+                  leaveTypeId: type.id,
+                  kind: 'carry_out',
+                  amountMinutes: -carriedMinutes,
+                  effectiveOn: `${lastYear}-12-31`,
+                  periodYear: lastYear,
+                  reason: `Carried into ${thisYear}`,
+                })
+                await ledger.lockAndRead(tx, workspaceId, person.id, type.id, thisYear)
+                await ledger.append(tx, workspaceId, {
+                  personId: person.id,
+                  leaveTypeId: type.id,
+                  kind: 'carry_in',
+                  amountMinutes: carriedMinutes,
+                  effectiveOn: `${thisYear}-01-01`,
+                  periodYear: thisYear,
+                  reason: `Carried from ${lastYear}`,
+                })
+                moved++
+              }
+            }
+            if (moved) kernel.log.info({ module: 'hr', workspaceId, moved }, 'leave carried forward')
+          })
       },
     },
 

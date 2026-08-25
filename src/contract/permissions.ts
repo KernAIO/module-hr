@@ -273,6 +273,31 @@ export const hrPermissions = definePermissions([
     dangerous: false,
   },
 
+  // ---------------------------------------------------------------- policies and periods
+  {
+    key: 'hr.policy.view',
+    label: 'View accrual, overtime and rounding policies',
+    scope: 'workspace',
+    defaultRoles: ['owner', 'admin'],
+    dangerous: false,
+  },
+  {
+    key: 'hr.policy.manage',
+    label: 'Change policies and who they apply to',
+    description: 'Changes what everybody accrues. A retroactive change is an adjustment, not a rewrite.',
+    scope: 'workspace',
+    defaultRoles: ['owner'],
+    dangerous: true,
+  },
+  {
+    key: 'hr.period.manage',
+    label: 'Open, lock and unlock payroll periods',
+    description: 'Locking freezes a month against recomputation. Unlocking lets it move again.',
+    scope: 'workspace',
+    defaultRoles: ['owner'],
+    dangerous: true,
+  },
+
   // ---------------------------------------------------------------- approvals
   {
     key: 'hr.approval.manage',
@@ -334,6 +359,9 @@ export const HR_PERMISSIONS = {
   attendanceManage: 'hr.attendance.manage',
   overtimeView: 'hr.overtime.view',
   overtimeManage: 'hr.overtime.manage',
+  policyView: 'hr.policy.view',
+  policyManage: 'hr.policy.manage',
+  periodManage: 'hr.period.manage',
   approvalManage: 'hr.approval.manage',
   approvalDelegate: 'hr.approval.delegate',
 } as const

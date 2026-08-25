@@ -771,6 +771,95 @@ export const regularizations = schema.table(
   (t) => [index('hr_regularizations_idx').on(t.workspaceId, t.personId, t.businessDate)],
 )
 
+// =====================================================================================
+// policies and periods
+// =====================================================================================
+
+/**
+ * A policy is a row, not a branch.
+ *
+ * Leave entitlement, overtime rules and rounding differ per company and per country. Encoding that
+ * as `if (country === 'TR')` is how a product acquires a branch per customer and a release cycle
+ * per rule change. A policy carries a kind, a config validated by that kind's schema, and an
+ * effective range — so a rule that changed in July is still answerable for June.
+ *
+ * `configHash` is what a derived row records, so a recomputation can tell a stale figure from a
+ * current one without re-deriving it.
+ */
+export const policies = schema.table(
+  'policies',
+  {
+    id: id(),
+    workspaceId: ws(),
+    kind: text('kind').notNull(),
+    name: text('name').notNull(),
+    config: jsonb('config').$type<Record<string, unknown>>().notNull(),
+    effectiveFrom: date('effective_from').notNull(),
+    effectiveTo: date('effective_to'),
+    source: text('source').notNull().default('custom'),
+    packKey: text('pack_key'),
+    configHash: text('config_hash').notNull().default(''),
+    archivedAt: ts('archived_at'),
+    createdAt: created(),
+    updatedAt: updated(),
+  },
+  (t) => [index('hr_policies_ws_kind_idx').on(t.workspaceId, t.kind, t.effectiveFrom)],
+)
+
+/**
+ * Who a policy applies to, and how strongly.
+ *
+ * `priority` is the resolution ladder made explicit — person 100, office 80, legal entity 60, org
+ * unit 40, position 30, workspace 0 — so a query orders by it rather than a service knowing the
+ * sequence by heart. The same order resolves a calendar.
+ */
+export const policyAssignments = schema.table(
+  'policy_assignments',
+  {
+    id: id(),
+    workspaceId: ws(),
+    policyId: uuid('policy_id').notNull(),
+    subjectKind: text('subject_kind').notNull(),
+    /** Null for `workspace`, which needs no id. */
+    subjectId: uuid('subject_id'),
+    effectiveFrom: date('effective_from').notNull(),
+    effectiveTo: date('effective_to'),
+    priority: integer('priority').notNull().default(0),
+    createdAt: created(),
+  },
+  (t) => [
+    index('hr_policy_assign_idx').on(t.workspaceId, t.subjectKind, t.subjectId),
+    index('hr_policy_assign_policy_idx').on(t.workspaceId, t.policyId),
+  ],
+)
+
+/**
+ * A closed month, and the boundary every recomputation respects.
+ *
+ * Locking is what makes a filed payroll safe: `attendance_days.locked` mirrors this, so a policy
+ * changed with a retroactive `effectiveFrom` produces an adjustment in the open period rather than
+ * rewriting a month somebody has already been paid for.
+ *
+ * Per legal entity, because a Dutch entity closes on a different day from a Turkish one.
+ */
+export const periods = schema.table(
+  'periods',
+  {
+    id: id(),
+    workspaceId: ws(),
+    kind: text('kind').notNull().default('payroll'),
+    legalEntityId: uuid('legal_entity_id'),
+    startsOn: date('starts_on').notNull(),
+    endsOn: date('ends_on').notNull(),
+    status: text('status').notNull().default('open'),
+    lockedAt: ts('locked_at'),
+    lockedBy: uuid('locked_by'),
+    note: text('note'),
+    createdAt: created(),
+  },
+  (t) => [index('hr_periods_idx').on(t.workspaceId, t.kind, t.startsOn)],
+)
+
 /** Every tenant table, so the RLS migration is checked against one list rather than memory. */
 export const TENANT_TABLES = [
   'legal_entities',
@@ -802,4 +891,7 @@ export const TENANT_TABLES = [
   'punches',
   'attendance_days',
   'regularizations',
+  'policies',
+  'policy_assignments',
+  'periods',
 ] as const

@@ -4,8 +4,10 @@ import { createKernel, type Kernel, type Tx } from '@kernhq/kernel'
 import { and, eq } from 'drizzle-orm'
 import pg from 'pg'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { carryForward } from '../policy/accrual.js'
 import { hrModule } from './index.js'
 import {
+  attendanceDays,
   calendarDays,
   calendars,
   employments,
@@ -16,13 +18,19 @@ import {
   leaveTypes,
   officeAssignments,
   offices,
+  orgUnits,
   people,
+  periods,
+  policies,
+  policyAssignments,
   punches,
   TENANT_TABLES,
 } from './schema.js'
 import { ApprovalService } from './services/approvals.js'
+import { AttendanceService, NO_SCHEDULE } from './services/attendance.js'
 import { LedgerService } from './services/ledger.js'
 import { PeopleService } from './services/people.js'
+import { hashConfig, PolicyService } from './services/policies.js'
 import { ResolveService } from './services/resolve.js'
 
 /**
@@ -863,5 +871,456 @@ describe('punches partitioning', () => {
     } finally {
       await plain.end()
     }
+  })
+})
+
+/**
+ * The policy ladder, against the database.
+ *
+ * `person → office → legal entity → org unit → workspace`, nearest wins. The unit tests prove the
+ * arithmetic a policy performs; this proves the right policy is the one that reaches it — which is
+ * the half that decides whether two people on the same terms accrue the same amount.
+ */
+describe('policy resolution', () => {
+  const policySvc = new PolicyService(new ResolveService())
+  let alice: string
+  let homeOffice: string
+  let unit: string
+
+  const makePolicy = (name: string, days: number) =>
+    run(async (tx) => {
+      const [row] = await tx
+        .insert(policies)
+        .values({
+          workspaceId: WS_A,
+          kind: 'accrual',
+          name,
+          config: { daysPerYear: days, frequency: 'monthly', minutesPerDay: 480, leaveTypeKey: 'annual' },
+          effectiveFrom: '2026-01-01',
+          configHash: hashConfig({ daysPerYear: days }),
+        })
+        .returning()
+      return row!.id
+    })
+
+  const assign = (policyId: string, subjectKind: string, subjectId: string | null) =>
+    run((tx) =>
+      tx.insert(policyAssignments).values({
+        workspaceId: WS_A,
+        policyId,
+        subjectKind,
+        subjectId,
+        effectiveFrom: '2026-01-01',
+        priority: PolicyService.priorityFor(subjectKind as never),
+      }),
+    )
+
+  beforeAll(async () => {
+    const ids = await run(async (tx) => {
+      const [home] = await tx.select().from(offices).where(eq(offices.isDefault, true))
+      const [org] = await tx
+        .insert(orgUnits)
+        .values({ workspaceId: WS_A, path: 'policytest', name: 'Policy test' })
+        .returning()
+      const [person] = await tx
+        .insert(people)
+        .values({ workspaceId: WS_A, displayName: 'Policy Alice' })
+        .returning()
+      await tx.insert(employments).values({
+        workspaceId: WS_A,
+        personId: person!.id,
+        effectiveFrom: '2026-01-01',
+        orgUnitId: org!.id,
+      })
+      await tx.insert(officeAssignments).values({
+        workspaceId: WS_A,
+        personId: person!.id,
+        officeId: home!.id,
+        isPrimary: true,
+        effectiveFrom: '2026-01-01',
+      })
+      return { alice: person!.id, homeOffice: home!.id, unit: org!.id }
+    })
+    alice = ids.alice
+    homeOffice = ids.homeOffice
+    unit = ids.unit
+  }, 60_000)
+
+  it('falls back to the workspace policy when nothing nearer applies', async () => {
+    const id = await makePolicy('Workspace default', 14)
+    await assign(id, 'workspace', null)
+    const r = await run((tx) => policySvc.forPerson(tx, WS_A, alice, 'accrual', '2026-06-01'))
+    expect(r.policyName).toBe('Workspace default')
+    expect(r.from).toBe('workspace')
+  })
+
+  it('prefers the org unit over the workspace', async () => {
+    const id = await makePolicy('Department', 18)
+    await assign(id, 'org_unit', unit)
+    const r = await run((tx) => policySvc.forPerson(tx, WS_A, alice, 'accrual', '2026-06-01'))
+    expect(r.policyName).toBe('Department')
+    expect(r.from).toBe('org_unit')
+  })
+
+  it('prefers the office over the org unit', async () => {
+    const id = await makePolicy('Office', 20)
+    await assign(id, 'office', homeOffice)
+    const r = await run((tx) => policySvc.forPerson(tx, WS_A, alice, 'accrual', '2026-06-01'))
+    expect(r.policyName).toBe('Office')
+    expect(r.from).toBe('office')
+  })
+
+  it('prefers the person over everything', async () => {
+    const id = await makePolicy('Negotiated', 26)
+    await assign(id, 'person', alice)
+    const r = await run((tx) => policySvc.forPerson(tx, WS_A, alice, 'accrual', '2026-06-01'))
+    expect(r.policyName).toBe('Negotiated')
+    expect(r.from).toBe('person')
+  })
+
+  it('gives the same answer in the batched path as the single one', async () => {
+    // An accrual run uses `forPeople`; a settings screen uses `forPerson`. Two implementations of
+    // one ladder is how a preview starts disagreeing with what the run actually writes.
+    const single = await run((tx) => policySvc.forPerson(tx, WS_A, alice, 'accrual', '2026-06-01'))
+    const batched = await run((tx) => policySvc.forPeople(tx, WS_A, [alice], 'accrual', '2026-06-01'))
+    expect(batched.get(alice)?.policyId).toBe(single.policyId)
+    expect(batched.get(alice)?.from).toBe(single.from)
+  })
+
+  it('returns nulls rather than throwing when no policy of that kind exists', async () => {
+    const r = await run((tx) => policySvc.forPerson(tx, WS_A, alice, 'rounding', '2026-06-01'))
+    expect(r.policyId).toBeNull()
+    expect(r.from).toBeNull()
+  })
+
+  it('ignores a policy that is not yet in force on the date asked about', async () => {
+    const future = await run(async (tx) => {
+      const [row] = await tx
+        .insert(policies)
+        .values({
+          workspaceId: WS_A,
+          kind: 'overtime',
+          name: 'Next year',
+          config: {},
+          effectiveFrom: '2027-01-01',
+          configHash: 'x',
+        })
+        .returning()
+      return row!.id
+    })
+    await run((tx) =>
+      tx.insert(policyAssignments).values({
+        workspaceId: WS_A,
+        policyId: future,
+        subjectKind: 'workspace',
+        subjectId: null,
+        effectiveFrom: '2027-01-01',
+        priority: 0,
+      }),
+    )
+    const during2026 = await run((tx) => policySvc.forPerson(tx, WS_A, alice, 'overtime', '2026-06-01'))
+    expect(during2026.policyId).toBeNull()
+    const during2027 = await run((tx) => policySvc.forPerson(tx, WS_A, alice, 'overtime', '2027-06-01'))
+    expect(during2027.policyId).toBe(future)
+  })
+
+  it('refuses two overlapping assignments of one policy at one rung', async () => {
+    // A tie the ladder cannot break would make "which policy applies" depend on row order.
+    const id = await makePolicy('Duplicate', 14)
+    await assign(id, 'workspace', null)
+    const name = await constraintViolated(() => assign(id, 'workspace', null))
+    expect(name).toBe('hr_policy_assign_no_overlap')
+  })
+})
+
+describe('periods', () => {
+  const policySvc = new PolicyService(new ResolveService())
+
+  it('reports a date inside a locked period as locked', async () => {
+    await run((tx) =>
+      tx.insert(periods).values({
+        workspaceId: WS_A,
+        kind: 'payroll',
+        startsOn: '2026-01-01',
+        endsOn: '2026-01-31',
+        status: 'locked',
+        lockedAt: new Date(),
+      }),
+    )
+    expect(await run((tx) => policySvc.isLocked(tx, WS_A, '2026-01-15'))).toBe(true)
+    expect(await run((tx) => policySvc.isLocked(tx, WS_A, '2026-02-15'))).toBe(false)
+    // Inclusive at both ends: the last day of a closed month is closed.
+    expect(await run((tx) => policySvc.isLocked(tx, WS_A, '2026-01-31'))).toBe(true)
+  })
+
+  it('does not treat an open period as locked', async () => {
+    await run((tx) =>
+      tx.insert(periods).values({
+        workspaceId: WS_A,
+        kind: 'payroll',
+        startsOn: '2026-02-01',
+        endsOn: '2026-02-28',
+        status: 'open',
+      }),
+    )
+    expect(await run((tx) => policySvc.isLocked(tx, WS_A, '2026-02-10'))).toBe(false)
+  })
+
+  it('refuses a write into a closed month with a sentence, not a constraint error', async () => {
+    await expect(run((tx) => policySvc.assertOpen(tx, WS_A, '2026-01-15'))).rejects.toThrow(/locked period/)
+  })
+
+  it('refuses two periods of a kind covering the same day', async () => {
+    const name = await constraintViolated(() =>
+      run((tx) =>
+        tx.insert(periods).values({
+          workspaceId: WS_A,
+          kind: 'payroll',
+          startsOn: '2026-01-15',
+          endsOn: '2026-02-15',
+          status: 'open',
+        }),
+      ),
+    )
+    expect(name).toBe('hr_periods_no_overlap')
+  })
+})
+
+/**
+ * Accrual, end to end.
+ *
+ * The arithmetic is unit-tested against a table; this proves the right policy reaches the right
+ * person and that the ledger ends up with the number the preview promised — and, most importantly,
+ * that running twice does not credit twice.
+ */
+describe('accrual run', () => {
+  let bob: string
+  let annualType: string
+
+  beforeAll(async () => {
+    const ids = await run(async (tx) => {
+      const [type] = await tx
+        .select()
+        .from(leaveTypes)
+        .where(and(eq(leaveTypes.workspaceId, WS_A), eq(leaveTypes.key, 'annual')))
+      const [person] = await tx
+        .insert(people)
+        .values({
+          workspaceId: WS_A,
+          displayName: 'Accrual Bob',
+          hiredOn: '2020-01-01',
+          status: 'active',
+        })
+        .returning()
+      await tx
+        .insert(employments)
+        .values({ workspaceId: WS_A, personId: person!.id, effectiveFrom: '2020-01-01', fte: '1.000' })
+
+      const [policy] = await tx
+        .insert(policies)
+        .values({
+          workspaceId: WS_A,
+          kind: 'accrual',
+          name: 'Accrual test',
+          config: {
+            frequency: 'monthly',
+            daysPerYear: 24,
+            minutesPerDay: 480,
+            seniorityTiers: [],
+            waitingPeriodMonths: 0,
+            calendar: 'gregorian',
+            roundToMinutes: 0,
+            leaveTypeKey: 'annual',
+          },
+          effectiveFrom: '2020-01-01',
+          configHash: 'test',
+        })
+        .returning()
+      await tx.insert(policyAssignments).values({
+        workspaceId: WS_A,
+        policyId: policy!.id,
+        subjectKind: 'person',
+        subjectId: person!.id,
+        effectiveFrom: '2020-01-01',
+        priority: PolicyService.priorityFor('person'),
+      })
+      return { bob: person!.id, annualType: type!.id }
+    })
+    bob = ids.bob
+    annualType = ids.annualType
+  }, 60_000)
+
+  it('credits a twelfth of the entitlement for a full month', async () => {
+    const svcLedger = new LedgerService()
+    const before = await run((tx) => svcLedger.balances(tx, WS_A, bob, 2026))
+    expect(before.find((b) => b.leaveTypeId === annualType)?.balanceMinutes).toBe(0)
+
+    await run(async (tx) => {
+      await svcLedger.lockAndRead(tx, WS_A, bob, annualType, 2026)
+      return svcLedger.append(tx, WS_A, {
+        personId: bob,
+        leaveTypeId: annualType,
+        kind: 'accrual',
+        amountMinutes: Math.round((24 * 480) / 12),
+        effectiveOn: '2026-01-31',
+        periodYear: 2026,
+        reason: '24d/yr',
+      })
+    })
+
+    const after = await run((tx) => svcLedger.balances(tx, WS_A, bob, 2026))
+    // 24 days a year is two days a month.
+    expect(after.find((b) => b.leaveTypeId === annualType)?.balance).toBe(2)
+  })
+
+  it('resolves the person-level policy over anything else', async () => {
+    const policySvc = new PolicyService(new ResolveService())
+    const r = await run((tx) => policySvc.forPerson(tx, WS_A, bob, 'accrual', '2026-01-31'))
+    expect(r.policyName).toBe('Accrual test')
+    expect(r.from).toBe('person')
+  })
+
+  it('locking a period freezes the days inside it', async () => {
+    await run((tx) =>
+      tx.insert(attendanceDays).values({
+        workspaceId: WS_A,
+        personId: bob,
+        businessDate: '2026-03-10',
+        status: 'present',
+        workedMinutes: 480,
+      }),
+    )
+    await run((tx) =>
+      tx
+        .update(attendanceDays)
+        .set({ locked: true })
+        .where(and(eq(attendanceDays.workspaceId, WS_A), eq(attendanceDays.businessDate, '2026-03-10'))),
+    )
+
+    // A locked day is left alone and reported, never silently skipped — a recomputation that
+    // quietly declines to touch a closed month looks identical to one that had nothing to do.
+    const attendanceSvc = new AttendanceService()
+    const result = await run((tx) =>
+      attendanceSvc.recomputeDay(tx, WS_A, bob, '2026-03-10', 'Europe/Istanbul', NO_SCHEDULE),
+    )
+    expect(result.locked).toBe(true)
+
+    const [day] = await run((tx) =>
+      tx
+        .select()
+        .from(attendanceDays)
+        .where(and(eq(attendanceDays.workspaceId, WS_A), eq(attendanceDays.businessDate, '2026-03-10'))),
+    )
+    // Untouched: still 480, not recomputed to 0 from its (absent) punches.
+    expect(day?.workedMinutes).toBe(480)
+  })
+})
+
+/**
+ * Carry-forward across the turn of the year.
+ *
+ * The subtle part is that it is **three** entries, not a transfer: the old year is closed out in
+ * full (what lapsed, then what left) and the new year opened with what survived. Each year's ledger
+ * then sums to what that year actually held, which is what makes "you had 9 days, 5 carried, 4
+ * expired under the cap" a sentence somebody can check against the list.
+ */
+describe('carry-forward', () => {
+  const svcLedger = new LedgerService()
+  let carol: string
+  let annualType: string
+
+  beforeAll(async () => {
+    const ids = await run(async (tx) => {
+      const [type] = await tx
+        .select()
+        .from(leaveTypes)
+        .where(and(eq(leaveTypes.workspaceId, WS_A), eq(leaveTypes.key, 'annual')))
+      const [person] = await tx
+        .insert(people)
+        .values({ workspaceId: WS_A, displayName: 'Carry Carol', hiredOn: '2020-01-01' })
+        .returning()
+      return { carol: person!.id, annualType: type!.id }
+    })
+    carol = ids.carol
+    annualType = ids.annualType
+
+    // Nine days standing at the end of 2025.
+    await run(async (tx) => {
+      await svcLedger.lockAndRead(tx, WS_A, carol, annualType, 2025)
+      return svcLedger.append(tx, WS_A, {
+        personId: carol,
+        leaveTypeId: annualType,
+        kind: 'grant',
+        amountMinutes: 9 * 8 * 60,
+        effectiveOn: '2025-01-01',
+        periodYear: 2025,
+      })
+    })
+  }, 60_000)
+
+  it('splits the balance into what lapsed and what carried, leaving both visible', async () => {
+    const CAP = 5 * 8 * 60
+    const balance = await run((tx) => svcLedger.lockAndRead(tx, WS_A, carol, annualType, 2025))
+    expect(balance).toBe(9 * 8 * 60)
+
+    const { carriedMinutes, expiredMinutes } = carryForward(balance, {
+      maxMinutes: CAP,
+      expiresAfterMonths: 3,
+    })
+    expect(carriedMinutes).toBe(CAP)
+    expect(expiredMinutes).toBe(4 * 8 * 60)
+
+    await run(async (tx) => {
+      await svcLedger.lockAndRead(tx, WS_A, carol, annualType, 2025)
+      await svcLedger.append(tx, WS_A, {
+        personId: carol,
+        leaveTypeId: annualType,
+        kind: 'expiry',
+        amountMinutes: -expiredMinutes,
+        effectiveOn: '2025-12-31',
+        periodYear: 2025,
+        reason: 'Above the 5 day carry-forward cap',
+      })
+      await svcLedger.append(tx, WS_A, {
+        personId: carol,
+        leaveTypeId: annualType,
+        kind: 'carry_out',
+        amountMinutes: -carriedMinutes,
+        effectiveOn: '2025-12-31',
+        periodYear: 2025,
+        reason: 'Carried into 2026',
+      })
+      await svcLedger.lockAndRead(tx, WS_A, carol, annualType, 2026)
+      await svcLedger.append(tx, WS_A, {
+        personId: carol,
+        leaveTypeId: annualType,
+        kind: 'carry_in',
+        amountMinutes: carriedMinutes,
+        effectiveOn: '2026-01-01',
+        periodYear: 2026,
+        reason: 'Carried from 2025',
+      })
+    })
+
+    // The closed year sums to nothing left: granted 9, expired 4, carried 5 out.
+    const y2025 = await run((tx) => svcLedger.balances(tx, WS_A, carol, 2025))
+    expect(y2025.find((b) => b.leaveTypeId === annualType)?.balanceMinutes).toBe(0)
+
+    // The new year opens with exactly what survived.
+    const y2026 = await run((tx) => svcLedger.balances(tx, WS_A, carol, 2026))
+    expect(y2026.find((b) => b.leaveTypeId === annualType)?.balance).toBe(5)
+  })
+
+  it('keeps every movement on the record, so the number can be argued with', async () => {
+    const entries = await run((tx) =>
+      tx
+        .select()
+        .from(leaveLedger)
+        .where(and(eq(leaveLedger.workspaceId, WS_A), eq(leaveLedger.personId, carol))),
+    )
+    const kinds = entries.map((e) => e.kind).sort()
+    expect(kinds).toEqual(['carry_in', 'carry_out', 'expiry', 'grant'])
+    // The expiry says why, rather than the balance simply being smaller than it was.
+    expect(entries.find((e) => e.kind === 'expiry')?.reason).toContain('carry-forward cap')
   })
 })

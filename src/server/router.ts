@@ -12,6 +12,15 @@ import {
 import { implement } from '@orpc/server'
 import { and, asc, count, desc, eq, gte, ilike, inArray, isNull, lte, or, sql } from 'drizzle-orm'
 import { HrSettings, hrContract, hrEvents, MODULE_ID, type WorkingWeek } from '../contract/index.js'
+import {
+  AccrualConfig,
+  CarryForwardConfig,
+  OvertimeConfig,
+  type PolicyKind,
+  RoundingConfig,
+  WorkingTimeConfig,
+} from '../contract/policies.js'
+import { accrueForPeriod } from '../policy/accrual.js'
 import { countWorkingDays, workingDays } from '../policy/calendar.js'
 import { businessDateFor } from '../policy/working-time.js'
 import { COUNTRY_PACKS, packDays } from './packs/index.js'
@@ -37,8 +46,11 @@ import {
   orgUnits,
   people,
   peopleSensitive,
+  periods,
   personDocuments,
   personHistory,
+  policies,
+  policyAssignments,
   positions,
   punches,
   regularizations,
@@ -50,6 +62,7 @@ import { AttendanceService } from './services/attendance.js'
 import { inForceOn, todayIn, todayIso } from './services/db.js'
 import { LedgerService, MINUTES_PER_DAY, yearOf } from './services/ledger.js'
 import { PeopleService } from './services/people.js'
+import { hashConfig, PolicyService } from './services/policies.js'
 import { DEFAULT_WORKING_WEEK, ResolveService } from './services/resolve.js'
 
 const os = implement(hrContract).$context<RequestContext>()
@@ -74,6 +87,7 @@ export function implement_(kernel: Kernel) {
   const ledger = new LedgerService()
   const approvals = new ApprovalService(kernel)
   const attendance = new AttendanceService()
+  const policySvc = new PolicyService(resolve)
   const db = kernel.database
   const settingsOf = (workspaceId: string) => kernel.settings.module(workspaceId, MODULE_ID, HrSettings)
 
@@ -1561,6 +1575,340 @@ export function implement_(kernel: Kernel) {
           })
           await changed(input.workspaceId, 'person', input.personId, 'updated')
           return { ok: true as const }
+        }),
+    },
+
+    // ================================================================= policies
+    policies: {
+      list: scoped.policies.list
+        .use(cap('leave_accrual'))
+        .use(requires('hr.policy.view'))
+        .handler(({ input }) =>
+          db.withWorkspace(input.workspaceId, async (tx) => {
+            const where = [eq(policies.workspaceId, input.workspaceId)]
+            if (input.kind) where.push(eq(policies.kind, input.kind))
+            if (!input.includeArchived) where.push(isNull(policies.archivedAt))
+            const rows = await tx
+              .select()
+              .from(policies)
+              .where(and(...where))
+              .orderBy(asc(policies.kind), asc(policies.name))
+            return withAssignments(tx, input.workspaceId, rows)
+          }),
+        ),
+
+      get: scoped.policies.get
+        .use(cap('leave_accrual'))
+        .use(requires('hr.policy.view'))
+        .handler(({ input }) =>
+          db.withWorkspace(input.workspaceId, async (tx) => {
+            const row = await loadPolicy(tx, input.workspaceId, input.policyId)
+            return (await withAssignments(tx, input.workspaceId, [row]))[0]!
+          }),
+        ),
+
+      create: scoped.policies.create
+        .use(cap('leave_accrual'))
+        .use(requires('hr.policy.manage'))
+        .handler(async ({ input }) => {
+          const config = validatePolicyConfig(input.kind, input.config)
+          const row = await db.withWorkspace(input.workspaceId, async (tx) => {
+            const [created] = await tx
+              .insert(policies)
+              .values({
+                id: uuidv7(),
+                workspaceId: input.workspaceId,
+                kind: input.kind,
+                name: input.name,
+                config,
+                effectiveFrom: input.effectiveFrom,
+                effectiveTo: input.effectiveTo ?? null,
+                source: 'custom',
+                configHash: hashConfig(config),
+              })
+              .returning()
+            return created!
+          })
+          await changed(input.workspaceId, 'policy', row.id, 'created')
+          return toPolicy(row)
+        }),
+
+      update: scoped.policies.update
+        .use(cap('leave_accrual'))
+        .use(requires('hr.policy.manage'))
+        .handler(async ({ input }) => {
+          const row = await db.withWorkspace(input.workspaceId, async (tx) => {
+            const existing = await loadPolicy(tx, input.workspaceId, input.policyId)
+            const set: Record<string, unknown> = { updatedAt: new Date() }
+            if (input.name !== undefined) set.name = input.name
+            if (input.effectiveTo !== undefined) set.effectiveTo = input.effectiveTo
+            if (input.config !== undefined) {
+              const config = validatePolicyConfig(existing.kind as never, input.config)
+              set.config = config
+              // The hash changes with the config, which is what marks every row derived from the
+              // old one as stale rather than leaving them silently wrong.
+              set.configHash = hashConfig(config)
+            }
+            const [updated] = await tx
+              .update(policies)
+              .set(set)
+              .where(and(eq(policies.workspaceId, input.workspaceId), eq(policies.id, input.policyId)))
+              .returning()
+            return updated!
+          })
+          await changed(input.workspaceId, 'policy', row.id, 'updated')
+          return toPolicy(row)
+        }),
+
+      archive: scoped.policies.archive
+        .use(cap('leave_accrual'))
+        .use(requires('hr.policy.manage'))
+        .handler(async ({ input }) => {
+          // Archived, never deleted: ledger entries name the policy that produced them, and a
+          // movement whose policy has vanished is a number nobody can explain.
+          await db.withWorkspace(input.workspaceId, (tx) =>
+            tx
+              .update(policies)
+              .set({ archivedAt: new Date() })
+              .where(and(eq(policies.workspaceId, input.workspaceId), eq(policies.id, input.policyId))),
+          )
+          await changed(input.workspaceId, 'policy', input.policyId, 'deleted')
+          return { ok: true as const }
+        }),
+
+      assign: scoped.policies.assign
+        .use(cap('leave_accrual'))
+        .use(requires('hr.policy.manage'))
+        .handler(async ({ input }) => {
+          const row = await db.withWorkspace(input.workspaceId, async (tx) => {
+            await loadPolicy(tx, input.workspaceId, input.policyId)
+            if (input.subjectKind !== 'workspace' && !input.subjectId)
+              throw KernError.badRequest(`A ${input.subjectKind} assignment needs a subject.`)
+            const [created] = await tx
+              .insert(policyAssignments)
+              .values({
+                id: uuidv7(),
+                workspaceId: input.workspaceId,
+                policyId: input.policyId,
+                subjectKind: input.subjectKind,
+                subjectId: input.subjectKind === 'workspace' ? null : (input.subjectId ?? null),
+                effectiveFrom: input.effectiveFrom,
+                effectiveTo: input.effectiveTo ?? null,
+                // The ladder, written once. Nothing else invents its own order.
+                priority: PolicyService.priorityFor(input.subjectKind),
+              })
+              .returning()
+            return created!
+          })
+          await changed(input.workspaceId, 'policy', input.policyId, 'updated')
+          return toAssignment(row)
+        }),
+
+      unassign: scoped.policies.unassign
+        .use(cap('leave_accrual'))
+        .use(requires('hr.policy.manage'))
+        .handler(async ({ input }) => {
+          await db.withWorkspace(input.workspaceId, (tx) =>
+            tx
+              .delete(policyAssignments)
+              .where(
+                and(
+                  eq(policyAssignments.workspaceId, input.workspaceId),
+                  eq(policyAssignments.id, input.assignmentId),
+                ),
+              ),
+          )
+          await changed(input.workspaceId, 'policy', input.assignmentId, 'deleted')
+          return { ok: true as const }
+        }),
+
+      resolveFor: scoped.policies.resolveFor
+        .use(cap('leave_accrual'))
+        .use(requires('hr.policy.view'))
+        .handler(({ input }) =>
+          db.withWorkspace(input.workspaceId, async (tx) => {
+            const on = input.on ?? todayIso()
+            const kinds = ['accrual', 'carry_forward', 'overtime', 'rounding', 'working_time'] as const
+            const out = []
+            for (const kind of kinds)
+              out.push(await policySvc.forPerson(tx, input.workspaceId, input.personId, kind, on))
+            return out
+          }),
+        ),
+    },
+
+    // ================================================================= accrual
+    accrual: {
+      preview: scoped.accrual.preview
+        .use(cap('leave_accrual'))
+        .use(requires('hr.policy.view'))
+        .handler(({ input }) =>
+          db.withWorkspace(input.workspaceId, (tx) =>
+            accrualPreview(tx, input.workspaceId, input.from, input.to, input.personId),
+          ),
+        ),
+
+      run: scoped.accrual.run
+        .use(cap('leave_accrual'))
+        .use(requires('hr.policy.manage'))
+        .handler(async ({ input, context }) => {
+          const result = await db.withWorkspace(input.workspaceId, async (tx) => {
+            const preview = await accrualPreview(tx, input.workspaceId, input.from, input.to, input.personId)
+            let credited = 0
+            let totalMinutes = 0
+            for (const row of preview.rows) {
+              // Idempotent per person, per type, per period: a job that double-credits when
+              // somebody clicks twice is worse than one that never ran.
+              if (row.alreadyAccrued || row.minutes <= 0) continue
+              const year = yearOf(input.from)
+              await ledger.lockAndRead(tx, input.workspaceId, row.personId, row.leaveTypeId, year)
+              await ledger.append(tx, input.workspaceId, {
+                personId: row.personId,
+                leaveTypeId: row.leaveTypeId,
+                kind: 'accrual',
+                amountMinutes: row.minutes,
+                effectiveOn: input.to,
+                periodYear: year,
+                reason: row.reason,
+                createdBy: context.principal.userId ?? null,
+              })
+              credited++
+              totalMinutes += row.minutes
+            }
+            return { credited, skipped: preview.rows.length - credited, totalMinutes }
+          })
+          await changed(input.workspaceId, 'leave_balance', input.workspaceId, 'updated')
+          return result
+        }),
+    },
+
+    // ================================================================= periods
+    periods: {
+      list: scoped.periods.list
+        .use(cap('periods'))
+        .use(requires('hr.period.manage'))
+        .handler(({ input }) =>
+          db.withWorkspace(input.workspaceId, async (tx) => {
+            const where = [eq(periods.workspaceId, input.workspaceId)]
+            if (input.kind) where.push(eq(periods.kind, input.kind))
+            const rows = await tx
+              .select()
+              .from(periods)
+              .where(and(...where))
+              .orderBy(desc(periods.startsOn))
+              .limit(input.limit)
+            return { items: rows.map(toPeriod), nextCursor: null }
+          }),
+        ),
+
+      create: scoped.periods.create
+        .use(cap('periods'))
+        .use(requires('hr.period.manage'))
+        .handler(async ({ input }) => {
+          const row = await db.withWorkspace(input.workspaceId, async (tx) => {
+            if (input.endsOn < input.startsOn)
+              throw KernError.badRequest('A period cannot end before it starts.')
+            const [created] = await tx
+              .insert(periods)
+              .values({
+                id: uuidv7(),
+                workspaceId: input.workspaceId,
+                kind: input.kind,
+                legalEntityId: input.legalEntityId ?? null,
+                startsOn: input.startsOn,
+                endsOn: input.endsOn,
+                status: 'open',
+              })
+              .returning()
+            return created!
+          })
+          await changed(input.workspaceId, 'period', row.id, 'created')
+          return toPeriod(row)
+        }),
+
+      lock: scoped.periods.lock
+        .use(cap('periods'))
+        .use(requires('hr.period.manage'))
+        .handler(async ({ input, context }) => {
+          const result = await db.withWorkspace(input.workspaceId, async (tx) => {
+            const period = await loadPeriod(tx, input.workspaceId, input.periodId)
+            if (period.status === 'locked') throw KernError.conflict('That period is already locked.')
+
+            const [row] = await tx
+              .update(periods)
+              .set({
+                status: 'locked',
+                lockedAt: new Date(),
+                lockedBy: context.principal.userId ?? null,
+                note: input.note ?? null,
+              })
+              .where(eq(periods.id, period.id))
+              .returning()
+
+            // The day sheet carries its own flag so a recomputation does not have to join periods
+            // on every row — this is what actually stops a closed month moving.
+            const locked = await tx
+              .update(attendanceDays)
+              .set({ locked: true })
+              .where(
+                and(
+                  eq(attendanceDays.workspaceId, input.workspaceId),
+                  gte(attendanceDays.businessDate, period.startsOn),
+                  lte(attendanceDays.businessDate, period.endsOn),
+                ),
+              )
+              .returning({ id: attendanceDays.id })
+
+            return { period: row!, lockedDays: locked.length }
+          })
+          await changed(input.workspaceId, 'period', input.periodId, 'updated')
+          return { ...toPeriod(result.period), lockedDays: result.lockedDays }
+        }),
+
+      unlock: scoped.periods.unlock
+        .use(cap('periods'))
+        .use(requires('hr.period.manage'))
+        .handler(async ({ input, context }) => {
+          const result = await db.withWorkspace(input.workspaceId, async (tx) => {
+            const period = await loadPeriod(tx, input.workspaceId, input.periodId)
+            const [row] = await tx
+              .update(periods)
+              .set({
+                status: 'open',
+                lockedAt: null,
+                lockedBy: null,
+                note: `Reopened: ${input.reason}`,
+              })
+              .where(eq(periods.id, period.id))
+              .returning()
+
+            const unlocked = await tx
+              .update(attendanceDays)
+              .set({ locked: false })
+              .where(
+                and(
+                  eq(attendanceDays.workspaceId, input.workspaceId),
+                  gte(attendanceDays.businessDate, period.startsOn),
+                  lte(attendanceDays.businessDate, period.endsOn),
+                ),
+              )
+              .returning({ id: attendanceDays.id })
+
+            kernel.log.warn(
+              {
+                module: MODULE_ID,
+                workspaceId: input.workspaceId,
+                periodId: period.id,
+                days: unlocked.length,
+                actorId: context.principal.userId,
+                reason: input.reason,
+              },
+              'payroll period reopened',
+            )
+            return { period: row!, unlockedDays: unlocked.length }
+          })
+          await changed(input.workspaceId, 'period', input.periodId, 'updated')
+          return { ...toPeriod(result.period), unlockedDays: result.unlockedDays }
         }),
     },
 
@@ -3371,6 +3719,211 @@ export function implement_(kernel: Kernel) {
       .where(eq(regularizations.id, row.id))
   }
 
+  async function loadPolicy(tx: Tx, workspaceId: string, policyId: string) {
+    const [row] = await tx
+      .select()
+      .from(policies)
+      .where(and(eq(policies.workspaceId, workspaceId), eq(policies.id, policyId)))
+      .limit(1)
+    if (!row) throw KernError.notFound('Policy')
+    return row
+  }
+
+  async function loadPeriod(tx: Tx, workspaceId: string, periodId: string) {
+    const [row] = await tx
+      .select()
+      .from(periods)
+      .where(and(eq(periods.workspaceId, workspaceId), eq(periods.id, periodId)))
+      .limit(1)
+    if (!row) throw KernError.notFound('Period')
+    return row
+  }
+
+  /** Policies with the assignments that decide who they reach — one query for the whole list. */
+  async function withAssignments(tx: Tx, workspaceId: string, rows: Array<typeof policies.$inferSelect>) {
+    if (!rows.length) return []
+    const assignments = await tx
+      .select()
+      .from(policyAssignments)
+      .where(
+        and(
+          eq(policyAssignments.workspaceId, workspaceId),
+          inArray(
+            policyAssignments.policyId,
+            rows.map((r) => r.id),
+          ),
+        ),
+      )
+    return rows.map((r) => ({
+      ...toPolicy(r),
+      assignments: assignments.filter((a) => a.policyId === r.id).map(toAssignment),
+    }))
+  }
+
+  /**
+   * What an accrual run would credit, per person.
+   *
+   * **`run` calls this and credits what it returns**, so the preview and the thing it previews are
+   * the same computation. A preview written separately is a preview that eventually disagrees with
+   * the number that lands in somebody's balance.
+   *
+   * Everybody active is considered; the reason a person was skipped is returned rather than the
+   * person being silently absent, because "why did she not accrue" is the question that follows.
+   */
+  async function accrualPreview(
+    tx: Tx,
+    workspaceId: string,
+    from: string,
+    to: string,
+    onlyPersonId?: string,
+  ) {
+    const staff = await tx
+      .select()
+      .from(people)
+      .where(
+        and(
+          eq(people.workspaceId, workspaceId),
+          onlyPersonId ? eq(people.id, onlyPersonId) : inArray(people.status, ['active', 'on_leave']),
+        ),
+      )
+
+    const rows: Array<{
+      personId: string
+      displayName: string
+      leaveTypeId: string
+      leaveTypeName: string
+      minutes: number
+      days: number
+      reason: string
+      alreadyAccrued: boolean
+    }> = []
+    const skipped: Array<{ personId: string; displayName: string; reason: string }> = []
+
+    if (!staff.length) return { periodFrom: from, periodTo: to, rows, totalMinutes: 0, skipped }
+
+    const ids = staff.map((p) => p.id)
+    const resolved = await policySvc.forPeople(tx, workspaceId, ids, 'accrual', to)
+    const employmentRows = await tx
+      .select()
+      .from(employments)
+      .where(
+        and(
+          eq(employments.workspaceId, workspaceId),
+          inArray(employments.personId, ids),
+          inForceOn(employments.effectiveFrom, employments.effectiveTo, to),
+        ),
+      )
+    const employmentBy = new Map(employmentRows.map((e) => [e.personId, e]))
+
+    const types = await tx
+      .select()
+      .from(leaveTypes)
+      .where(and(eq(leaveTypes.workspaceId, workspaceId), isNull(leaveTypes.archivedAt)))
+    const typeByKey = new Map(types.map((t) => [t.key, t]))
+
+    // Everything already credited for this window, so a re-run credits nothing.
+    const existing = await tx
+      .select({ personId: leaveLedger.personId, leaveTypeId: leaveLedger.leaveTypeId })
+      .from(leaveLedger)
+      .where(
+        and(
+          eq(leaveLedger.workspaceId, workspaceId),
+          eq(leaveLedger.kind, 'accrual'),
+          eq(leaveLedger.effectiveOn, to),
+          inArray(leaveLedger.personId, ids),
+        ),
+      )
+    const already = new Set(existing.map((e) => `${e.personId}:${e.leaveTypeId}`))
+
+    let totalMinutes = 0
+    for (const person of staff) {
+      const policy = resolved.get(person.id)
+      if (!policy?.config) {
+        skipped.push({
+          personId: person.id,
+          displayName: person.displayName,
+          reason: 'no accrual policy applies',
+        })
+        continue
+      }
+      const config = policy.config as unknown as AccrualConfig
+      const type = typeByKey.get(config.leaveTypeKey)
+      if (!type) {
+        skipped.push({
+          personId: person.id,
+          displayName: person.displayName,
+          reason: `no leave type "${config.leaveTypeKey}"`,
+        })
+        continue
+      }
+      if (!person.hiredOn) {
+        skipped.push({
+          personId: person.id,
+          displayName: person.displayName,
+          reason: 'no hire date',
+        })
+        continue
+      }
+
+      const employment = employmentBy.get(person.id)
+      const result = accrueForPeriod({
+        policy: {
+          frequency: config.frequency,
+          daysPerYear: config.daysPerYear,
+          minutesPerDay: config.minutesPerDay,
+          seniorityTiers: config.seniorityTiers,
+          waitingPeriodMonths: config.waitingPeriodMonths,
+          roundToMinutes: config.roundToMinutes,
+        },
+        period: { from, to },
+        hiredOn: person.hiredOn,
+        terminatedOn: person.terminatedOn,
+        fte: employment ? Number.parseFloat(employment.fte ?? '1') : 1,
+      })
+
+      const alreadyAccrued = already.has(`${person.id}:${type.id}`)
+      rows.push({
+        personId: person.id,
+        displayName: person.displayName,
+        leaveTypeId: type.id,
+        leaveTypeName: type.name,
+        minutes: result.minutes,
+        days: Math.round((result.minutes / config.minutesPerDay) * 100) / 100,
+        reason: result.reason,
+        alreadyAccrued,
+      })
+      if (!alreadyAccrued) totalMinutes += result.minutes
+    }
+
+    return { periodFrom: from, periodTo: to, rows, totalMinutes, skipped }
+  }
+
+  /**
+   * Validate a config against the schema for its kind.
+   *
+   * A policy is data, and data from an API is not trusted because it arrived in the right-shaped
+   * field. Each kind validates its own shape, which is what makes "policies as data" safe rather
+   * than a jsonb column nobody checks.
+   */
+  function validatePolicyConfig(kind: PolicyKind, config: Record<string, unknown>) {
+    const schema =
+      kind === 'accrual'
+        ? AccrualConfig
+        : kind === 'carry_forward'
+          ? CarryForwardConfig
+          : kind === 'overtime'
+            ? OvertimeConfig
+            : kind === 'rounding'
+              ? RoundingConfig
+              : WorkingTimeConfig
+    const parsed = schema.safeParse(config)
+    if (!parsed.success)
+      throw KernError.badRequest(`Invalid ${kind} policy`, {
+        issues: parsed.error.issues.map((issue) => `${issue.path.join('.')}: ${issue.message}`),
+      })
+    return parsed.data as unknown as Record<string, unknown>
+  }
+
   async function emitCalendarChanged(
     workspaceId: WorkspaceId,
     calendarId: string,
@@ -3508,4 +4061,24 @@ const toRegularization = (r: typeof regularizations.$inferSelect) => ({
   proposed: r.proposed as never,
   appliedAt: r.appliedAt?.toISOString() ?? null,
   createdAt: r.createdAt.toISOString(),
+})
+
+const toPolicy = (r: typeof policies.$inferSelect) => ({
+  ...r,
+  kind: r.kind as never,
+  source: r.source as 'pack' | 'custom',
+  config: r.config ?? {},
+  archivedAt: r.archivedAt?.toISOString() ?? null,
+})
+
+const toAssignment = (r: typeof policyAssignments.$inferSelect) => ({
+  ...r,
+  subjectKind: r.subjectKind as never,
+})
+
+const toPeriod = (r: typeof periods.$inferSelect) => ({
+  ...r,
+  kind: r.kind as never,
+  status: r.status as 'open' | 'locked',
+  lockedAt: r.lockedAt?.toISOString() ?? null,
 })

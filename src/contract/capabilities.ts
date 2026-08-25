@@ -75,6 +75,24 @@ export const hrCapabilities = defineCapabilities([
     level: 1,
   },
   {
+    id: 'leave_accrual',
+    label: 'Accrual',
+    description: 'Earn leave over time, with proration, carry-forward and expiry',
+    dependsOn: ['leave'],
+    // Off by default. Plenty of companies grant a fixed allowance on 1 January and never accrue —
+    // and for them an accrual engine is a screen full of settings that change nothing.
+    defaultEnabled: false,
+    level: 2,
+  },
+  {
+    id: 'periods',
+    label: 'Payroll periods',
+    description: 'Close a month so a filed payroll cannot move underneath it',
+    dependsOn: ['core'],
+    defaultEnabled: false,
+    level: 2,
+  },
+  {
     id: 'approvals',
     label: 'Approval chains',
     description: 'Named multi-step approvals with delegation, instead of a single manager',
@@ -185,6 +203,19 @@ export const hrCapabilityProcedures: Record<string, readonly string[]> = {
     'attendance.regularizations.list',
     'attendance.regularizations.request',
   ],
+  leave_accrual: [
+    'policies.list',
+    'policies.get',
+    'policies.create',
+    'policies.update',
+    'policies.archive',
+    'policies.assign',
+    'policies.unassign',
+    'policies.resolveFor',
+    'accrual.preview',
+    'accrual.run',
+  ],
+  periods: ['periods.list', 'periods.create', 'periods.lock', 'periods.unlock'],
   approvals: [
     'approvals.chains.list',
     'approvals.chains.create',

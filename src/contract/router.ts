@@ -53,6 +53,15 @@ import {
   TimeZone,
   WorkingWeek,
 } from './models.js'
+import {
+  AccrualPreview,
+  Period,
+  Policy,
+  PolicyAssignment,
+  PolicyKind,
+  PolicySubjectKind,
+  ResolvedPolicy,
+} from './policies.js'
 
 const ws = z.object({ workspaceId: WorkspaceId })
 const t = ['hr'] as const
@@ -600,6 +609,145 @@ export const hrContract = {
       .route({ method: 'DELETE', path: '/people/{personId}/documents/{documentId}', tags: t })
       .input(ws.extend({ personId: z.uuid(), documentId: z.uuid() }))
       .output(ok),
+  },
+
+  // ---------------------------------------------------------------- policies
+  policies: {
+    list: baseContract
+      .route({ method: 'GET', path: '/policies', tags: t })
+      .input(ws.extend({ kind: PolicyKind.optional(), includeArchived: z.boolean().default(false) }))
+      .output(z.array(Policy.extend({ assignments: z.array(PolicyAssignment) }))),
+    get: baseContract
+      .route({ method: 'GET', path: '/policies/{policyId}', tags: t })
+      .input(ws.extend({ policyId: z.uuid() }))
+      .output(Policy.extend({ assignments: z.array(PolicyAssignment) })),
+    create: baseContract
+      .route({ method: 'POST', path: '/policies', tags: t })
+      .input(
+        ws.extend({
+          kind: PolicyKind,
+          name: z.string().min(1).max(120),
+          /** Validated against the schema for `kind` — a config for the wrong kind is refused. */
+          config: z.record(z.string(), z.unknown()),
+          effectiveFrom: IsoDate,
+          effectiveTo: IsoDate.nullish(),
+        }),
+      )
+      .output(Policy),
+    /**
+     * Edits a policy in place.
+     *
+     * A change that should apply from a date rather than retroactively is a **new** policy with a
+     * later `effectiveFrom`, not an edit — editing rewrites what was true in the past, and anything
+     * already derived from it becomes unexplainable.
+     */
+    update: baseContract
+      .route({ method: 'PATCH', path: '/policies/{policyId}', tags: t })
+      .input(
+        ws.extend({
+          policyId: z.uuid(),
+          name: z.string().min(1).max(120).optional(),
+          config: z.record(z.string(), z.unknown()).optional(),
+          effectiveTo: IsoDate.nullish(),
+        }),
+      )
+      .output(Policy),
+    archive: baseContract
+      .route({ method: 'DELETE', path: '/policies/{policyId}', tags: t })
+      .input(ws.extend({ policyId: z.uuid() }))
+      .output(ok),
+    assign: baseContract
+      .route({ method: 'POST', path: '/policies/{policyId}/assign', tags: t })
+      .input(
+        ws.extend({
+          policyId: z.uuid(),
+          subjectKind: PolicySubjectKind,
+          /** Null for `workspace`, which needs no id. */
+          subjectId: z.uuid().nullish(),
+          effectiveFrom: IsoDate,
+          effectiveTo: IsoDate.nullish(),
+        }),
+      )
+      .output(PolicyAssignment),
+    unassign: baseContract
+      .route({ method: 'DELETE', path: '/policies/assignments/{assignmentId}', tags: t })
+      .input(ws.extend({ assignmentId: z.uuid() }))
+      .output(ok),
+    /**
+     * Which policy of each kind applies to this person on this date, and which rung answered.
+     *
+     * "Why does she accrue differently from her team" is the question this module gets asked, and
+     * this is what answers it without a database session.
+     */
+    resolveFor: baseContract
+      .route({ method: 'GET', path: '/people/{personId}/policies', tags: t })
+      .input(ws.extend({ personId: z.uuid(), on: IsoDate.optional() }))
+      .output(z.array(ResolvedPolicy)),
+  },
+
+  // ---------------------------------------------------------------- accrual
+  accrual: {
+    /**
+     * What a run would credit, per person, before it writes anything.
+     *
+     * Runs the same code the run does. A preview computed differently from the thing it previews is
+     * a preview that eventually lies.
+     */
+    preview: baseContract
+      .route({ method: 'POST', path: '/accrual/preview', tags: t })
+      .input(ws.extend({ from: IsoDate, to: IsoDate, personId: z.uuid().optional() }))
+      .output(AccrualPreview),
+    /**
+     * Credits the ledger.
+     *
+     * Idempotent per person, per leave type, per period: a second run for the same window credits
+     * nothing, because an accrual job that double-credits when somebody clicks twice is worse than
+     * one that never ran.
+     */
+    run: baseContract
+      .route({ method: 'POST', path: '/accrual/run', tags: t })
+      .input(ws.extend({ from: IsoDate, to: IsoDate, personId: z.uuid().optional() }))
+      .output(
+        z.object({
+          credited: z.number().int(),
+          skipped: z.number().int(),
+          totalMinutes: z.number().int(),
+        }),
+      ),
+  },
+
+  // ---------------------------------------------------------------- periods
+  periods: {
+    list: baseContract
+      .route({ method: 'GET', path: '/periods', tags: t })
+      .input(ws.extend({ kind: Period.shape.kind.optional(), ...PageInput.shape }))
+      .output(page(Period)),
+    create: baseContract
+      .route({ method: 'POST', path: '/periods', tags: t })
+      .input(
+        ws.extend({
+          kind: Period.shape.kind.default('payroll'),
+          legalEntityId: z.uuid().nullish(),
+          startsOn: IsoDate,
+          endsOn: IsoDate,
+        }),
+      )
+      .output(Period),
+    /** Freezes the month. Every derived day inside it stops being recomputable. */
+    lock: baseContract
+      .route({ method: 'POST', path: '/periods/{periodId}/lock', tags: t })
+      .input(ws.extend({ periodId: z.uuid(), note: z.string().max(500).nullish() }))
+      .output(Period.extend({ lockedDays: z.number().int() })),
+    /**
+     * Reopens it.
+     *
+     * Dangerous on purpose: a payroll has usually been filed against a locked month, and reopening
+     * lets figures move underneath it. The response says how many days became recomputable again.
+     */
+    unlock: baseContract
+      .route({ method: 'POST', path: '/periods/{periodId}/unlock', tags: t })
+      .input(ws.extend({ periodId: z.uuid(), reason: z.string().min(1).max(500) }))
+      .output(Period.extend({ unlockedDays: z.number().int() })),
   },
 
   // ---------------------------------------------------------------- attendance
