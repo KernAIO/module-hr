@@ -38,7 +38,9 @@
     "dev": "tsc -p tsconfig.json --watch --preserveWatchOutput",
     "typecheck": "tsc -p tsconfig.json --noEmit && svelte-check --tsconfig ./tsconfig.client.json --threshold error",
     "test": "vitest run",
-    "db:generate": "drizzle-kit generate"
+    "db:generate": "drizzle-kit generate",
+    "lint": "biome check . && node scripts/check-ranges.mjs package.json",
+    "format": "biome check --write ."
   },
   "dependencies": {
     "@kernhq/contracts": "^0.5.1",
@@ -60,7 +62,8 @@
     "svelte": "^5.46.0",
     "svelte-check": "^4.0.0",
     "typescript": "~5.9.3",
-    "vitest": "^4.0.0"
+    "vitest": "^4.0.0",
+    "@biomejs/biome": "^2.0.0"
   },
   "peerDependencies": {
     "@kernhq/ui": "^0.8.0",
@@ -77,5 +80,14 @@
     "svelte": {
       "optional": true
     }
-  }
+  },
+  "packageManager": "pnpm@10.30.3",
+  "engines": {
+    "node": ">=24"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KernAIO/module-hr.git"
+  },
+  "homepage": "https://github.com/KernAIO/module-hr#readme"
 }
