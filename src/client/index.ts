@@ -78,3 +78,6 @@ export const HR_CAPABILITIES = {
   attendance: 'attendance',
   overtime: 'overtime',
 } as const
+export { __setHrApi, getHrApi } from './api-instance.js'
+export { type HrMessageKey, hrMessageBundles, t } from './i18n.js'
+export { hrClientModule, hrClientModule as default } from './module.js'
