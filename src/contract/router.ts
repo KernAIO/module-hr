@@ -75,7 +75,13 @@ export const hrContract = {
           status: z.array(PersonStatus).optional(),
         }),
       )
-      .output(page(Person)),
+      /**
+       * Rows carry their office, which `Person` itself does not: office lives in
+       * `office_assignments` because people change desks and change jobs on different days. A
+       * directory that cannot say which office somebody is in misses the point of having offices,
+       * so the list resolves it once for the whole page rather than making the client ask per row.
+       */
+      .output(page(Person.extend({ officeId: z.uuid().nullable(), officeName: z.string().nullable() }))),
     get: baseContract
       .route({ method: 'GET', path: '/people/{personId}', tags: t })
       .input(ws.extend({ personId: z.uuid() }))

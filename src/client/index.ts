@@ -23,15 +23,25 @@ export function createHrClient(opts: KernClientOptions): HrApi {
 }
 
 export {
+  type ApprovalChain,
+  type ApprovalRequest,
+  type AttendanceDay,
   type Calendar,
   type CalendarDay,
+  type ClockState,
   type CostCenter,
   type CustomFieldDef,
+  type Delegation,
   type Employment,
   HR_PERMISSIONS,
   hrCapabilities,
   hrPermissions,
   type IsoDate,
+  type LeaveBalance,
+  type LeaveLedgerEntry,
+  type LeaveRequest,
+  type LeaveSimulation,
+  type LeaveType,
   type LegalEntity,
   MODULE_ID,
   type Office,
@@ -42,7 +52,10 @@ export {
   type PersonResolution,
   type PersonStatus,
   type Position,
+  type Punch,
+  type Regularization,
   type ResolvedCalendarDay,
+  type Schedule,
   type WorkingWeek,
 } from '../contract/index.js'
 
@@ -59,4 +72,9 @@ export const HR_CAPABILITIES = {
   legalEntities: 'legal_entities',
   calendars: 'calendars',
   documents: 'documents',
+  leave: 'leave',
+  leaveAccrual: 'leave_accrual',
+  approvals: 'approvals',
+  attendance: 'attendance',
+  overtime: 'overtime',
 } as const

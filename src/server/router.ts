@@ -148,7 +148,44 @@ export function implement_(kernel: Kernel) {
             .select({ n: count() })
             .from(people)
             .where(and(...where))
-          return { items: rows.map(PeopleService.toPerson), nextCursor: null, total: total?.n ?? 0 }
+
+          // One query for the whole page rather than a resolution per row: a directory of five
+          // hundred people would otherwise be five hundred ladder walks.
+          const assignments = rows.length
+            ? await tx
+                .select({
+                  personId: officeAssignments.personId,
+                  officeId: officeAssignments.officeId,
+                  name: offices.name,
+                })
+                .from(officeAssignments)
+                .innerJoin(offices, eq(offices.id, officeAssignments.officeId))
+                .where(
+                  and(
+                    eq(officeAssignments.workspaceId, input.workspaceId),
+                    inArray(
+                      officeAssignments.personId,
+                      rows.map((r) => r.id),
+                    ),
+                    eq(officeAssignments.isPrimary, true),
+                    isNull(officeAssignments.effectiveTo),
+                  ),
+                )
+            : []
+          const officeBy = new Map(assignments.map((a) => [a.personId, a]))
+
+          return {
+            items: rows.map((r) => ({
+              ...PeopleService.toPerson(r),
+              // Spreading into a fresh literal drops the branded WorkspaceId that flowed through
+              // `toPerson`, so it is restored rather than widened to `string`.
+              workspaceId: r.workspaceId as WorkspaceId,
+              officeId: officeBy.get(r.id)?.officeId ?? null,
+              officeName: officeBy.get(r.id)?.name ?? null,
+            })),
+            nextCursor: null,
+            total: total?.n ?? 0,
+          }
         }),
       ),
 
