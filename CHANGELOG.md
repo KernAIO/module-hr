@@ -1,5 +1,11 @@
 # @kernhq/module-hr
 
+## 0.9.2
+
+### Patch Changes
+
+- chore: refresh the lockfile for the changesets dependency
+
 ## 0.9.1
 
 ### Patch Changes
