@@ -17,6 +17,7 @@ import {
   officeAssignments,
   offices,
   people,
+  punches,
   TENANT_TABLES,
 } from './schema.js'
 import { ApprovalService } from './services/approvals.js'
@@ -175,14 +176,20 @@ describe('the module boots', () => {
      * first time anybody adds a table (it did, on the very next commit).
      */
     const { rows } = await kernel.database.pool.query<{ table_name: string }>(
-      `select table_name from information_schema.tables
-        where table_schema = 'mod_hr' and table_type = 'BASE TABLE'`,
+      `select c.relname as table_name
+         from pg_class c
+         join pg_namespace n on n.oid = c.relnamespace
+        where n.nspname = 'mod_hr'
+          and c.relkind in ('r', 'p')
+          -- Partitions of punches are tables too, and correctly absent from TENANT_TABLES: they
+          -- inherit the parent's policy rather than declaring their own.
+          and not c.relispartition`,
     )
     const declared = new Set<string>(TENANT_TABLES)
     const undeclared = rows
       .map((r) => r.table_name)
       // drizzle's own bookkeeping is not tenant data and correctly has no policy.
-      .filter((t) => t !== '__drizzle_migrations' && !t.startsWith('__'))
+      .filter((t) => !t.startsWith('__'))
       .filter((t) => !declared.has(t))
     expect(undeclared, 'tables missing from TENANT_TABLES').toEqual([])
   })
@@ -773,3 +780,88 @@ describe('leave', () => {
 
 const FIXED_REQUEST = '01920000-0000-7000-8000-00000000fa01'
 const FIXED_REQUEST_2 = '01920000-0000-7000-8000-00000000fa02'
+
+/**
+ * Partitioning, and the thing about it that would be silent if wrong.
+ *
+ * A policy on a partitioned parent is documented to apply to every partition, including ones created
+ * after the policy. The whole rolling-partition design rests on that, and "it inherits" is exactly
+ * the kind of assumption that holds until a Postgres upgrade says otherwise — so it is asserted
+ * against a partition created *after* the migration ran, as the monthly job would.
+ */
+describe('punches partitioning', () => {
+  it('is a partitioned table with a default partition', async () => {
+    const { rows } = await kernel.database.pool.query<{ relkind: string }>(
+      `select relkind from pg_class c join pg_namespace n on n.oid = c.relnamespace
+        where n.nspname = 'mod_hr' and c.relname = 'punches'`,
+    )
+    expect(rows[0]?.relkind, "'p' means partitioned").toBe('p')
+
+    const { rows: parts } = await kernel.database.pool.query<{ n: string }>(
+      `select count(*) as n from pg_inherits i
+         join pg_class c on c.oid = i.inhrelid
+        where i.inhparent = 'mod_hr.punches'::regclass`,
+    )
+    // Seeded window plus the default: a missing month must degrade to a slow insert, never a
+    // refused punch.
+    expect(Number(parts[0]?.n ?? 0)).toBeGreaterThan(12)
+  })
+
+  it('routes a punch into the partition for its business date', async () => {
+    const person = randomUUID()
+    await run((tx) => tx.insert(people).values({ id: person, workspaceId: WS_A, displayName: 'Puncher' }))
+    await run((tx) =>
+      tx.insert(punches).values({
+        workspaceId: WS_A,
+        personId: person,
+        direction: 'in',
+        at: new Date('2026-06-15T06:00:00Z'),
+        businessDate: '2026-06-15',
+        timezone: 'Europe/Istanbul',
+      }),
+    )
+    const { rows } = await kernel.database.pool.query<{ tableoid: string }>(
+      `select tableoid::regclass::text as tableoid from mod_hr.punches
+        where person_id = '${person}'`,
+    )
+    expect(rows[0]?.tableoid).toBe('mod_hr.punches_2026_06')
+  })
+
+  it('applies row-level security to a partition created after the policy', async () => {
+    // Created the way the monthly job creates one — through the function that secures it. Doing it
+    // with a bare CREATE TABLE ... PARTITION OF is what this test caught: the partition is then
+    // readable directly by any role holding SELECT on it, whatever the parent's policy says.
+    await kernel.database.pool.query(`select mod_hr.ensure_punch_partition('2031-01-01'::date)`)
+    await kernel.database.pool.query(`grant select on mod_hr.punches_2031_01 to "${RLS_ROLE}"`)
+
+    const person = randomUUID()
+    await run((tx) => tx.insert(people).values({ id: person, workspaceId: WS_A, displayName: 'Future' }))
+    await run((tx) =>
+      tx.insert(punches).values({
+        workspaceId: WS_A,
+        personId: person,
+        direction: 'in',
+        at: new Date('2031-01-15T06:00:00Z'),
+        businessDate: '2031-01-15',
+        timezone: 'Europe/Istanbul',
+      }),
+    )
+
+    const url = new URL(databaseUrl)
+    url.username = RLS_ROLE
+    url.password = 'probe'
+    const plain = new pg.Client({ connectionString: url.toString() })
+    await plain.connect()
+    try {
+      await plain.query('reset app.workspace_id')
+      const blind = await plain.query<{ n: string }>('select count(*) as n from mod_hr.punches_2031_01')
+      expect(Number(blind.rows[0]?.n), 'a new partition must not be readable without a workspace').toBe(0)
+
+      await plain.query(`set app.workspace_id = '${WS_A}'`)
+      const seeing = await plain.query<{ n: string }>('select count(*) as n from mod_hr.punches_2031_01')
+      expect(Number(seeing.rows[0]?.n)).toBe(1)
+    } finally {
+      await plain.end()
+    }
+  })
+})

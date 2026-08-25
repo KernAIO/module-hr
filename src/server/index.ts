@@ -10,6 +10,7 @@ import {
   hrPermissions,
   MODULE_ID,
 } from '../contract/index.js'
+import { hrJobs } from './jobs.js'
 import { COUNTRY_PACKS, packDays } from './packs/index.js'
 import { implement_ } from './router.js'
 import { calendarDays, calendars, offices, people, schema } from './schema.js'
@@ -35,6 +36,7 @@ export const hrModule = defineServerModule({
   schema,
   migrationsFolder: join(dirname(fileURLToPath(import.meta.url)), '../../migrations'),
   router: implement_,
+  jobs: hrJobs(),
 
   /**
    * A workspace that switches HR on gets one office and the calendar for its country.

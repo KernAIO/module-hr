@@ -8,6 +8,17 @@ import {
   Delegation,
 } from './approvals.js'
 import {
+  AttendanceDay,
+  ClockState,
+  Punch,
+  PunchDirection,
+  PunchMethod,
+  Regularization,
+  Schedule,
+  ScheduleAssignment,
+  ScheduleWeek,
+} from './attendance.js'
+import {
   DayPart,
   LeaveBalance,
   LeaveLedgerEntry,
@@ -583,6 +594,191 @@ export const hrContract = {
       .route({ method: 'DELETE', path: '/people/{personId}/documents/{documentId}', tags: t })
       .input(ws.extend({ personId: z.uuid(), documentId: z.uuid() }))
       .output(ok),
+  },
+
+  // ---------------------------------------------------------------- attendance
+  attendance: {
+    /** Am I clocked in? The one call a clock widget makes. */
+    state: baseContract
+      .route({ method: 'GET', path: '/attendance/state', tags: t })
+      .input(ws.extend({ personId: z.uuid().optional() }))
+      .output(ClockState),
+
+    /**
+     * Clock in. The instant is **stamped by the server**, never taken from the caller.
+     *
+     * `clientReportedAt` is recorded alongside it for audit — a device whose clock is an hour out is
+     * worth knowing about — but it never decides anything.
+     */
+    clockIn: baseContract
+      .route({ method: 'POST', path: '/attendance/clock-in', tags: t })
+      .input(
+        ws.extend({
+          personId: z.uuid().optional(),
+          method: PunchMethod.default('web'),
+          clientReportedAt: z.iso.datetime({ offset: true }).nullish(),
+          geo: z.object({ lat: z.number(), lng: z.number(), accuracyM: z.number().optional() }).nullish(),
+          note: z.string().max(500).nullish(),
+          idempotencyKey: z.string().min(8).max(128).optional(),
+        }),
+      )
+      .output(Punch),
+    clockOut: baseContract
+      .route({ method: 'POST', path: '/attendance/clock-out', tags: t })
+      .input(
+        ws.extend({
+          personId: z.uuid().optional(),
+          method: PunchMethod.default('web'),
+          clientReportedAt: z.iso.datetime({ offset: true }).nullish(),
+          geo: z.object({ lat: z.number(), lng: z.number(), accuracyM: z.number().optional() }).nullish(),
+          note: z.string().max(500).nullish(),
+          idempotencyKey: z.string().min(8).max(128).optional(),
+        }),
+      )
+      .output(Punch),
+    breakStart: baseContract
+      .route({ method: 'POST', path: '/attendance/break-start', tags: t })
+      .input(
+        ws.extend({ personId: z.uuid().optional(), idempotencyKey: z.string().min(8).max(128).optional() }),
+      )
+      .output(Punch),
+    breakEnd: baseContract
+      .route({ method: 'POST', path: '/attendance/break-end', tags: t })
+      .input(
+        ws.extend({ personId: z.uuid().optional(), idempotencyKey: z.string().min(8).max(128).optional() }),
+      )
+      .output(Punch),
+
+    punches: {
+      list: baseContract
+        .route({ method: 'GET', path: '/attendance/punches', tags: t })
+        .input(
+          ws.extend({
+            personId: z.uuid().optional(),
+            from: IsoDate,
+            to: IsoDate,
+            includeVoided: z.boolean().default(false),
+            ...PageInput.shape,
+          }),
+        )
+        .output(page(Punch)),
+      /**
+       * Void a punch by writing a correcting row.
+       *
+       * The original is never edited or deleted — an attendance record somebody can quietly rewrite
+       * is worth nothing in the dispute it exists for.
+       */
+      void: baseContract
+        .route({ method: 'POST', path: '/attendance/punches/{punchId}/void', tags: t })
+        .input(ws.extend({ punchId: z.uuid(), reason: z.string().min(1).max(500) }))
+        .output(ok),
+    },
+
+    days: {
+      list: baseContract
+        .route({ method: 'GET', path: '/attendance/days', tags: t })
+        .input(
+          ws.extend({
+            personId: z.uuid().optional(),
+            officeId: z.uuid().optional(),
+            from: IsoDate,
+            to: IsoDate,
+            ...PageInput.shape,
+          }),
+        )
+        .output(page(AttendanceDay)),
+      /**
+       * Recompute a range from the punches.
+       *
+       * Safe to call at any time — the day sheet is a projection, so this is idempotent by
+       * construction. Locked days are skipped and named in the response rather than silently
+       * ignored.
+       */
+      recompute: baseContract
+        .route({ method: 'POST', path: '/attendance/days/recompute', tags: t })
+        .input(ws.extend({ personId: z.uuid().optional(), from: IsoDate, to: IsoDate }))
+        .output(z.object({ recomputed: z.number().int(), skippedLocked: z.array(IsoDate) })),
+    },
+
+    schedules: {
+      list: baseContract
+        .route({ method: 'GET', path: '/attendance/schedules', tags: t })
+        .input(ws.extend({ includeArchived: z.boolean().default(false) }))
+        .output(z.array(Schedule)),
+      create: baseContract
+        .route({ method: 'POST', path: '/attendance/schedules', tags: t })
+        .input(
+          ws.extend({
+            name: z.string().min(1).max(120),
+            kind: Schedule.shape.kind.default('fixed'),
+            week: ScheduleWeek,
+            tzMode: Schedule.shape.tzMode.default('office'),
+            tz: Schedule.shape.tz.optional(),
+            graceInMinutes: z.number().int().min(0).max(240).default(0),
+            graceOutMinutes: z.number().int().min(0).max(240).default(0),
+            roundingStepMinutes: z.number().int().min(0).max(60).default(0),
+            roundingDirection: Schedule.shape.roundingDirection.default('nearest'),
+            autoClockOutAfterMinutes: z.number().int().min(60).nullish(),
+          }),
+        )
+        .output(Schedule),
+      update: baseContract
+        .route({ method: 'PATCH', path: '/attendance/schedules/{scheduleId}', tags: t })
+        .input(
+          ws.extend({
+            scheduleId: z.uuid(),
+            name: z.string().min(1).max(120).optional(),
+            week: ScheduleWeek.optional(),
+            graceInMinutes: z.number().int().min(0).max(240).optional(),
+            graceOutMinutes: z.number().int().min(0).max(240).optional(),
+            roundingStepMinutes: z.number().int().min(0).max(60).optional(),
+            roundingDirection: Schedule.shape.roundingDirection.optional(),
+            autoClockOutAfterMinutes: z.number().int().min(60).nullish(),
+          }),
+        )
+        .output(Schedule),
+      archive: baseContract
+        .route({ method: 'DELETE', path: '/attendance/schedules/{scheduleId}', tags: t })
+        .input(ws.extend({ scheduleId: z.uuid() }))
+        .output(ok),
+      assign: baseContract
+        .route({ method: 'POST', path: '/attendance/schedules/{scheduleId}/assign', tags: t })
+        .input(ws.extend({ scheduleId: z.uuid(), personId: z.uuid(), effectiveFrom: IsoDate }))
+        .output(z.array(ScheduleAssignment)),
+    },
+
+    regularizations: {
+      list: baseContract
+        .route({ method: 'GET', path: '/attendance/regularizations', tags: t })
+        .input(
+          ws.extend({
+            personId: z.uuid().optional(),
+            status: z.array(Regularization.shape.status).optional(),
+            ...PageInput.shape,
+          }),
+        )
+        .output(page(Regularization)),
+      /** Ask for a wrong or missing punch to be fixed. Goes through the same approval engine. */
+      request: baseContract
+        .route({ method: 'POST', path: '/attendance/regularizations', tags: t })
+        .input(
+          ws.extend({
+            personId: z.uuid().optional(),
+            businessDate: IsoDate,
+            punchId: z.uuid().nullish(),
+            proposed: z
+              .array(
+                z.object({
+                  direction: PunchDirection,
+                  at: z.iso.datetime({ offset: true }),
+                }),
+              )
+              .min(1),
+            reason: z.string().min(1).max(1000),
+          }),
+        )
+        .output(Regularization),
+    },
   },
 
   // ---------------------------------------------------------------- leave

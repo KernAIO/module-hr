@@ -13,12 +13,14 @@ import { implement } from '@orpc/server'
 import { and, asc, count, desc, eq, gte, ilike, inArray, isNull, lte, or, sql } from 'drizzle-orm'
 import { HrSettings, hrContract, hrEvents, MODULE_ID, type WorkingWeek } from '../contract/index.js'
 import { countWorkingDays, workingDays } from '../policy/calendar.js'
+import { businessDateFor } from '../policy/working-time.js'
 import { COUNTRY_PACKS, packDays } from './packs/index.js'
 import {
   approvalChains,
   approvalDecisions,
   approvalRequests,
   approvalSteps,
+  attendanceDays,
   calendarDays,
   calendars,
   costCenters,
@@ -38,9 +40,14 @@ import {
   personDocuments,
   personHistory,
   positions,
+  punches,
+  regularizations,
+  scheduleAssignments,
+  schedules,
 } from './schema.js'
 import { ApprovalService } from './services/approvals.js'
-import { inForceOn, todayIso } from './services/db.js'
+import { AttendanceService } from './services/attendance.js'
+import { inForceOn, todayIn, todayIso } from './services/db.js'
 import { LedgerService, MINUTES_PER_DAY, yearOf } from './services/ledger.js'
 import { PeopleService } from './services/people.js'
 import { DEFAULT_WORKING_WEEK, ResolveService } from './services/resolve.js'
@@ -66,6 +73,7 @@ export function implement_(kernel: Kernel) {
   const svc = new PeopleService(kernel)
   const ledger = new LedgerService()
   const approvals = new ApprovalService(kernel)
+  const attendance = new AttendanceService()
   const db = kernel.database
   const settingsOf = (workspaceId: string) => kernel.settings.module(workspaceId, MODULE_ID, HrSettings)
 
@@ -1519,6 +1527,394 @@ export function implement_(kernel: Kernel) {
         }),
     },
 
+    // ================================================================= attendance
+    attendance: {
+      state: scoped.attendance.state
+        .use(cap('attendance'))
+        .use(requires('hr.attendance.view'))
+        .handler(({ input, context }) =>
+          db.withWorkspace(input.workspaceId, async (tx) => {
+            const personId = await personFor(tx, input.workspaceId, context, input.personId)
+            const { timezone, businessDate, schedule } = await clockContext(tx, input.workspaceId, personId)
+            const rows = await attendance.punchesOn(tx, input.workspaceId, personId, businessDate)
+
+            let open: Date | null = null
+            let onBreak = false
+            let workedMs = 0
+            let breakOpen: Date | null = null
+            for (const r of rows) {
+              if (r.direction === 'in') open = r.at
+              else if (r.direction === 'out' && open) {
+                workedMs += r.at.getTime() - open.getTime()
+                open = null
+              } else if (r.direction === 'break_start') {
+                breakOpen = r.at
+                onBreak = true
+              } else if (r.direction === 'break_end' && breakOpen) {
+                workedMs -= r.at.getTime() - breakOpen.getTime()
+                breakOpen = null
+                onBreak = false
+              }
+            }
+            // An open span counts up to now, so the widget shows time accruing rather than freezing
+            // at the last completed pair.
+            if (open) workedMs += Date.now() - open.getTime()
+            if (breakOpen) workedMs -= Date.now() - breakOpen.getTime()
+            void schedule
+
+            return {
+              personId,
+              businessDate,
+              clockedIn: open !== null,
+              onBreak,
+              since: (open ?? breakOpen)?.toISOString() ?? null,
+              workedMinutesToday: Math.max(0, Math.round(workedMs / 60000)),
+              timezone,
+            }
+          }),
+        ),
+
+      clockIn: scoped.attendance.clockIn
+        .use(cap('attendance'))
+        .use(requires('hr.attendance.punch'))
+        .handler(({ input, context }) => punch(input, context, 'in')),
+      clockOut: scoped.attendance.clockOut
+        .use(cap('attendance'))
+        .use(requires('hr.attendance.punch'))
+        .handler(({ input, context }) => punch(input, context, 'out')),
+      breakStart: scoped.attendance.breakStart
+        .use(cap('attendance'))
+        .use(requires('hr.attendance.punch'))
+        .handler(({ input, context }) => punch(input, context, 'break_start')),
+      breakEnd: scoped.attendance.breakEnd
+        .use(cap('attendance'))
+        .use(requires('hr.attendance.punch'))
+        .handler(({ input, context }) => punch(input, context, 'break_end')),
+
+      punches: {
+        list: scoped.attendance.punches.list
+          .use(cap('attendance'))
+          .use(requires('hr.attendance.view'))
+          .handler(({ input, context }) =>
+            db.withWorkspace(input.workspaceId, async (tx) => {
+              const personId = await personFor(tx, input.workspaceId, context, input.personId)
+              const where = [
+                eq(punches.workspaceId, input.workspaceId),
+                eq(punches.personId, personId),
+                gte(punches.businessDate, input.from),
+                lte(punches.businessDate, input.to),
+              ]
+              if (!input.includeVoided) where.push(isNull(punches.voidedByPunchId))
+              const rows = await tx
+                .select()
+                .from(punches)
+                .where(and(...where))
+                .orderBy(asc(punches.at))
+                .limit(input.limit)
+              return { items: rows.map(toPunch), nextCursor: null }
+            }),
+          ),
+
+        void: scoped.attendance.punches.void
+          .use(cap('attendance'))
+          .use(requires('hr.attendance.manage'))
+          .handler(async ({ input, context }) => {
+            const affected = await db.withWorkspace(input.workspaceId, async (tx) => {
+              const me = await svc.byUserId(tx, input.workspaceId, context.principal.userId ?? '')
+              const { original } = await attendance.voidPunch(
+                tx,
+                input.workspaceId,
+                input.punchId,
+                input.reason,
+                me?.id ?? null,
+              )
+              // The day is derived, so voiding a punch means the sheet is stale until it is rebuilt.
+              const { timezone, schedule } = await clockContext(tx, input.workspaceId, original.personId)
+              await attendance.recomputeDay(
+                tx,
+                input.workspaceId,
+                original.personId,
+                original.businessDate,
+                timezone,
+                schedule,
+              )
+              return original
+            })
+            await changed(input.workspaceId, 'attendance_day', affected.personId, 'updated')
+            return { ok: true as const }
+          }),
+      },
+
+      days: {
+        list: scoped.attendance.days.list
+          .use(cap('attendance'))
+          .use(requires('hr.attendance.view'))
+          .handler(({ input, context }) =>
+            db.withWorkspace(input.workspaceId, async (tx) => {
+              const where = [
+                eq(attendanceDays.workspaceId, input.workspaceId),
+                gte(attendanceDays.businessDate, input.from),
+                lte(attendanceDays.businessDate, input.to),
+              ]
+              if (input.officeId) {
+                const here = await tx
+                  .select({ personId: officeAssignments.personId })
+                  .from(officeAssignments)
+                  .where(
+                    and(
+                      eq(officeAssignments.workspaceId, input.workspaceId),
+                      eq(officeAssignments.officeId, input.officeId),
+                      isNull(officeAssignments.effectiveTo),
+                    ),
+                  )
+                // Reading a whole office needs the team permission; reading yourself does not.
+                await kernel.authz.require(context.principal, 'hr.attendance.view_team', {
+                  kind: 'workspace',
+                  id: input.workspaceId,
+                  workspaceId: input.workspaceId,
+                })
+                where.push(
+                  here.length
+                    ? inArray(
+                        attendanceDays.personId,
+                        here.map((h) => h.personId),
+                      )
+                    : sql`false`,
+                )
+              } else {
+                const personId = await personFor(tx, input.workspaceId, context, input.personId)
+                where.push(eq(attendanceDays.personId, personId))
+              }
+              const rows = await tx
+                .select()
+                .from(attendanceDays)
+                .where(and(...where))
+                .orderBy(asc(attendanceDays.businessDate))
+                .limit(input.limit)
+              return { items: rows.map(toAttendanceDay), nextCursor: null }
+            }),
+          ),
+
+        recompute: scoped.attendance.days.recompute
+          .use(cap('attendance'))
+          .use(requires('hr.attendance.manage'))
+          .handler(({ input, context }) =>
+            db.withWorkspace(input.workspaceId, async (tx) => {
+              const personId = await personFor(tx, input.workspaceId, context, input.personId)
+              const { timezone, schedule } = await clockContext(tx, input.workspaceId, personId)
+              const dates = await attendance.datesWithPunches(
+                tx,
+                input.workspaceId,
+                personId,
+                input.from,
+                input.to,
+              )
+              let recomputed = 0
+              const skippedLocked: string[] = []
+              for (const date of dates) {
+                const r = await attendance.recomputeDay(
+                  tx,
+                  input.workspaceId,
+                  personId,
+                  date,
+                  timezone,
+                  schedule,
+                )
+                // Named rather than silently skipped: a recomputation that quietly declines to touch
+                // a closed month looks identical to one that had nothing to do.
+                if (r.locked) skippedLocked.push(date)
+                else recomputed++
+              }
+              return { recomputed, skippedLocked }
+            }),
+          ),
+      },
+
+      schedules: {
+        list: scoped.attendance.schedules.list
+          .use(cap('attendance'))
+          .use(requires('hr.attendance.view'))
+          .handler(({ input }) =>
+            db.withWorkspace(input.workspaceId, async (tx) => {
+              const where = [eq(schedules.workspaceId, input.workspaceId)]
+              if (!input.includeArchived) where.push(isNull(schedules.archivedAt))
+              const rows = await tx
+                .select()
+                .from(schedules)
+                .where(and(...where))
+                .orderBy(asc(schedules.name))
+              return rows.map(toSchedule)
+            }),
+          ),
+        create: scoped.attendance.schedules.create
+          .use(cap('attendance'))
+          .use(requires('hr.attendance.manage'))
+          .handler(async ({ input }) => {
+            const row = await db.withWorkspace(input.workspaceId, async (tx) => {
+              const [created] = await tx
+                .insert(schedules)
+                .values({
+                  id: uuidv7(),
+                  workspaceId: input.workspaceId,
+                  name: input.name,
+                  kind: input.kind,
+                  week: input.week as unknown as Record<string, unknown>,
+                  tzMode: input.tzMode,
+                  tz: input.tz ?? null,
+                  graceInMinutes: input.graceInMinutes,
+                  graceOutMinutes: input.graceOutMinutes,
+                  roundingStepMinutes: input.roundingStepMinutes,
+                  roundingDirection: input.roundingDirection,
+                  autoClockOutAfterMinutes: input.autoClockOutAfterMinutes ?? null,
+                })
+                .returning()
+              return created!
+            })
+            await changed(input.workspaceId, 'schedule', row.id, 'created')
+            return toSchedule(row)
+          }),
+        update: scoped.attendance.schedules.update
+          .use(cap('attendance'))
+          .use(requires('hr.attendance.manage'))
+          .handler(async ({ input }) => {
+            const row = await db.withWorkspace(input.workspaceId, async (tx) => {
+              const { workspaceId, scheduleId, ...patch } = input
+              const set: Record<string, unknown> = { updatedAt: new Date() }
+              for (const [k, v] of Object.entries(patch)) if (v !== undefined) set[k] = v
+              const [updated] = await tx
+                .update(schedules)
+                .set(set)
+                .where(and(eq(schedules.workspaceId, workspaceId), eq(schedules.id, scheduleId)))
+                .returning()
+              if (!updated) throw KernError.notFound('Schedule')
+              return updated
+            })
+            await changed(input.workspaceId, 'schedule', row.id, 'updated')
+            return toSchedule(row)
+          }),
+        archive: scoped.attendance.schedules.archive
+          .use(cap('attendance'))
+          .use(requires('hr.attendance.manage'))
+          .handler(async ({ input }) => {
+            await db.withWorkspace(input.workspaceId, (tx) =>
+              tx
+                .update(schedules)
+                .set({ archivedAt: new Date() })
+                .where(and(eq(schedules.workspaceId, input.workspaceId), eq(schedules.id, input.scheduleId))),
+            )
+            await changed(input.workspaceId, 'schedule', input.scheduleId, 'deleted')
+            return { ok: true as const }
+          }),
+        assign: scoped.attendance.schedules.assign
+          .use(cap('attendance'))
+          .use(requires('hr.attendance.manage'))
+          .handler(async ({ input }) => {
+            const rows = await db.withWorkspace(input.workspaceId, async (tx) => {
+              // Effective-dated like everything else here: the old assignment is closed the day
+              // before, so "which schedule was she on in March" stays answerable.
+              await tx
+                .update(scheduleAssignments)
+                .set({ effectiveTo: sql`${input.effectiveFrom}::date - 1` })
+                .where(
+                  and(
+                    eq(scheduleAssignments.workspaceId, input.workspaceId),
+                    eq(scheduleAssignments.personId, input.personId),
+                    isNull(scheduleAssignments.effectiveTo),
+                  ),
+                )
+              await tx.insert(scheduleAssignments).values({
+                id: uuidv7(),
+                workspaceId: input.workspaceId,
+                personId: input.personId,
+                scheduleId: input.scheduleId,
+                effectiveFrom: input.effectiveFrom,
+              })
+              return tx
+                .select()
+                .from(scheduleAssignments)
+                .where(
+                  and(
+                    eq(scheduleAssignments.workspaceId, input.workspaceId),
+                    eq(scheduleAssignments.personId, input.personId),
+                  ),
+                )
+                .orderBy(desc(scheduleAssignments.effectiveFrom))
+            })
+            await changed(input.workspaceId, 'schedule', input.scheduleId, 'updated')
+            return rows.map(toScheduleAssignment)
+          }),
+      },
+
+      regularizations: {
+        list: scoped.attendance.regularizations.list
+          .use(cap('attendance'))
+          .use(requires('hr.attendance.view'))
+          .handler(({ input, context }) =>
+            db.withWorkspace(input.workspaceId, async (tx) => {
+              const personId = await personFor(tx, input.workspaceId, context, input.personId)
+              const where = [
+                eq(regularizations.workspaceId, input.workspaceId),
+                eq(regularizations.personId, personId),
+              ]
+              if (input.status?.length) where.push(inArray(regularizations.status, input.status))
+              const rows = await tx
+                .select()
+                .from(regularizations)
+                .where(and(...where))
+                .orderBy(desc(regularizations.businessDate))
+                .limit(input.limit)
+              return { items: rows.map(toRegularization), nextCursor: null }
+            }),
+          ),
+
+        request: scoped.attendance.regularizations.request
+          .use(cap('attendance'))
+          .use(requires('hr.attendance.punch'))
+          .handler(async ({ input, context }) => {
+            const row = await db.withWorkspace(input.workspaceId, async (tx) => {
+              const personId = await personFor(tx, input.workspaceId, context, input.personId)
+              const [created] = await tx
+                .insert(regularizations)
+                .values({
+                  id: uuidv7(),
+                  workspaceId: input.workspaceId,
+                  personId,
+                  businessDate: input.businessDate,
+                  punchId: input.punchId ?? null,
+                  proposed: input.proposed as unknown as Array<Record<string, unknown>>,
+                  reason: input.reason,
+                  status: 'pending',
+                })
+                .returning()
+
+              // The same engine leave uses. That reuse is the reason approvals were built keyed by
+              // subject type rather than bolted onto leave_requests.
+              const raised = await approvals.raise(tx, input.workspaceId, {
+                subjectType: 'regularization',
+                subjectId: created!.id,
+                summary: `Correction for ${input.businessDate}`,
+                requesterPersonId: personId,
+                requestedBy: context.principal.userId ?? null,
+                on: input.businessDate,
+              })
+              await tx
+                .update(regularizations)
+                .set({ approvalRequestId: raised.request.id })
+                .where(eq(regularizations.id, created!.id))
+              if (raised.autoApproved) await applyRegularization(tx, input.workspaceId, created!.id)
+
+              const [fresh] = await tx
+                .select()
+                .from(regularizations)
+                .where(eq(regularizations.id, created!.id))
+              return fresh!
+            })
+            await changed(input.workspaceId, 'regularization', row.id, 'created')
+            return toRegularization(row)
+          }),
+      },
+    },
+
     // ================================================================= leave
     leave: {
       types: {
@@ -2006,6 +2402,14 @@ export function implement_(kernel: Kernel) {
                 .update(leaveRequests)
                 .set({ status: 'rejected', decidedAt: new Date(), updatedAt: new Date() })
                 .where(eq(leaveRequests.id, request.subjectId))
+          } else if (request.subjectType === 'regularization') {
+            if (result.status === 'approved')
+              await applyRegularization(tx, input.workspaceId, request.subjectId)
+            else if (result.status === 'rejected')
+              await tx
+                .update(regularizations)
+                .set({ status: 'rejected' })
+                .where(eq(regularizations.id, request.subjectId))
           }
 
           const [fresh] = await tx
@@ -2776,6 +3180,160 @@ export function implement_(kernel: Kernel) {
     }
   }
 
+  /**
+   * Everything a punch needs: the person's zone, today's business date, and their schedule.
+   *
+   * The zone comes from the resolution ladder — their primary office unless they have an override —
+   * so a punch made on a business trip still counts towards the month they are employed in.
+   */
+  async function clockContext(tx: Tx, workspaceId: string, personId: string) {
+    const today = todayIso()
+    const resolution = await resolve.forPerson(tx, workspaceId, personId, today)
+    const schedule = await attendance.scheduleFor(tx, workspaceId, personId, today)
+    const businessDate = businessDateFor(
+      Date.now(),
+      resolution.timezone,
+      schedule.shiftFor(todayIn(resolution.timezone)),
+    )
+    return { timezone: resolution.timezone, businessDate, schedule, resolution }
+  }
+
+  /**
+   * One punch, and the day rebuilt straight afterwards.
+   *
+   * Recomputing inline rather than in a background job: the clock widget shows a total, and a person
+   * who clocks out wants to see it immediately. The day sheet is a projection, so doing it twice
+   * costs nothing.
+   */
+  async function punch(
+    input: {
+      workspaceId: string
+      personId?: string
+      method?: string
+      clientReportedAt?: string | null
+      geo?: { lat: number; lng: number; accuracyM?: number } | null
+      note?: string | null
+      idempotencyKey?: string
+    },
+    context: RequestContext,
+    direction: 'in' | 'out' | 'break_start' | 'break_end',
+  ) {
+    const row = await db.withWorkspace(input.workspaceId, async (tx) => {
+      const personId = await personFor(tx, input.workspaceId, context, input.personId)
+      const { timezone, businessDate, schedule, resolution } = await clockContext(
+        tx,
+        input.workspaceId,
+        personId,
+      )
+
+      // Refuse the transitions that make no sense, with a sentence rather than a constraint error:
+      // clocking in twice, or out when never in, is somebody double-tapping a button.
+      const existing = await attendance.punchesOn(tx, input.workspaceId, personId, businessDate)
+      const open = openState(existing)
+      if (direction === 'in' && open.clockedIn) throw KernError.conflict('You are already clocked in.')
+      if (direction === 'out' && !open.clockedIn) throw KernError.conflict('You are not clocked in.')
+      if (direction === 'break_start' && !open.clockedIn)
+        throw KernError.conflict('Clock in before starting a break.')
+      if (direction === 'break_start' && open.onBreak) throw KernError.conflict('You are already on a break.')
+      if (direction === 'break_end' && !open.onBreak) throw KernError.conflict('You are not on a break.')
+
+      const punchRow = await attendance.record(
+        tx,
+        input.workspaceId,
+        {
+          personId,
+          direction,
+          timezone,
+          method: input.method ?? 'web',
+          clientReportedAt: input.clientReportedAt ?? null,
+          officeId: resolution.primaryOfficeId,
+          geo: input.geo ?? null,
+          note: input.note ?? null,
+          idempotencyKey: input.idempotencyKey ?? null,
+        },
+        schedule,
+      )
+
+      await attendance.recomputeDay(
+        tx,
+        input.workspaceId,
+        personId,
+        punchRow.businessDate,
+        timezone,
+        schedule,
+      )
+      return punchRow
+    })
+
+    await kernel.emit(
+      hrEvents.punchRecorded,
+      {
+        punchId: row.id,
+        workspaceId: input.workspaceId as never,
+        personId: row.personId,
+        direction: row.direction,
+        businessDate: row.businessDate,
+      },
+      { workspaceId: input.workspaceId, actorId: context.principal.userId },
+    )
+    await changed(input.workspaceId, 'attendance_day', row.personId, 'updated')
+    return toPunch(row)
+  }
+
+  /** Whether a person is currently clocked in or on a break, from their punches so far. */
+  function openState(rows: Array<{ direction: string }>) {
+    let clockedIn = false
+    let onBreak = false
+    for (const r of rows) {
+      if (r.direction === 'in') clockedIn = true
+      else if (r.direction === 'out') {
+        clockedIn = false
+        onBreak = false
+      } else if (r.direction === 'break_start') onBreak = true
+      else if (r.direction === 'break_end') onBreak = false
+    }
+    return { clockedIn, onBreak }
+  }
+
+  /**
+   * Apply an approved correction: write the proposed punches, void what they replace, rebuild.
+   *
+   * Nothing is edited. The original punch keeps its row and gains a pointer to what superseded it,
+   * so a corrected timesheet and an edited one stay distinguishable — which is the entire reason
+   * regularization exists rather than an update statement.
+   */
+  async function applyRegularization(tx: Tx, workspaceId: string, regularizationId: string) {
+    const [row] = await tx
+      .select()
+      .from(regularizations)
+      .where(and(eq(regularizations.workspaceId, workspaceId), eq(regularizations.id, regularizationId)))
+      .limit(1)
+    if (!row || row.status === 'approved') return
+
+    if (row.punchId) await attendance.voidPunch(tx, workspaceId, row.punchId, 'Regularized', null)
+
+    const { timezone, schedule } = await clockContext(tx, workspaceId, row.personId)
+    for (const proposal of row.proposed as Array<{ direction: string; at: string }>)
+      await tx.insert(punches).values({
+        id: uuidv7(),
+        workspaceId,
+        personId: row.personId,
+        direction: proposal.direction,
+        at: new Date(proposal.at),
+        businessDate: row.businessDate,
+        timezone,
+        method: 'manual',
+        trust: 'trusted',
+        note: `Regularization ${row.id}`,
+      })
+
+    await attendance.recomputeDay(tx, workspaceId, row.personId, row.businessDate, timezone, schedule)
+    await tx
+      .update(regularizations)
+      .set({ status: 'approved', appliedAt: new Date() })
+      .where(eq(regularizations.id, row.id))
+  }
+
   async function emitCalendarChanged(
     workspaceId: WorkspaceId,
     calendarId: string,
@@ -2871,5 +3429,46 @@ const toChain = (r: typeof approvalChains.$inferSelect) => ({
 const toDelegation = (r: typeof delegations.$inferSelect) => ({
   ...r,
   subjectType: (r.subjectType ?? null) as never,
+  createdAt: r.createdAt.toISOString(),
+})
+
+const toPunch = (r: typeof punches.$inferSelect) => ({
+  ...r,
+  direction: r.direction as never,
+  method: r.method as never,
+  trust: r.trust as never,
+  geo: (r.geo as { lat: number; lng: number } | null) ?? null,
+  at: r.at.toISOString(),
+  clientReportedAt: r.clientReportedAt?.toISOString() ?? null,
+  createdAt: r.createdAt.toISOString(),
+})
+
+const toAttendanceDay = (r: typeof attendanceDays.$inferSelect) => ({
+  ...r,
+  status: r.status as never,
+  firstIn: r.firstIn?.toISOString() ?? null,
+  lastOut: r.lastOut?.toISOString() ?? null,
+  computedAt: r.computedAt.toISOString(),
+})
+
+const toSchedule = (r: typeof schedules.$inferSelect) => ({
+  ...r,
+  kind: r.kind as never,
+  week: r.week as never,
+  tzMode: r.tzMode as never,
+  roundingDirection: r.roundingDirection as never,
+  archivedAt: r.archivedAt?.toISOString() ?? null,
+})
+
+const toScheduleAssignment = (r: typeof scheduleAssignments.$inferSelect) => ({
+  ...r,
+  createdAt: r.createdAt.toISOString(),
+})
+
+const toRegularization = (r: typeof regularizations.$inferSelect) => ({
+  ...r,
+  status: r.status as never,
+  proposed: r.proposed as never,
+  appliedAt: r.appliedAt?.toISOString() ?? null,
   createdAt: r.createdAt.toISOString(),
 })

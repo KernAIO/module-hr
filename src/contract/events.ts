@@ -129,6 +129,30 @@ export const hrEvents = {
       status: z.string(),
     }),
   ),
+  punchRecorded: defineEvent(
+    'hr.punch.recorded',
+    z.object({
+      punchId: z.uuid(),
+      workspaceId: WorkspaceId,
+      personId: z.uuid(),
+      direction: z.string(),
+      businessDate: z.iso.date(),
+    }),
+  ),
+  /**
+   * A derived day changed. Carries the date so a consumer recomputes that window rather than
+   * everything — this fires on every punch, so a coarse payload would be a stampede.
+   */
+  attendanceDayComputed: defineEvent(
+    'hr.attendance.day_computed',
+    z.object({
+      workspaceId: WorkspaceId,
+      personId: z.uuid(),
+      businessDate: z.iso.date(),
+      status: z.string(),
+      workedMinutes: z.number().int(),
+    }),
+  ),
   calendarChanged: defineEvent(
     'hr.calendar.changed',
     z.object({

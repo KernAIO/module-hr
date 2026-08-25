@@ -634,6 +634,143 @@ export const delegations = schema.table(
   (t) => [index('hr_delegations_idx').on(t.workspaceId, t.toPersonId, t.startsOn)],
 )
 
+// =====================================================================================
+// attendance
+// =====================================================================================
+
+export const schedules = schema.table(
+  'schedules',
+  {
+    id: id(),
+    workspaceId: ws(),
+    name: text('name').notNull(),
+    kind: text('kind').notNull().default('fixed'),
+    /** Wall-clock readings per weekday. Never instants — a schedule is a rule, not a set of moments. */
+    week: jsonb('week').$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
+    tzMode: text('tz_mode').notNull().default('office'),
+    tz: text('tz'),
+    graceInMinutes: integer('grace_in_minutes').notNull().default(0),
+    graceOutMinutes: integer('grace_out_minutes').notNull().default(0),
+    roundingStepMinutes: integer('rounding_step_minutes').notNull().default(0),
+    roundingDirection: text('rounding_direction').notNull().default('nearest'),
+    autoClockOutAfterMinutes: integer('auto_clock_out_after_minutes'),
+    archivedAt: ts('archived_at'),
+    createdAt: created(),
+    updatedAt: updated(),
+  },
+  (t) => [index('hr_schedules_ws_idx').on(t.workspaceId, t.archivedAt)],
+)
+
+export const scheduleAssignments = schema.table(
+  'schedule_assignments',
+  {
+    id: id(),
+    workspaceId: ws(),
+    personId: uuid('person_id').notNull(),
+    scheduleId: uuid('schedule_id').notNull(),
+    effectiveFrom: date('effective_from').notNull(),
+    effectiveTo: date('effective_to'),
+    createdAt: created(),
+  },
+  (t) => [index('hr_schedule_assign_idx').on(t.workspaceId, t.personId, t.effectiveFrom)],
+)
+
+/**
+ * Raw punches. **Append-only, and partitioned.**
+ *
+ * Never updated, never deleted: a wrong punch is voided by a correcting row, so both survive. An
+ * attendance record somebody can quietly rewrite is worth nothing in the dispute it exists for.
+ *
+ * Partitioned monthly by `business_date` — see migration 0003, which creates the table by hand
+ * because drizzle-kit cannot express `PARTITION BY`. Five hundred people punching four times a day
+ * is half a million rows a year, and retrofitting partitioning onto a live table of those is a
+ * migration nobody wants. A partitioned table's primary key must contain the partition column,
+ * which is why it is `(id, business_date)` rather than `id`.
+ */
+export const punches = schema.table(
+  'punches',
+  {
+    id: uuid('id').notNull().default(sql`uuidv7()`),
+    workspaceId: ws(),
+    personId: uuid('person_id').notNull(),
+    direction: text('direction').notNull(),
+    /** The instant. Server-stamped unless the punch was made offline and is a claim. */
+    at: ts('at').notNull().defaultNow(),
+    /** What the client believed. Kept even when it disagrees — a device an hour out is worth knowing. */
+    clientReportedAt: ts('client_reported_at'),
+    skewMs: integer('skew_ms'),
+    /** The partition key, and the day this punch counts towards. A night shift lands on its start date. */
+    businessDate: date('business_date').notNull(),
+    /** The zone it happened in — audit only. Attribution follows the person's primary office. */
+    timezone: text('timezone').notNull().default('UTC'),
+    method: text('method').notNull().default('web'),
+    officeId: uuid('office_id'),
+    deviceId: uuid('device_id'),
+    geo: jsonb('geo').$type<Record<string, number>>(),
+    trust: text('trust').notNull().default('trusted'),
+    voidedByPunchId: uuid('voided_by_punch_id'),
+    idempotencyKey: text('idempotency_key'),
+    note: text('note'),
+    createdAt: created(),
+  },
+  (t) => [index('hr_punches_person_idx').on(t.workspaceId, t.personId, t.businessDate)],
+)
+
+/**
+ * The derived day sheet. **A projection, never a source of truth.**
+ *
+ * Recomputable from punches + schedule + calendar + leave at any moment, which is what makes a bad
+ * computation a bug to fix and re-run rather than data to repair by hand. `policyHash` records what
+ * produced a row so a recomputation can tell whether it is stale; `locked` mirrors the period, so a
+ * closed month cannot move underneath a payroll that has already been filed.
+ */
+export const attendanceDays = schema.table(
+  'attendance_days',
+  {
+    id: id(),
+    workspaceId: ws(),
+    personId: uuid('person_id').notNull(),
+    businessDate: date('business_date').notNull(),
+    scheduledMinutes: integer('scheduled_minutes').notNull().default(0),
+    workedMinutes: integer('worked_minutes').notNull().default(0),
+    breakMinutes: integer('break_minutes').notNull().default(0),
+    overtimeMinutes: integer('overtime_minutes').notNull().default(0),
+    lateMinutes: integer('late_minutes').notNull().default(0),
+    earlyLeaveMinutes: integer('early_leave_minutes').notNull().default(0),
+    status: text('status').notNull().default('absent'),
+    leaveRequestId: uuid('leave_request_id'),
+    anomalies: text('anomalies').array().notNull().default(sql`'{}'::text[]`),
+    firstIn: ts('first_in'),
+    lastOut: ts('last_out'),
+    policyHash: text('policy_hash'),
+    locked: boolean('locked').notNull().default(false),
+    computedAt: ts('computed_at').notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('hr_attendance_days_uq').on(t.workspaceId, t.personId, t.businessDate),
+    index('hr_attendance_days_date_idx').on(t.workspaceId, t.businessDate, t.status),
+  ],
+)
+
+export const regularizations = schema.table(
+  'regularizations',
+  {
+    id: id(),
+    workspaceId: ws(),
+    personId: uuid('person_id').notNull(),
+    businessDate: date('business_date').notNull(),
+    /** Null when nothing was punched at all and the whole day is being asked for. */
+    punchId: uuid('punch_id'),
+    proposed: jsonb('proposed').$type<Array<Record<string, unknown>>>().notNull(),
+    reason: text('reason').notNull(),
+    status: text('status').notNull().default('pending'),
+    approvalRequestId: uuid('approval_request_id'),
+    appliedAt: ts('applied_at'),
+    createdAt: created(),
+  },
+  (t) => [index('hr_regularizations_idx').on(t.workspaceId, t.personId, t.businessDate)],
+)
+
 /** Every tenant table, so the RLS migration is checked against one list rather than memory. */
 export const TENANT_TABLES = [
   'legal_entities',
@@ -660,4 +797,9 @@ export const TENANT_TABLES = [
   'approval_steps',
   'approval_decisions',
   'delegations',
+  'schedules',
+  'schedule_assignments',
+  'punches',
+  'attendance_days',
+  'regularizations',
 ] as const

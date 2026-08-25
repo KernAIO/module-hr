@@ -7,6 +7,7 @@
  * and also that every procedure listed in `hrCapabilityProcedures` carries its capability guard.
  */
 export * from './approvals.js'
+export * from './attendance.js'
 export * from './capabilities.js'
 export * from './events.js'
 export * from './leave.js'

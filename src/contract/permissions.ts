@@ -228,6 +228,51 @@ export const hrPermissions = definePermissions([
     dangerous: true,
   },
 
+  // ---------------------------------------------------------------- attendance
+  {
+    key: 'hr.attendance.punch',
+    label: 'Clock yourself in and out',
+    scope: 'workspace',
+    defaultRoles: ['owner', 'admin', 'member'],
+    dangerous: false,
+  },
+  {
+    key: 'hr.attendance.view',
+    label: 'View your own attendance',
+    scope: 'workspace',
+    defaultRoles: ['owner', 'admin', 'member'],
+    dangerous: false,
+  },
+  {
+    key: 'hr.attendance.view_team',
+    label: "View your team's attendance",
+    scope: 'object',
+    defaultRoles: ['owner', 'admin'],
+    dangerous: false,
+  },
+  {
+    key: 'hr.attendance.manage',
+    label: 'Correct punches, schedules and day sheets',
+    description: 'Voids punches and recomputes days. Every change leaves the original visible.',
+    scope: 'workspace',
+    defaultRoles: ['owner', 'admin'],
+    dangerous: true,
+  },
+  {
+    key: 'hr.overtime.view',
+    label: 'View overtime',
+    scope: 'workspace',
+    defaultRoles: ['owner', 'admin'],
+    dangerous: false,
+  },
+  {
+    key: 'hr.overtime.manage',
+    label: 'Approve and adjust overtime',
+    scope: 'workspace',
+    defaultRoles: ['owner', 'admin'],
+    dangerous: false,
+  },
+
   // ---------------------------------------------------------------- approvals
   {
     key: 'hr.approval.manage',
@@ -283,6 +328,12 @@ export const HR_PERMISSIONS = {
   leaveViewLedger: 'hr.leave.view_ledger',
   leaveManage: 'hr.leave.manage',
   leaveAdjust: 'hr.leave.adjust',
+  attendancePunch: 'hr.attendance.punch',
+  attendanceView: 'hr.attendance.view',
+  attendanceViewTeam: 'hr.attendance.view_team',
+  attendanceManage: 'hr.attendance.manage',
+  overtimeView: 'hr.overtime.view',
+  overtimeManage: 'hr.overtime.manage',
   approvalManage: 'hr.approval.manage',
   approvalDelegate: 'hr.approval.delegate',
 } as const
