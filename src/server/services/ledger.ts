@@ -1,5 +1,5 @@
 import { KernError, type Tx, uuidv7 } from '@kernhq/kernel'
-import { and, eq, inArray, sql } from 'drizzle-orm'
+import { and, eq, sql } from 'drizzle-orm'
 import type { LedgerKind } from '../../contract/index.js'
 import { leaveBalanceCursor, leaveLedger, leaveRequestDays, leaveTypes } from '../schema.js'
 
@@ -271,4 +271,3 @@ export class LedgerService {
 }
 
 export const yearOf = (isoDate: string): number => Number(isoDate.slice(0, 4))
-export { inArray }

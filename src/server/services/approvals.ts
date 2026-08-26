@@ -1,5 +1,5 @@
 import { KernError, type Kernel, type Tx, uuidv7 } from '@kernhq/kernel'
-import { and, arrayOverlaps, desc, eq, inArray, isNull, lte, or, sql } from 'drizzle-orm'
+import { and, arrayOverlaps, desc, eq, inArray, isNull, lte, sql } from 'drizzle-orm'
 import type { ApprovalChainSpec, ApprovalStepSpec, ApproverSubject } from '../../contract/index.js'
 import {
   approvalChains,
@@ -448,5 +448,3 @@ export class ApprovalService {
       .limit(limit)
   }
 }
-
-export { or }

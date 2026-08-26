@@ -3021,6 +3021,98 @@ describe("the jobs, in each office's own calendar", () => {
       expect(accrued[0]?.effectiveOn).toBe('2026-01-31')
       expect((await entries(sena, 2026)).filter((e) => e.kind === 'accrual')).toHaveLength(1)
     })
+
+    /**
+     * `per_hour_worked`, through the job rather than through the pure function.
+     *
+     * The frequency was implemented in `src/policy/accrual.ts` and fed by nobody: neither the cron
+     * nor `accrual.preview` passed `workedMinutes` or `scheduledMinutes`, so `grantForPeriod` took
+     * its "nothing scheduled" guard, returned zero, and the job's `if (result.minutes <= 0) continue`
+     * skipped every person without a word. Every test that reached the job used `monthly`, and the
+     * ones that covered this frequency called the pure function and hand-fed it the two arguments
+     * no caller supplied — which is how a setting comes to be accepted, saved, and ignored.
+     *
+     * The figures were in `attendance_days` the whole time.
+     */
+    it('accrues against the hours actually worked, where the policy says to', async () => {
+      const WORKED = ['2026-01-05', '2026-01-06', '2026-01-07', '2026-01-08']
+
+      /** Two people, one policy, the same scheduled month — differing only in what they worked. */
+      const hire = async (tx: Tx, displayName: string, daysWorked: number) => {
+        const [person] = await tx
+          .insert(people)
+          .values({ workspaceId: WS_JOBS, displayName, hiredOn: '2020-01-01', status: 'active' })
+          .returning()
+        await tx.insert(officeAssignments).values({
+          workspaceId: WS_JOBS,
+          personId: person!.id,
+          officeId: istanbul,
+          isPrimary: true,
+          effectiveFrom: '2020-01-01',
+        })
+        for (const [index, day] of WORKED.entries())
+          await tx.insert(attendanceDays).values({
+            workspaceId: WS_JOBS,
+            personId: person!.id,
+            businessDate: day,
+            scheduledMinutes: DAY,
+            workedMinutes: index < daysWorked ? DAY : 0,
+            status: index < daysWorked ? 'present' : 'absent',
+          })
+        const [policy] = await tx
+          .insert(policies)
+          .values({
+            workspaceId: WS_JOBS,
+            kind: 'accrual',
+            name: `Earned by the hour (${displayName})`,
+            config: {
+              frequency: 'per_hour_worked',
+              daysPerYear: 24,
+              minutesPerDay: DAY,
+              seniorityTiers: [],
+              waitingPeriodMonths: 0,
+              calendar: 'gregorian',
+              roundToMinutes: 0,
+              leaveTypeKey: 'annual',
+            },
+            effectiveFrom: '2020-01-01',
+          })
+          .returning()
+        // On the person, so it outranks the workspace-wide monthly policy the others use.
+        await tx.insert(policyAssignments).values({
+          workspaceId: WS_JOBS,
+          policyId: policy!.id,
+          subjectKind: 'person',
+          subjectId: person!.id,
+          effectiveFrom: '2020-01-01',
+          priority: PolicyService.priorityFor('person'),
+        })
+        return person!.id
+      }
+
+      const { full, half } = await run(async (tx) => ({
+        full: await hire(tx, 'Worked the whole week', 4),
+        half: await hire(tx, 'Worked half of it', 2),
+      }))
+
+      clockReads('2026-01-31T22:00:00Z')
+      await runJob('accrue-leave')
+
+      const credited = async (personId: string) =>
+        (await entries(personId, 2026)).filter((e) => e.kind === 'accrual')
+
+      const [fullEntry] = await credited(full)
+      const [halfEntry] = await credited(half)
+
+      // Before the job passed the hours, both of these were zero and the job skipped them silently.
+      expect(fullEntry?.amountMinutes ?? 0, 'the job credited the hourly worker at all').toBeGreaterThan(0)
+      expect(fullEntry?.effectiveOn).toBe('2026-01-31')
+
+      // The property, rather than a constant: half the scheduled hours earns half the accrual,
+      // whatever base the frequency prorates against. A hardcoded figure here would assert what the
+      // implementation happens to do rather than what `per_hour_worked` means.
+      expect(halfEntry?.amountMinutes).toBe(Math.round((fullEntry?.amountMinutes ?? 0) / 2))
+    })
   })
 
   describe('the deadline on carried leave', () => {

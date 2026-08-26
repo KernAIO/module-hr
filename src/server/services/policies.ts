@@ -1,5 +1,5 @@
 import { KernError, type Tx } from '@kernhq/kernel'
-import { and, asc, desc, eq, inArray, isNull, lte, or, sql } from 'drizzle-orm'
+import { and, desc, eq, isNull, lte, or, sql } from 'drizzle-orm'
 import {
   type PolicyKind,
   type PolicySubjectKind,
@@ -228,5 +228,3 @@ export function hashConfig(config: Record<string, unknown>): string {
   }
   return Math.abs(hash).toString(36)
 }
-
-export { asc, inArray }

@@ -1749,6 +1749,9 @@ export function createMockHrApi() {
             workedMinutes: n === 2 ? 0 : 480 + (n === 1 ? 45 : 0),
             breakMinutes: 60,
             overtimeMinutes: n === 1 ? 45 : 0,
+            // Null, not zero: the demo workspace has no overtime policy with an annual cap, and
+            // "no ceiling applied" is a different fact from "one applied and nothing exceeded it".
+            beyondCapMinutes: null,
             lateMinutes: 0,
             earlyLeaveMinutes: 0,
             status: n === 2 ? ('leave' as const) : ('present' as const),

@@ -89,6 +89,15 @@ export const AttendanceDay = z.object({
   workedMinutes: z.number().int(),
   breakMinutes: z.number().int(),
   overtimeMinutes: z.number().int(),
+  /**
+   * Overtime the policy's annual cap will not take — null where no cap was in force.
+   *
+   * Declared here or it does not exist: oRPC validates a procedure's output against this schema and
+   * zod strips what the schema does not name, so the column was written, stored, and then dropped
+   * on the way out. Null and zero mean different things and a compliance report has to tell them
+   * apart — null is "no ceiling applied to this day", zero is "one applied and nothing exceeded it".
+   */
+  beyondCapMinutes: z.number().int().nullable(),
   lateMinutes: z.number().int(),
   earlyLeaveMinutes: z.number().int(),
   status: AttendanceStatus,

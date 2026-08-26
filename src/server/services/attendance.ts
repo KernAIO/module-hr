@@ -638,5 +638,3 @@ export class AttendanceService {
 function hashSchedule(schedule: ResolvedSchedule): string {
   return `${schedule.scheduleId ?? 'none'}:${schedule.rounding.stepMinutes}:${schedule.rounding.direction}`
 }
-
-export { inArray, sql }

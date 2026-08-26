@@ -3894,6 +3894,42 @@ export function implement_(kernel: Kernel) {
       )
     const employmentBy = new Map(employmentRows.map((e) => [e.personId, e]))
 
+    /**
+     * Hours worked in the window, for the frequency that accrues against them.
+     *
+     * The preview has to answer with the same numbers the job will credit, so it reads the same
+     * inputs. `per_hour_worked` was fed by neither for as long as it existed, which made the
+     * preview quietly agree with a job that granted nothing. Only queried where a policy asks.
+     */
+    const hoursBy = new Map<string, { workedMinutes: number; scheduledMinutes: number }>()
+    if (
+      [...resolved.values()].some(
+        (p) => (p?.config as AccrualConfig | undefined)?.frequency === 'per_hour_worked',
+      )
+    ) {
+      const rows = await tx
+        .select({
+          personId: attendanceDays.personId,
+          worked: sql<string>`coalesce(sum(${attendanceDays.workedMinutes}), 0)`,
+          scheduled: sql<string>`coalesce(sum(${attendanceDays.scheduledMinutes}), 0)`,
+        })
+        .from(attendanceDays)
+        .where(
+          and(
+            eq(attendanceDays.workspaceId, workspaceId),
+            inArray(attendanceDays.personId, ids),
+            gte(attendanceDays.businessDate, from),
+            lte(attendanceDays.businessDate, to),
+          ),
+        )
+        .groupBy(attendanceDays.personId)
+      for (const r of rows)
+        hoursBy.set(r.personId, {
+          workedMinutes: Number(r.worked),
+          scheduledMinutes: Number(r.scheduled),
+        })
+    }
+
     const types = await tx
       .select()
       .from(leaveTypes)
@@ -3958,6 +3994,7 @@ export function implement_(kernel: Kernel) {
         hiredOn: person.hiredOn,
         terminatedOn: person.terminatedOn,
         fte: employment ? Number.parseFloat(employment.fte ?? '1') : 1,
+        ...hoursBy.get(person.id),
       })
 
       const alreadyAccrued = already.has(`${person.id}:${type.id}`)

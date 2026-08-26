@@ -169,6 +169,46 @@ export function hrJobs(): JobDef[] {
                 ).map((e) => `${e.personId}:${e.leaveTypeId}`),
               )
 
+              /**
+               * Hours worked in the period, for the one frequency that accrues against them.
+               *
+               * `per_hour_worked` was implemented in the pure layer and fed by nobody: the two
+               * callers passed neither figure, so `grantForPeriod` took its "nothing scheduled"
+               * guard and returned zero for every person, and the job's `minutes <= 0` skipped them
+               * without a word. The numbers were in `attendance_days` the whole time.
+               *
+               * Only queried where a policy actually asks for it — the other three frequencies
+               * accrue against the calendar, and a sum over a month of day sheets for everybody is
+               * not free.
+               */
+              const worksAgainstHours = [...resolved.values()].some(
+                (p) => (p?.config as Record<string, unknown> | undefined)?.frequency === 'per_hour_worked',
+              )
+              const hoursBy = new Map<string, { workedMinutes: number; scheduledMinutes: number }>()
+              if (worksAgainstHours) {
+                const rows = await tx
+                  .select({
+                    personId: attendanceDays.personId,
+                    worked: sql<string>`coalesce(sum(${attendanceDays.workedMinutes}), 0)`,
+                    scheduled: sql<string>`coalesce(sum(${attendanceDays.scheduledMinutes}), 0)`,
+                  })
+                  .from(attendanceDays)
+                  .where(
+                    and(
+                      eq(attendanceDays.workspaceId, workspaceId),
+                      inArray(attendanceDays.personId, ids),
+                      gte(attendanceDays.businessDate, from),
+                      lte(attendanceDays.businessDate, to),
+                    ),
+                  )
+                  .groupBy(attendanceDays.personId)
+                for (const r of rows)
+                  hoursBy.set(r.personId, {
+                    workedMinutes: Number(r.worked),
+                    scheduledMinutes: Number(r.scheduled),
+                  })
+              }
+
               let credited = 0
               for (const person of staff) {
                 if (!mine.has(person.id)) continue
@@ -192,6 +232,7 @@ export function hrJobs(): JobDef[] {
                   hiredOn: person.hiredOn,
                   terminatedOn: person.terminatedOn,
                   fte: employment ? Number.parseFloat(employment.fte ?? '1') : 1,
+                  ...hoursBy.get(person.id),
                 })
                 if (result.minutes <= 0) continue
 
