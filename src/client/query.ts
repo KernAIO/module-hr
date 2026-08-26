@@ -38,6 +38,18 @@ export const hrKeys = {
   approvalInbox: (ws: string, includeDecided = false) =>
     ['hr', 'approvals', ws, includeDecided ? 'decided' : 'waiting'] as const,
   delegations: (ws: string) => ['hr', 'delegations', ws] as const,
+  calendar: (ws: string, id: string) => ['hr', 'calendar', ws, id] as const,
+  calendarWorkingDays: (ws: string, calendarId: string, from: string, to: string) =>
+    ['hr', 'calendar-working-days', ws, calendarId, from, to] as const,
+  /**
+   * The pack diff is keyed by the pack and the year as well as the calendar: an admin comparing two
+   * years must not be shown the first one's answer while the second is still in flight.
+   */
+  calendarPackPreview: (ws: string, calendarId: string, packKey: string, year: number) =>
+    ['hr', 'calendar-pack-preview', ws, calendarId, packKey, year] as const,
+  entities: (ws: string) => ['hr', 'entities', ws] as const,
+  officePeople: (ws: string, officeId: string, primaryOnly: boolean) =>
+    ['hr', 'office-people', ws, officeId, primaryOnly ? 'primary' : 'all'] as const,
 } as const
 
 /** `YYYY-MM-DD` for a date, in the viewer's own zone rather than UTC. */

@@ -224,13 +224,27 @@ export const hrClientModule = defineClientModule({
    */
   settingsPages: [
     {
+      id: 'general',
+      get label() {
+        return t('settings_general')
+      },
+      icon: 'sliders-vertical',
+      scope: 'workspace',
+      permission: 'core.modules.manage',
+      order: 1,
+      component: () => import('./settings/GeneralSettings.svelte'),
+    },
+    {
       id: 'capabilities',
       get label() {
         return t('settings_capabilities')
       },
       icon: 'toggle-left',
       scope: 'workspace',
-      permission: 'core.workspace.manage',
+      // `core.modules.manage`, not `core.workspace.manage`: core gates `modules.updateSettings` on
+      // the former, and this page's every control is a write to it. Offering the page on the wider
+      // permission showed the whole switchboard to somebody the server then refused on each switch.
+      permission: 'core.modules.manage',
       order: 5,
       component: () => import('./settings/CapabilitiesSettings.svelte'),
     },
