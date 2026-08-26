@@ -70,30 +70,50 @@ afterAll(async () => {
   await admin?.end().catch(() => undefined)
 }, 60_000)
 
+/**
+ * Every case here applies the whole folder, which takes several seconds — most of it building the
+ * punch partitions — so each carries its own timeout. Vitest's default is five, and a suite that
+ * fails on the clock rather than on the schema says nothing about the schema.
+ */
+const APPLY_TIMEOUT = 120_000
+
 describe('the migrations', () => {
-  it('apply to a schema created from nothing', async () => {
-    expect(
-      await applyAll(),
-      'a migration that has only ever run against your dev database has not been tested',
-    ).toEqual([])
-  })
+  it(
+    'apply to a schema created from nothing',
+    async () => {
+      expect(
+        await applyAll(),
+        'a migration that has only ever run against your dev database has not been tested',
+      ).toEqual([])
+    },
+    APPLY_TIMEOUT,
+  )
 
-  it('apply again without throwing, so a replay is a no-op and not a boot failure', async () => {
-    expect(
-      await applyAll(),
-      'a module migration that throws takes down every module in the host service, not only its own',
-    ).toEqual([])
-  })
+  it(
+    'apply again without throwing, so a replay is a no-op and not a boot failure',
+    async () => {
+      expect(
+        await applyAll(),
+        'a module migration that throws takes down every module in the host service, not only its own',
+      ).toEqual([])
+    },
+    APPLY_TIMEOUT,
+  )
 
-  it('leaves each policy defined once, not once per replay', async () => {
-    await applyAll()
-    const { rows } = await client.query<{ tablename: string; policyname: string; n: string }>(
-      `select tablename, policyname, count(*)::text as n from pg_policies
+  it(
+    'leaves each policy defined once, not once per replay',
+    async () => {
+      await applyAll()
+      const { rows } = await client.query<{ tablename: string; policyname: string; n: string }>(
+        `select tablename, policyname, count(*)::text as n from pg_policies
        where schemaname = 'mod_hr' group by tablename, policyname order by tablename`,
-    )
-    for (const row of rows)
-      expect(Number(row.n), `${row.tablename}.${row.policyname} exists ${row.n} times`).toBe(1)
-  })
+      )
+      expect(rows.length, 'no policy exists at all, so this assertion proves nothing').toBeGreaterThan(0)
+      for (const row of rows)
+        expect(Number(row.n), `${row.tablename}.${row.policyname} exists ${row.n} times`).toBe(1)
+    },
+    APPLY_TIMEOUT,
+  )
 
   it('forces row-level security on every table it wrote a policy for', async () => {
     const { rows } = await client.query<{ relname: string; forced: boolean; enabled: boolean }>(
