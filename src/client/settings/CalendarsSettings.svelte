@@ -183,8 +183,17 @@ const stats = $derived({
 })
 
 /** Where the pack days would come from: this calendar's own, its base's, or the country code. */
+/**
+ * The pack this calendar would update from.
+ *
+ * Upper-cased, because `COUNTRY_PACKS` is keyed by the ISO code as ISO writes it — `TR`, not `tr`.
+ * Lower-casing it here meant a calendar with a country and no pack key of its own proposed a key
+ * nobody publishes, and the server answered that with a diff reading "remove every holiday". The
+ * server refuses an unknown key now, so the worst case is a readable error rather than an empty
+ * year; this keeps the common case from producing one at all.
+ */
 const packKey = $derived(
-  selected?.packKey ?? baseQuery.data?.packKey ?? (selected?.country ?? '').toLowerCase(),
+  selected?.packKey ?? baseQuery.data?.packKey ?? (selected?.country ?? '').toUpperCase(),
 )
 
 const baseLine = $derived(

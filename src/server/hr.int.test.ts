@@ -5,7 +5,10 @@ import { and, eq } from 'drizzle-orm'
 import pg from 'pg'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { carryForward } from '../policy/accrual.js'
+import { weekdayOf } from '../policy/calendar.js'
+import { zonedToInstant } from '../policy/time.js'
 import { hrModule } from './index.js'
+import { hrJobs } from './jobs.js'
 import {
   approvalDecisions,
   approvalRequests,
@@ -28,10 +31,13 @@ import {
   policies,
   policyAssignments,
   punches,
+  scheduleAssignments,
+  schedules,
   TENANT_TABLES,
 } from './schema.js'
 import { ApprovalService } from './services/approvals.js'
-import { AttendanceService, NO_SCHEDULE } from './services/attendance.js'
+import { AttendanceService, NO_SCHEDULE, type ResolvedSchedule } from './services/attendance.js'
+import { todayIn } from './services/db.js'
 import { LedgerService } from './services/ledger.js'
 import { PeopleService } from './services/people.js'
 import { hashConfig, PolicyService } from './services/policies.js'
@@ -61,6 +67,9 @@ const WS_B = randomUUID()
 const ALICE = randomUUID()
 
 const principal = (userId: string, workspaceId: string): Principal =>
+  // `unknown` first: `userId` is branded on Principal and a plain string does not overlap it, which
+  // is a real difference the test does not need to model. Since tsconfig.test.json started
+  // type-checking this file, the cast has to say so rather than pretend the shapes match.
   ({
     kind: 'user',
     userId,
@@ -71,7 +80,7 @@ const principal = (userId: string, workspaceId: string): Principal =>
     service: null,
     memberships: [{ workspaceId, role: 'admin', roleIds: [], groupIds: [], status: 'active' }],
     permissionVersion: 0,
-  }) as Principal
+  }) as unknown as Principal
 
 const inWs =
   (workspaceId: string) =>
@@ -1245,6 +1254,786 @@ describe('periods', () => {
 })
 
 /**
+ * A closed month, and the two mechanisms that have to agree about who it closes.
+ *
+ * `PolicyService.isLocked` reads the period and has always scoped to its legal entity;
+ * `attendance_days.locked` is a cache of the same answer, and the lock that stamped it filtered on
+ * the date range alone. So closing the Turkish entity's month froze the Dutch and Iranian ones
+ * too — and neither mechanism looked wrong from where it was read, which is what made it survive.
+ */
+describe('locking one legal entity’s period', () => {
+  const attendanceSvc = new AttendanceService()
+  const policySvc = new PolicyService(new ResolveService())
+  const TURKISH = randomUUID()
+  const DUTCH = randomUUID()
+  const MAY = { legalEntityId: TURKISH, startsOn: '2026-05-01', endsOn: '2026-05-31' }
+  let ayse: string
+  let jan: string
+
+  beforeAll(async () => {
+    ayse = randomUUID()
+    jan = randomUUID()
+    await run(async (tx) => {
+      await tx.insert(people).values([
+        { id: ayse, workspaceId: WS_A, displayName: 'Ayşe' },
+        { id: jan, workspaceId: WS_A, displayName: 'Jan' },
+      ])
+      // The entity somebody is in is the employment's, never a column on `people`.
+      await tx.insert(employments).values([
+        { workspaceId: WS_A, personId: ayse, effectiveFrom: '2020-01-01', legalEntityId: TURKISH },
+        { workspaceId: WS_A, personId: jan, effectiveFrom: '2020-01-01', legalEntityId: DUTCH },
+      ])
+      await tx.insert(attendanceDays).values([
+        {
+          workspaceId: WS_A,
+          personId: ayse,
+          businessDate: '2026-05-11',
+          status: 'present',
+          workedMinutes: 480,
+        },
+        {
+          workspaceId: WS_A,
+          personId: jan,
+          businessDate: '2026-05-11',
+          status: 'present',
+          workedMinutes: 480,
+        },
+      ])
+      await tx.insert(periods).values({
+        workspaceId: WS_A,
+        kind: 'payroll',
+        legalEntityId: TURKISH,
+        startsOn: MAY.startsOn,
+        endsOn: MAY.endsOn,
+        status: 'locked',
+        lockedAt: new Date(),
+      })
+    })
+  }, 60_000)
+
+  const mayDays = () =>
+    run((tx) =>
+      tx
+        .select()
+        .from(attendanceDays)
+        .where(and(eq(attendanceDays.workspaceId, WS_A), eq(attendanceDays.businessDate, '2026-05-11'))),
+    )
+
+  it('stamps that entity’s days and leaves the other entity’s open', async () => {
+    expect(await run((tx) => attendanceSvc.setPeriodLock(tx, WS_A, MAY, true))).toBe(1)
+    const days = await mayDays()
+    expect(days.find((d) => d.personId === ayse)?.locked).toBe(true)
+    expect(days.find((d) => d.personId === jan)?.locked).toBe(false)
+  })
+
+  it('says the same thing as isLocked, which is the point', async () => {
+    expect(await run((tx) => policySvc.isLocked(tx, WS_A, '2026-05-11', TURKISH))).toBe(true)
+    expect(await run((tx) => policySvc.isLocked(tx, WS_A, '2026-05-11', DUTCH))).toBe(false)
+  })
+
+  it('lets go of exactly the days it took, when the month is reopened', async () => {
+    // Reopening writes the period's own status first and stamps the days afterwards, which is the
+    // order the handler uses — and it matters, because releasing a day now asks whether any period
+    // still closes it, and this one would still answer for itself.
+    await run((tx) =>
+      tx
+        .update(periods)
+        .set({ status: 'open', lockedAt: null })
+        .where(and(eq(periods.workspaceId, WS_A), eq(periods.legalEntityId, TURKISH))),
+    )
+    expect(await run((tx) => attendanceSvc.setPeriodLock(tx, WS_A, MAY, false))).toBe(1)
+    const days = await mayDays()
+    expect(days.every((d) => !d.locked)).toBe(true)
+  })
+})
+
+/**
+ * The person who transferred, and the three dates the entity question used to be asked as of.
+ *
+ * Which legal entity somebody is in is a question about a *day*: March is filed under the entity
+ * they were employed by in March, whatever their badge says today. Three places asked it as of
+ * something else, and each of them wrote into a month that had already been filed:
+ *
+ * - `recomputeDay` was handed the entity `clockContext` resolved as of **today**, then applied it
+ *   to arbitrary past business dates — so a March day came back "not locked" and was rewritten.
+ * - `setPeriodLock` resolved every candidate once at the period's **last day**, so somebody who
+ *   transferred *into* the filed entity mid-month had the half they spent elsewhere stamped too.
+ * - `attendance_days.locked` was believed whenever it said `true`, before the period was consulted
+ *   at all — so a day stamped by either of the above stayed frozen with nothing behind it.
+ */
+describe('a person who transfers between legal entities', () => {
+  const attendanceSvc = new AttendanceService()
+  const policySvc = new PolicyService(new ResolveService())
+  const resolveSvc = new ResolveService()
+  const IST = 'Europe/Istanbul'
+
+  const LEFT = randomUUID()
+  const JOINED = randomUUID()
+  const MARCH = { legalEntityId: LEFT, startsOn: '2026-03-01', endsOn: '2026-03-31' }
+  let emre: string
+
+  const daysFor = (personId: string, date: string) =>
+    run((tx) =>
+      tx
+        .select()
+        .from(attendanceDays)
+        .where(
+          and(
+            eq(attendanceDays.workspaceId, WS_A),
+            eq(attendanceDays.personId, personId),
+            eq(attendanceDays.businessDate, date),
+          ),
+        ),
+    )
+
+  beforeAll(async () => {
+    emre = randomUUID()
+    await run(async (tx) => {
+      await tx.insert(people).values({ id: emre, workspaceId: WS_A, displayName: 'Emre' })
+      await tx.insert(employments).values([
+        {
+          workspaceId: WS_A,
+          personId: emre,
+          effectiveFrom: '2020-01-01',
+          effectiveTo: '2026-03-31',
+          legalEntityId: LEFT,
+        },
+        { workspaceId: WS_A, personId: emre, effectiveFrom: '2026-04-01', legalEntityId: JOINED },
+      ])
+      await tx.insert(periods).values({
+        workspaceId: WS_A,
+        kind: 'payroll',
+        legalEntityId: LEFT,
+        startsOn: MARCH.startsOn,
+        endsOn: MARCH.endsOn,
+        status: 'locked',
+        lockedAt: new Date(),
+      })
+      await attendanceSvc.record(
+        tx,
+        WS_A,
+        {
+          personId: emre,
+          direction: 'in',
+          timezone: IST,
+          method: 'manual',
+          claimedAt: new Date(zonedToInstant('2026-03-20', '09:00', IST)),
+        },
+        NO_SCHEDULE,
+      )
+    })
+  }, 60_000)
+
+  it('is in one entity on the filed day and another one today', async () => {
+    expect(await run((tx) => resolveSvc.forPerson(tx, WS_A, emre, '2026-03-20'))).toMatchObject({
+      legalEntityId: LEFT,
+    })
+    expect(await run((tx) => resolveSvc.forPerson(tx, WS_A, emre))).toMatchObject({
+      legalEntityId: JOINED,
+    })
+    // Which is why the as-of date decides the answer: March is closed under the entity they left
+    // and open under the one they are in now.
+    expect(await run((tx) => policySvc.isLocked(tx, WS_A, '2026-03-20', LEFT))).toBe(true)
+    expect(await run((tx) => policySvc.isLocked(tx, WS_A, '2026-03-20', JOINED))).toBe(false)
+  })
+
+  it('cannot be recomputed into the month their old entity has already filed', async () => {
+    const r = await run((tx) => attendanceSvc.recomputeDay(tx, WS_A, emre, '2026-03-20', IST, NO_SCHEDULE))
+    expect(r.locked).toBe(true)
+    // No row at all: an absent sheet reads as "nothing was filed for this day", where a fresh one
+    // reads as a figure somebody can act on — and this one would be inside a closed month.
+    expect(await daysFor(emre, '2026-03-20')).toHaveLength(0)
+  })
+})
+
+/**
+ * Locking one entity's month, for somebody who spent half of it in another.
+ *
+ * The period names an entity, so it closes that entity's days — and a day belongs to whichever
+ * entity employed the person *on that day*. Resolving every candidate once, at the period's last
+ * day, stamps the half of the month they spent elsewhere as well.
+ */
+describe('locking a month somebody transferred into', () => {
+  const attendanceSvc = new AttendanceService()
+  const policySvc = new PolicyService(new ResolveService())
+  const IST = 'Europe/Istanbul'
+
+  const BEFORE = randomUUID()
+  const AFTER = randomUUID()
+  const APRIL = { legalEntityId: AFTER, startsOn: '2026-04-01', endsOn: '2026-04-30' }
+  let pieter: string
+
+  const aprilDays = () =>
+    run((tx) =>
+      tx
+        .select()
+        .from(attendanceDays)
+        .where(and(eq(attendanceDays.workspaceId, WS_A), eq(attendanceDays.personId, pieter))),
+    )
+
+  beforeAll(async () => {
+    pieter = randomUUID()
+    await run(async (tx) => {
+      await tx.insert(people).values({ id: pieter, workspaceId: WS_A, displayName: 'Pieter' })
+      await tx.insert(employments).values([
+        {
+          workspaceId: WS_A,
+          personId: pieter,
+          effectiveFrom: '2020-01-01',
+          effectiveTo: '2026-04-15',
+          legalEntityId: BEFORE,
+        },
+        { workspaceId: WS_A, personId: pieter, effectiveFrom: '2026-04-16', legalEntityId: AFTER },
+      ])
+      await tx.insert(attendanceDays).values([
+        {
+          workspaceId: WS_A,
+          personId: pieter,
+          businessDate: '2026-04-10',
+          status: 'present',
+          workedMinutes: 480,
+        },
+        {
+          workspaceId: WS_A,
+          personId: pieter,
+          businessDate: '2026-04-20',
+          status: 'present',
+          workedMinutes: 480,
+        },
+      ])
+      await tx.insert(periods).values({
+        workspaceId: WS_A,
+        kind: 'payroll',
+        legalEntityId: AFTER,
+        startsOn: APRIL.startsOn,
+        endsOn: APRIL.endsOn,
+        status: 'locked',
+        lockedAt: new Date(),
+      })
+    })
+  }, 60_000)
+
+  it('stamps the days spent inside the entity and not the ones before the transfer', async () => {
+    expect(await run((tx) => attendanceSvc.setPeriodLock(tx, WS_A, APRIL, true))).toBe(1)
+    const days = await aprilDays()
+    expect(days.find((d) => d.businessDate === '2026-04-20')?.locked).toBe(true)
+    expect(days.find((d) => d.businessDate === '2026-04-10')?.locked).toBe(false)
+  })
+
+  it('says the same thing as isLocked on both halves of the month', async () => {
+    expect(await run((tx) => policySvc.isLocked(tx, WS_A, '2026-04-10', BEFORE))).toBe(false)
+    expect(await run((tx) => policySvc.isLocked(tx, WS_A, '2026-04-20', AFTER))).toBe(true)
+  })
+
+  it('goes on recomputing the half nothing has filed', async () => {
+    const r = await run((tx) => attendanceSvc.recomputeDay(tx, WS_A, pieter, '2026-04-10', IST, NO_SCHEDULE))
+    expect(r.locked).toBe(false)
+  })
+})
+
+/**
+ * The flag that could only ever be repaired upwards.
+ *
+ * `attendance_days.locked` is a cache of a question the period answers. It was believed outright
+ * whenever it said `true` — before `isLocked` was consulted — so a row stamped by mistake refused
+ * recomputation for ever, with no locked period behind it. Every route into that state is now
+ * closed, and it is repaired downwards as well, because a cache that is only ever repaired in one
+ * direction is a trapdoor rather than a cache.
+ */
+describe('a day flagged locked with no period behind it', () => {
+  const attendanceSvc = new AttendanceService()
+  const policySvc = new PolicyService(new ResolveService())
+  const IST = 'Europe/Istanbul'
+  let lale: string
+
+  beforeAll(async () => {
+    lale = randomUUID()
+    await run(async (tx) => {
+      await tx.insert(people).values({ id: lale, workspaceId: WS_A, displayName: 'Lale' })
+      for (const [wall, direction] of [
+        ['09:00', 'in'],
+        ['15:00', 'out'],
+      ] as const)
+        await attendanceSvc.record(
+          tx,
+          WS_A,
+          {
+            personId: lale,
+            direction,
+            timezone: IST,
+            method: 'manual',
+            claimedAt: new Date(zonedToInstant('2026-06-05', wall, IST)),
+          },
+          NO_SCHEDULE,
+        )
+      await tx.insert(attendanceDays).values({
+        workspaceId: WS_A,
+        personId: lale,
+        businessDate: '2026-06-05',
+        status: 'present',
+        workedMinutes: 480,
+        locked: true,
+      })
+    })
+  }, 60_000)
+
+  it('is not inside any locked period, whatever the flag says', async () => {
+    expect(await run((tx) => policySvc.isLocked(tx, WS_A, '2026-06-05', null))).toBe(false)
+  })
+
+  it('is recomputed, and the flag repaired down to what the period says', async () => {
+    const r = await run((tx) => attendanceSvc.recomputeDay(tx, WS_A, lale, '2026-06-05', IST, NO_SCHEDULE))
+    expect(r.locked).toBe(false)
+
+    const [day] = await run((tx) =>
+      tx
+        .select()
+        .from(attendanceDays)
+        .where(and(eq(attendanceDays.workspaceId, WS_A), eq(attendanceDays.personId, lale))),
+    )
+    expect(day?.locked).toBe(false)
+    // Rebuilt from the punches — six hours, not the 480 the frozen row was carrying.
+    expect(day?.workedMinutes).toBe(360)
+  })
+})
+
+/**
+ * Reopening one period when another still covers the same days.
+ *
+ * The exclusion constraint keys on `coalesce(legal_entity_id, …)`, so a workspace-wide period and
+ * an entity's period may cover exactly the same dates on purpose. Releasing the days a period took
+ * therefore has to ask whether anything still closes them, or reopening the narrower one unlocks a
+ * month the wider one has filed — and reports the number of days it freed.
+ */
+describe('reopening one of two periods covering a day', () => {
+  const attendanceSvc = new AttendanceService()
+  const ENTITY = randomUUID()
+  const OCTOBER = { legalEntityId: ENTITY, startsOn: '2026-10-01', endsOn: '2026-10-31' }
+  const IST = 'Europe/Istanbul'
+  let okan: string
+
+  const octoberDay = () =>
+    run(async (tx) => {
+      const [day] = await tx
+        .select()
+        .from(attendanceDays)
+        .where(and(eq(attendanceDays.workspaceId, WS_A), eq(attendanceDays.personId, okan)))
+      return day
+    })
+
+  beforeAll(async () => {
+    okan = randomUUID()
+    await run(async (tx) => {
+      await tx.insert(people).values({ id: okan, workspaceId: WS_A, displayName: 'Okan' })
+      await tx.insert(employments).values({
+        workspaceId: WS_A,
+        personId: okan,
+        effectiveFrom: '2020-01-01',
+        legalEntityId: ENTITY,
+      })
+      await tx.insert(attendanceDays).values({
+        workspaceId: WS_A,
+        personId: okan,
+        businessDate: '2026-10-12',
+        status: 'present',
+        workedMinutes: 480,
+      })
+      await tx.insert(periods).values([
+        {
+          workspaceId: WS_A,
+          kind: 'payroll',
+          legalEntityId: ENTITY,
+          startsOn: OCTOBER.startsOn,
+          endsOn: OCTOBER.endsOn,
+          status: 'locked',
+          lockedAt: new Date(),
+        },
+        {
+          workspaceId: WS_A,
+          kind: 'payroll',
+          startsOn: OCTOBER.startsOn,
+          endsOn: OCTOBER.endsOn,
+          status: 'locked',
+          lockedAt: new Date(),
+        },
+      ])
+    })
+    expect(await run((tx) => attendanceSvc.setPeriodLock(tx, WS_A, OCTOBER, true))).toBe(1)
+  }, 60_000)
+
+  it('releases nothing, and says so', async () => {
+    // The handler writes the period's own status before stamping the days, so `isLocked` already
+    // reflects the reopening — what it still finds is the other period.
+    await run((tx) =>
+      tx
+        .update(periods)
+        .set({ status: 'open', lockedAt: null })
+        .where(and(eq(periods.workspaceId, WS_A), eq(periods.legalEntityId, ENTITY))),
+    )
+    expect(await run((tx) => attendanceSvc.setPeriodLock(tx, WS_A, OCTOBER, false))).toBe(0)
+    expect((await octoberDay())?.locked).toBe(true)
+  })
+
+  it('and the day is still refused a recomputation', async () => {
+    const r = await run((tx) => attendanceSvc.recomputeDay(tx, WS_A, okan, '2026-10-12', IST, NO_SCHEDULE))
+    expect(r.locked).toBe(true)
+    expect((await octoberDay())?.workedMinutes).toBe(480)
+  })
+})
+
+/**
+ * A punch on a date inside a month that has already been filed.
+ *
+ * The lock stamps the day rows that exist when it runs. A date with no row yet was invisible to it,
+ * so the punch path wrote a fresh one at the column's `false` default and the nightly reconciliation
+ * then rewrote it every night — a filed month moving underneath the payroll it was filed for.
+ *
+ * The punch itself is kept. It is a fact about somebody's day, and refusing to record it because
+ * payroll has closed loses the fact in order to protect the report. What must not move is the
+ * derived sheet, so no sheet is written for a closed day at all: an absent row reads as "nothing
+ * was filed for this day", which is true, where a frozen half-day would read as a figure.
+ */
+describe('a punch inside a closed month', () => {
+  const attendanceSvc = new AttendanceService()
+  let mert: string
+
+  beforeAll(async () => {
+    mert = randomUUID()
+    await run(async (tx) => {
+      await tx.insert(people).values({ id: mert, workspaceId: WS_A, displayName: 'Mert' })
+      await tx.insert(periods).values({
+        workspaceId: WS_A,
+        kind: 'payroll',
+        startsOn: '2026-07-01',
+        endsOn: '2026-07-31',
+        status: 'locked',
+        lockedAt: new Date(),
+      })
+    })
+  }, 60_000)
+
+  const daysFor = (date: string) =>
+    run((tx) =>
+      tx
+        .select()
+        .from(attendanceDays)
+        .where(
+          and(
+            eq(attendanceDays.workspaceId, WS_A),
+            eq(attendanceDays.personId, mert),
+            eq(attendanceDays.businessDate, date),
+          ),
+        ),
+    )
+
+  it('is recorded, and writes no sheet where the lock had nothing to stamp', async () => {
+    const punch = await run((tx) =>
+      attendanceSvc.record(
+        tx,
+        WS_A,
+        {
+          personId: mert,
+          direction: 'in',
+          timezone: 'Europe/Istanbul',
+          method: 'manual',
+          claimedAt: new Date(Date.UTC(2026, 6, 15, 6, 0)),
+        },
+        NO_SCHEDULE,
+      ),
+    )
+    expect(punch.businessDate).toBe('2026-07-15')
+
+    const result = await run((tx) =>
+      attendanceSvc.recomputeDay(tx, WS_A, mert, '2026-07-15', 'Europe/Istanbul', NO_SCHEDULE),
+    )
+    expect(result.locked).toBe(true)
+    expect(await daysFor('2026-07-15')).toHaveLength(0)
+  })
+
+  it('repairs a row that was written at the default after the lock ran', async () => {
+    await run((tx) =>
+      tx.insert(attendanceDays).values({
+        workspaceId: WS_A,
+        personId: mert,
+        businessDate: '2026-07-16',
+        status: 'present',
+        workedMinutes: 480,
+      }),
+    )
+    const result = await run((tx) =>
+      attendanceSvc.recomputeDay(tx, WS_A, mert, '2026-07-16', 'Europe/Istanbul', NO_SCHEDULE),
+    )
+    expect(result.locked).toBe(true)
+
+    const [day] = await daysFor('2026-07-16')
+    // The flag is repaired from the period; the figures are not touched by the repair.
+    expect(day?.locked).toBe(true)
+    expect(day?.workedMinutes).toBe(480)
+  })
+})
+
+/**
+ * The night shift, where the punch and the day sheet used to disagree.
+ *
+ * A 22:00–06:00 Monday-to-Friday shift is clocked out of at 06:00 on Saturday. The punch path read
+ * the shift off the punch's **UTC** date, so it asked the week for Saturday, got nothing — Saturday
+ * schedules no shift — and never consulted `crossesMidnight`. Friday's sheet lost eight hours and
+ * Saturday grew an orphan clock-out: the exact split `businessDateFor` exists to prevent.
+ */
+describe('a shift that runs from Friday night into Saturday', () => {
+  const attendanceSvc = new AttendanceService()
+  const NY = 'America/New_York'
+  const nights: ResolvedSchedule = {
+    scheduleId: null,
+    rounding: { stepMinutes: 0, direction: 'nearest' },
+    autoClockOutAfterMinutes: null,
+    shiftFor: (date) => {
+      const day = weekdayOf(date)
+      if (day === 'sat' || day === 'sun') return null
+      return { start: '22:00', end: '06:00', breakMinutes: 0, graceInMinutes: 5, graceOutMinutes: 5 }
+    },
+  }
+  let deniz: string
+
+  beforeAll(async () => {
+    deniz = randomUUID()
+    await run((tx) => tx.insert(people).values({ id: deniz, workspaceId: WS_A, displayName: 'Deniz' }))
+  }, 60_000)
+
+  const punchAt = (date: string, wall: string, direction: 'in' | 'out') =>
+    run((tx) =>
+      attendanceSvc.record(
+        tx,
+        WS_A,
+        {
+          personId: deniz,
+          direction,
+          timezone: NY,
+          method: 'manual',
+          claimedAt: new Date(zonedToInstant(date, wall, NY)),
+        },
+        nights,
+      ),
+    )
+
+  it('attributes both ends of the night to Friday', async () => {
+    expect((await punchAt('2026-06-19', '22:00', 'in')).businessDate).toBe('2026-06-19')
+    expect((await punchAt('2026-06-20', '06:00', 'out')).businessDate).toBe('2026-06-19')
+  })
+
+  it('leaves Friday’s sheet holding the whole eight hours', async () => {
+    await run((tx) => attendanceSvc.recomputeDay(tx, WS_A, deniz, '2026-06-19', NY, nights))
+    const [day] = await run((tx) =>
+      tx
+        .select()
+        .from(attendanceDays)
+        .where(and(eq(attendanceDays.workspaceId, WS_A), eq(attendanceDays.personId, deniz))),
+    )
+    expect(day?.businessDate).toBe('2026-06-19')
+    expect(day?.workedMinutes).toBe(480)
+    expect(day?.scheduledMinutes).toBe(480)
+    expect(day?.anomalies).toEqual([])
+  })
+})
+
+/**
+ * The morning shift the day after a night week — the case that made the night-shift fix expensive.
+ *
+ * A rotating week: 22:00–06:00 Monday to Friday, then 08:00–16:00 on Saturday. 08:00 falls inside
+ * the tail the night shift is allowed to reach into, so preferring the previous day unconditionally
+ * filed Saturday's clock-in on **Friday** while its 16:00 clock-out stayed on Saturday. Two ends of
+ * one shift on two sheets is the visible half; the invisible half is worse. `clockContext` makes the
+ * same attribution, so at 16:00 Saturday's punch list was empty, the widget said "not clocked in",
+ * and the guard threw `You are not clocked in.` — somebody on a morning shift after a night week
+ * could never clock out.
+ */
+describe('a morning shift the day after a night week', () => {
+  const attendanceSvc = new AttendanceService()
+  const NY = 'America/New_York'
+  const rotating: ResolvedSchedule = {
+    scheduleId: null,
+    rounding: { stepMinutes: 0, direction: 'nearest' },
+    autoClockOutAfterMinutes: null,
+    shiftFor: (date) => {
+      const day = weekdayOf(date)
+      if (day === 'sun') return null
+      return day === 'sat'
+        ? { start: '08:00', end: '16:00', breakMinutes: 0, graceInMinutes: 5, graceOutMinutes: 5 }
+        : { start: '22:00', end: '06:00', breakMinutes: 0, graceInMinutes: 5, graceOutMinutes: 5 }
+    },
+  }
+  let sena: string
+
+  beforeAll(async () => {
+    sena = randomUUID()
+    await run((tx) => tx.insert(people).values({ id: sena, workspaceId: WS_A, displayName: 'Sena' }))
+  }, 60_000)
+
+  const punchAt = (date: string, wall: string, direction: 'in' | 'out') =>
+    run((tx) =>
+      attendanceSvc.record(
+        tx,
+        WS_A,
+        {
+          personId: sena,
+          direction,
+          timezone: NY,
+          method: 'manual',
+          claimedAt: new Date(zonedToInstant(date, wall, NY)),
+        },
+        rotating,
+      ),
+    )
+
+  const punchesOn = (date: string) => run((tx) => attendanceSvc.punchesOn(tx, WS_A, sena, date))
+
+  it('files Friday night on Friday and Saturday morning on Saturday', async () => {
+    expect((await punchAt('2026-06-19', '22:00', 'in')).businessDate).toBe('2026-06-19')
+    expect((await punchAt('2026-06-20', '06:00', 'out')).businessDate).toBe('2026-06-19')
+    expect((await punchAt('2026-06-20', '08:00', 'in')).businessDate).toBe('2026-06-20')
+    expect((await punchAt('2026-06-20', '16:00', 'out')).businessDate).toBe('2026-06-20')
+  })
+
+  it('leaves the morning’s clock-in where the clock-out will look for it', async () => {
+    // This list is what the punch guard reads. With the clock-in filed on Friday it is empty at
+    // 16:00, the open state says "not clocked in", and the clock-out is refused outright.
+    expect((await punchesOn('2026-06-20')).map((p) => p.direction)).toEqual(['in', 'out'])
+    expect((await punchesOn('2026-06-19')).map((p) => p.direction)).toEqual(['in', 'out'])
+  })
+
+  it('gives each day its own eight hours instead of piling both on Friday', async () => {
+    for (const date of ['2026-06-19', '2026-06-20'])
+      await run((tx) => attendanceSvc.recomputeDay(tx, WS_A, sena, date, NY, rotating))
+
+    const days = await run((tx) =>
+      tx
+        .select()
+        .from(attendanceDays)
+        .where(and(eq(attendanceDays.workspaceId, WS_A), eq(attendanceDays.personId, sena))),
+    )
+    const friday = days.find((d) => d.businessDate === '2026-06-19')
+    const saturday = days.find((d) => d.businessDate === '2026-06-20')
+    expect(friday?.workedMinutes).toBe(480)
+    expect(friday?.scheduledMinutes).toBe(480)
+    expect(friday?.anomalies).toEqual([])
+    expect(saturday?.workedMinutes).toBe(480)
+    expect(saturday?.scheduledMinutes).toBe(480)
+    expect(saturday?.anomalies).toEqual([])
+    expect(saturday?.lateMinutes).toBe(0)
+  })
+})
+
+/**
+ * The hourly sweep that closes shifts nobody clocked out of.
+ *
+ * Worth running against a real database rather than reasoning about: "is this shift still open" used
+ * to be answered in TypeScript, one query per candidate row, and moving it into the statement is
+ * exactly the kind of rewrite that is right in the plan and wrong at the boundaries — two `in`
+ * punches with no `out` must produce **one** auto clock-out, not two.
+ */
+describe('the auto clock-out sweep', () => {
+  const today = todayIn('Europe/Istanbul')
+  const HOUR = 3_600_000
+  let forgot: string
+  let finished: string
+  let twice: string
+
+  const sweep = () => {
+    const job = hrJobs().find((j) => j.name === 'auto-clock-out')
+    if (!job) throw new Error('auto-clock-out job is gone')
+    return job.handler({}, { kernel, id: 'test', attempt: 1 })
+  }
+
+  const punchesOf = (personId: string) =>
+    run((tx) =>
+      tx
+        .select()
+        .from(punches)
+        .where(and(eq(punches.workspaceId, WS_A), eq(punches.personId, personId))),
+    )
+
+  beforeAll(async () => {
+    forgot = randomUUID()
+    finished = randomUUID()
+    twice = randomUUID()
+    await run(async (tx) => {
+      const [schedule] = await tx
+        .insert(schedules)
+        .values({ workspaceId: WS_A, name: 'Ten hours and out', autoClockOutAfterMinutes: 600 })
+        .returning()
+      for (const [personId, name] of [
+        [forgot, 'Forgot'],
+        [finished, 'Finished'],
+        [twice, 'Twice'],
+      ] as const) {
+        await tx.insert(people).values({ id: personId, workspaceId: WS_A, displayName: name })
+        await tx.insert(scheduleAssignments).values({
+          workspaceId: WS_A,
+          personId,
+          scheduleId: schedule!.id,
+          effectiveFrom: '2020-01-01',
+        })
+      }
+      const punch = (personId: string, direction: 'in' | 'out', hoursAgo: number) => ({
+        workspaceId: WS_A,
+        personId,
+        direction,
+        at: new Date(Date.now() - hoursAgo * HOUR),
+        businessDate: today,
+        timezone: 'Europe/Istanbul',
+      })
+      await tx
+        .insert(punches)
+        .values([
+          punch(forgot, 'in', 11),
+          punch(finished, 'in', 11),
+          punch(finished, 'out', 10),
+          punch(twice, 'in', 11),
+          punch(twice, 'in', 10.5),
+        ])
+    })
+  }, 60_000)
+
+  it('closes the shift nobody clocked out of, once', async () => {
+    await sweep()
+    const rows = await punchesOf(forgot)
+    const closed = rows.filter((r) => r.direction === 'out')
+    expect(closed).toHaveLength(1)
+    expect(closed[0]?.note).toBe('Closed automatically: no clock-out recorded')
+    // Ten hours after the punch that opened it, not ten hours after the sweep noticed.
+    expect(closed[0]?.at.getTime()).toBe(rows.find((r) => r.direction === 'in')!.at.getTime() + 600 * 60_000)
+  })
+
+  it('leaves a day that was already closed alone', async () => {
+    await sweep()
+    expect(await punchesOf(finished)).toHaveLength(2)
+  })
+
+  it('writes one clock-out for a day with two clock-ins, not one each', async () => {
+    const rows = await punchesOf(twice)
+    expect(rows.filter((r) => r.direction === 'out')).toHaveLength(1)
+  })
+
+  it('running again changes nothing', async () => {
+    await sweep()
+    expect((await punchesOf(forgot)).filter((r) => r.direction === 'out')).toHaveLength(1)
+  })
+
+  it('does not reach back past the lookback, which is the cost of pruning the partitions', async () => {
+    // The July punch two describes up is still open and always will be. `at >= cutoff - 3 days` is
+    // what turns this sweep from a full scan of every partition into a bitmap scan of one, and a
+    // shift left open for longer than that is a regularization, not a job's problem.
+    const july = await run((tx) =>
+      tx
+        .select()
+        .from(punches)
+        .where(and(eq(punches.workspaceId, WS_A), eq(punches.businessDate, '2026-07-15'))),
+    )
+    expect(july.filter((r) => r.direction === 'out')).toHaveLength(0)
+  })
+})
+
+/**
  * Accrual, end to end.
  *
  * The arithmetic is unit-tested against a table; this proves the right policy reaches the right
@@ -1252,6 +2041,7 @@ describe('periods', () => {
  * that running twice does not credit twice.
  */
 describe('accrual run', () => {
+  const MARCH_SNAP = { legalEntityId: null, startsOn: '2026-03-09', endsOn: '2026-03-11' }
   let bob: string
   let annualType: string
 
@@ -1339,25 +2129,31 @@ describe('accrual run', () => {
   })
 
   it('locking a period freezes the days inside it', async () => {
-    await run((tx) =>
-      tx.insert(attendanceDays).values({
+    await run(async (tx) => {
+      await tx.insert(attendanceDays).values({
         workspaceId: WS_A,
         personId: bob,
         businessDate: '2026-03-10',
         status: 'present',
         workedMinutes: 480,
-      }),
-    )
-    await run((tx) =>
-      tx
-        .update(attendanceDays)
-        .set({ locked: true })
-        .where(and(eq(attendanceDays.workspaceId, WS_A), eq(attendanceDays.businessDate, '2026-03-10'))),
-    )
+      })
+      // The period is what freezes the day; the column is a cache of its answer. Stamping the
+      // cache on its own would prove nothing any more — a flag with no period behind it is now
+      // repaired away rather than believed.
+      await tx.insert(periods).values({
+        workspaceId: WS_A,
+        kind: 'payroll',
+        startsOn: '2026-03-09',
+        endsOn: '2026-03-11',
+        status: 'locked',
+        lockedAt: new Date(),
+      })
+    })
+    const attendanceSvc = new AttendanceService()
+    expect(await run((tx) => attendanceSvc.setPeriodLock(tx, WS_A, MARCH_SNAP, true))).toBe(1)
 
     // A locked day is left alone and reported, never silently skipped — a recomputation that
     // quietly declines to touch a closed month looks identical to one that had nothing to do.
-    const attendanceSvc = new AttendanceService()
     const result = await run((tx) =>
       attendanceSvc.recomputeDay(tx, WS_A, bob, '2026-03-10', 'Europe/Istanbul', NO_SCHEDULE),
     )

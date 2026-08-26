@@ -22,8 +22,8 @@ import {
 } from '../contract/policies.js'
 import { accrueForPeriod } from '../policy/accrual.js'
 import { countWorkingDays, workingDays } from '../policy/calendar.js'
-import { businessDateFor } from '../policy/working-time.js'
-import { COUNTRY_PACKS, packDays } from './packs/index.js'
+import { attributeToShift } from '../policy/working-time.js'
+import { COUNTRY_PACKS, packDays, packFor } from './packs/index.js'
 import {
   approvalChains,
   approvalDecisions,
@@ -59,7 +59,7 @@ import {
 } from './schema.js'
 import { ApprovalService } from './services/approvals.js'
 import { AttendanceService } from './services/attendance.js'
-import { inForceOn, todayIn, todayIso } from './services/db.js'
+import { inForceOn, todayIso } from './services/db.js'
 import { LedgerService, MINUTES_PER_DAY, yearOf } from './services/ledger.js'
 import { PeopleService } from './services/people.js'
 import { hashConfig, PolicyService } from './services/policies.js'
@@ -86,8 +86,8 @@ export function implement_(kernel: Kernel) {
   const svc = new PeopleService(kernel)
   const ledger = new LedgerService()
   const approvals = new ApprovalService(kernel)
-  const attendance = new AttendanceService()
   const policySvc = new PolicyService(resolve)
+  const attendance = new AttendanceService(resolve, policySvc)
   const db = kernel.database
   const settingsOf = (workspaceId: string) => kernel.settings.module(workspaceId, MODULE_ID, HrSettings)
 
@@ -1846,20 +1846,13 @@ export function implement_(kernel: Kernel) {
               .returning()
 
             // The day sheet carries its own flag so a recomputation does not have to join periods
-            // on every row — this is what actually stops a closed month moving.
-            const locked = await tx
-              .update(attendanceDays)
-              .set({ locked: true })
-              .where(
-                and(
-                  eq(attendanceDays.workspaceId, input.workspaceId),
-                  gte(attendanceDays.businessDate, period.startsOn),
-                  lte(attendanceDays.businessDate, period.endsOn),
-                ),
-              )
-              .returning({ id: attendanceDays.id })
+            // on every row — this is what actually stops a closed month moving. It is stamped
+            // through `setPeriodLock`, which is also what keeps the flag scoped to the period's
+            // legal entity: filtering on the date range alone closed January for every entity in
+            // the workspace, while `isLocked` went on answering for one.
+            const lockedDays = await attendance.setPeriodLock(tx, input.workspaceId, period, true)
 
-            return { period: row!, lockedDays: locked.length }
+            return { period: row!, lockedDays }
           })
           await changed(input.workspaceId, 'period', input.periodId, 'updated')
           return { ...toPeriod(result.period), lockedDays: result.lockedDays }
@@ -1882,30 +1875,20 @@ export function implement_(kernel: Kernel) {
               .where(eq(periods.id, period.id))
               .returning()
 
-            const unlocked = await tx
-              .update(attendanceDays)
-              .set({ locked: false })
-              .where(
-                and(
-                  eq(attendanceDays.workspaceId, input.workspaceId),
-                  gte(attendanceDays.businessDate, period.startsOn),
-                  lte(attendanceDays.businessDate, period.endsOn),
-                ),
-              )
-              .returning({ id: attendanceDays.id })
+            const unlockedDays = await attendance.setPeriodLock(tx, input.workspaceId, period, false)
 
             kernel.log.warn(
               {
                 module: MODULE_ID,
                 workspaceId: input.workspaceId,
                 periodId: period.id,
-                days: unlocked.length,
+                days: unlockedDays,
                 actorId: context.principal.userId,
                 reason: input.reason,
               },
               'payroll period reopened',
             )
-            return { period: row!, unlockedDays: unlocked.length }
+            return { period: row!, unlockedDays }
           })
           await changed(input.workspaceId, 'period', input.periodId, 'updated')
           return { ...toPeriod(result.period), unlockedDays: result.unlockedDays }
@@ -3216,7 +3199,31 @@ export function implement_(kernel: Kernel) {
    * company's own holidays during a routine yearly refresh, silently, months before anyone notices.
    * Showing exactly which days survive is how an administrator can believe the operation.
    */
+  /**
+   * The days a pack would add, change and drop — and the days it must never touch.
+   *
+   * A pack key nobody publishes is refused rather than treated as a pack with no days in it.
+   * `packDays` answers `[]` for an unknown key, which made the diff for a typo "add nothing, change
+   * nothing, **remove every national holiday**" — with Apply live beside it, and `keptCustom` still
+   * promising the company's own days were safe, which was true and beside the point. The screen
+   * could reach that state on its own: `COUNTRY_PACKS` is keyed `TR`, the editor prefilled the
+   * calendar's country lowercased, and so a calendar made by hand offered to empty itself.
+   *
+   * This is the one operation in the module that deletes rows a customer did not ask it to, so it
+   * fails closed: an unknown key is a mistake, never an instruction.
+   */
+  function requirePack(packKey: string) {
+    // `packFor` states the rule and is tested beside the packs; this turns its refusal into the
+    // error shape a client can render.
+    try {
+      packFor(packKey)
+    } catch (error) {
+      throw KernError.badRequest((error as Error).message)
+    }
+  }
+
   async function diffPack(tx: Tx, workspaceId: string, calendarId: string, packKey: string, year: number) {
+    requirePack(packKey)
     const from = `${year}-01-01`
     const to = `${year}-12-31`
     const existing = await tx
@@ -3588,16 +3595,21 @@ export function implement_(kernel: Kernel) {
    *
    * The zone comes from the resolution ladder — their primary office unless they have an override —
    * so a punch made on a business trip still counts towards the month they are employed in.
+   *
+   * Everything here is resolved **as of today**, which is what a punch is about. It is therefore
+   * not the place to answer a question about a past date: this used to hand out today's legal
+   * entity as well, and three callers applied it to business dates months back — so a person who
+   * transferred entity had a filed month recomputed against the one they are in now. `recomputeDay`
+   * asks that question of the day it is rebuilding.
    */
   async function clockContext(tx: Tx, workspaceId: string, personId: string) {
     const today = todayIso()
     const resolution = await resolve.forPerson(tx, workspaceId, personId, today)
     const schedule = await attendance.scheduleFor(tx, workspaceId, personId, today)
-    const businessDate = businessDateFor(
-      Date.now(),
-      resolution.timezone,
-      schedule.shiftFor(todayIn(resolution.timezone)),
-    )
+    // Their zone decides the date, and a night shift's tail belongs to the day it started — the
+    // same attribution `attendance.record` makes, because a clock-out that reads the day one way
+    // while the punch reads it the other is refused as "you are not clocked in".
+    const { businessDate } = attributeToShift(Date.now(), resolution.timezone, (d) => schedule.shiftFor(d))
     return { timezone: resolution.timezone, businessDate, schedule, resolution }
   }
 
@@ -3657,6 +3669,9 @@ export function implement_(kernel: Kernel) {
         schedule,
       )
 
+      // A punch inside a closed month is still recorded — it is a fact about somebody's day, and
+      // refusing it because payroll has been filed loses the fact to protect the report. What must
+      // not move is the derived sheet, and `recomputeDay` is where that is decided.
       await attendance.recomputeDay(
         tx,
         input.workspaceId,

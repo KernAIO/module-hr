@@ -145,7 +145,7 @@ export const en: Record<string, Message> = {
   'hr.cal_pack_kept': 'Yours, untouched',
   'hr.cal_pack_kept_desc': 'Days added here are never touched by an update.',
   'hr.cal_pack_key': 'Pack',
-  'hr.cal_pack_key_hint': "The country's holiday pack, by its code: nl, de, tr.",
+  'hr.cal_pack_key_hint': "The country's holiday pack, by its ISO code: TR, DE, GB, US, NL, IR.",
   'hr.cal_pack_more': { one: 'and {count} more', other: 'and {count} more' },
   'hr.cal_pack_needs_country': 'Set a country on this calendar to take its public holidays from a pack.',
   'hr.cal_pack_preview_desc':
@@ -736,7 +736,7 @@ export const ar: Record<string, Message> = {
   'hr.cal_pack_kept': 'أيامكم، دون مساس',
   'hr.cal_pack_kept_desc': 'لا يمسّ التحديث أبدًا الأيام المضافة هنا.',
   'hr.cal_pack_key': 'الحزمة',
-  'hr.cal_pack_key_hint': 'حزمة عطل الدولة، برمزها: nl أو de أو tr.',
+  'hr.cal_pack_key_hint': 'حزمة عطل الدولة، برمزها الدولي: TR أو DE أو GB أو US أو NL أو IR.',
   'hr.cal_pack_more': {
     zero: 'ولا شيء غير ذلك',
     one: 'وواحد آخر',
@@ -1345,7 +1345,7 @@ export const de: Record<string, Message> = {
   'hr.cal_pack_kept': 'Ihre Tage, unberührt',
   'hr.cal_pack_kept_desc': 'Hier ergänzte Tage werden von einem Update nie angerührt.',
   'hr.cal_pack_key': 'Paket',
-  'hr.cal_pack_key_hint': 'Das Feiertagspaket des Landes, per Code: nl, de, tr.',
+  'hr.cal_pack_key_hint': 'Das Feiertagspaket des Landes, per ISO-Code: TR, DE, GB, US, NL, IR.',
   'hr.cal_pack_more': { one: 'und {count} weiterer', other: 'und {count} weitere' },
   'hr.cal_pack_needs_country':
     'Hinterlegen Sie ein Land für diesen Kalender, um die Feiertage aus einem Paket zu holen.',
@@ -1933,7 +1933,7 @@ export const fa: Record<string, Message> = {
   'hr.cal_pack_kept': 'روزهای خودتان، دست‌نخورده',
   'hr.cal_pack_kept_desc': 'به‌روزرسانی هرگز به روزهایی که اینجا افزوده‌اید دست نمی‌زند.',
   'hr.cal_pack_key': 'بسته',
-  'hr.cal_pack_key_hint': 'بستهٔ تعطیلات کشور، با کدش: nl، de، tr.',
+  'hr.cal_pack_key_hint': 'بستهٔ تعطیلات کشور، با کد ایزوی آن: TR، DE، GB، US، NL، IR.',
   'hr.cal_pack_more': { one: 'و {count} مورد دیگر', other: 'و {count} مورد دیگر' },
   'hr.cal_pack_needs_country': 'برای گرفتن تعطیلات رسمی از بسته، برای این تقویم کشوری تعیین کنید.',
   'hr.cal_pack_preview_desc':
@@ -2505,7 +2505,7 @@ export const tr: Record<string, Message> = {
   'hr.cal_pack_kept': 'Sizinkiler, dokunulmadan',
   'hr.cal_pack_kept_desc': 'Burada eklenen günlere güncelleme hiç dokunmaz.',
   'hr.cal_pack_key': 'Paket',
-  'hr.cal_pack_key_hint': 'Ülkenin tatil paketi, kodla: nl, de, tr.',
+  'hr.cal_pack_key_hint': 'Ülkenin tatil paketi, ISO koduyla: TR, DE, GB, US, NL, IR.',
   'hr.cal_pack_more': { one: 've {count} tane daha', other: 've {count} tane daha' },
   'hr.cal_pack_needs_country': 'Resmî tatilleri paketten almak için bu takvime bir ülke verin.',
   'hr.cal_pack_preview_desc': 'Yalnızca paketten gelen günler değişir. Burada eklenenler olduğu gibi kalır.',

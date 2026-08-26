@@ -165,6 +165,28 @@ export function packDays(
 }
 
 /** True when this pack cannot be complete for the year — the caller should say so before applying. */
+/**
+ * The pack for this key, or a refusal.
+ *
+ * `packDays` answers `[]` for a key nobody publishes, which reads as "a pack with no days in it"
+ * and is not what the caller means. The diff behind `calendars.pack.preview` took it that way, so a
+ * typed key produced "add nothing, change nothing, **remove every national holiday**" — with the
+ * apply button live beside it. The editor could reach it unaided: these keys are ISO codes as ISO
+ * writes them (`TR`), and the screen prefilled the calendar's country lower-cased.
+ *
+ * So anything that DELETES on the strength of a pack asks here first. `packDays` keeps its empty
+ * answer, because a pack that exists and publishes nothing for a given year is a real state and a
+ * different one.
+ */
+export function packFor(packKey: string): CountryPack {
+  const pack = COUNTRY_PACKS[packKey]
+  if (!pack)
+    throw new Error(
+      `No holiday pack is published for "${packKey}". Known packs: ${Object.keys(COUNTRY_PACKS).sort().join(', ')}.`,
+    )
+  return pack
+}
+
 export const packIsIncompleteFor = (packKey: string, year: number): boolean => {
   const pack = COUNTRY_PACKS[packKey]
   if (!pack) return false
