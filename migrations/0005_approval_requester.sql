@@ -16,5 +16,15 @@ alter table "mod_hr"."approval_requests"
 -- The inbox lists by approver and then names the requester, so the lookup is by request, not by
 -- requester — this index is for "everything Ayşe has asked for", which the person page reads.
 -- `requested_at` is the ORM's name for it; the column is `created_at`, from the shared helper.
+--
+-- `desc nulls last`, not bare `desc`. Postgres reads `desc` as DESC NULLS FIRST, while drizzle
+-- writes DESC NULLS LAST for `t.requestedAt.desc()` — so the database and the snapshot described
+-- the same index differently, permanently and invisibly, until check-snapshot-drift.mjs learned to
+-- compare sort order.
+--
+-- No corrective migration for instances that already ran this. `created_at` is NOT NULL, so the two
+-- orderings are indistinguishable: there is no row for the null ordering to place. Dropping and
+-- rebuilding the index would take an ACCESS EXCLUSIVE lock to change nothing anybody can observe.
+-- Every statement in this file is `if not exists`, so re-running it after this edit is a no-op.
 create index if not exists "hr_approval_requests_requester_idx"
-  on "mod_hr"."approval_requests" ("workspace_id", "requester_person_id", "created_at" desc);
+  on "mod_hr"."approval_requests" ("workspace_id", "requester_person_id", "created_at" desc nulls last);
