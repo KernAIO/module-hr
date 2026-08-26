@@ -1,5 +1,11 @@
 # @kernhq/module-hr
 
+## 0.10.2
+
+### Patch Changes
+
+- fix(hr): feed the two settings that were implemented and fed by nobody
+
 ## 0.10.1
 
 ### Patch Changes
