@@ -58,26 +58,7 @@ export {
   type Schedule,
   type WorkingWeek,
 } from '../contract/index.js'
-
-/**
- * The capability ids, so a client contribution gates on a constant rather than a retyped string.
- *
- * Named unqualified — `capability: HR_CAPABILITIES.offices` gives `'offices'`, not `'hr.offices'` —
- * because from inside a module there is only one namespace. The shell adds this module's id when it
- * builds the workspace's set, which is where several modules' capabilities meet.
- */
-export const HR_CAPABILITIES = {
-  core: 'core',
-  offices: 'offices',
-  legalEntities: 'legal_entities',
-  calendars: 'calendars',
-  documents: 'documents',
-  leave: 'leave',
-  leaveAccrual: 'leave_accrual',
-  approvals: 'approvals',
-  attendance: 'attendance',
-  overtime: 'overtime',
-} as const
 export { __setHrApi, getHrApi } from './api-instance.js'
+export { HR_CAPABILITIES, type HrCapabilityId } from './capabilities.js'
 export { type HrMessageKey, hrMessageBundles, t } from './i18n.js'
 export { hrClientModule, hrClientModule as default } from './module.js'

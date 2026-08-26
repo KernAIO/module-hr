@@ -28,7 +28,16 @@ export const hrKeys = {
   attendanceDays: (ws: string, personId: string | undefined, from: string, to: string) =>
     ['hr', 'attendance-days', ws, personId ?? 'me', from, to] as const,
   schedules: (ws: string) => ['hr', 'schedules', ws] as const,
-  approvalInbox: (ws: string) => ['hr', 'approvals', ws] as const,
+  /**
+   * `includeDecided` is part of the key, not a filter over one cached list.
+   *
+   * The two answers are different rows from the server — the waiting list is what a step is
+   * pending on, the decided one is history — so sharing a key would show one tab the other's
+   * contents for as long as the refetch takes.
+   */
+  approvalInbox: (ws: string, includeDecided = false) =>
+    ['hr', 'approvals', ws, includeDecided ? 'decided' : 'waiting'] as const,
+  delegations: (ws: string) => ['hr', 'delegations', ws] as const,
 } as const
 
 /** `YYYY-MM-DD` for a date, in the viewer's own zone rather than UTC. */

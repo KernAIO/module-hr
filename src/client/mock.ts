@@ -77,6 +77,59 @@ export function createMockHrApi() {
   let clockedInAt: number | null = null
   let onBreak = false
 
+  const delegations: Array<Record<string, unknown>> = []
+
+  const approvalRequests = [
+    {
+      id: '01920000-0000-7000-8000-00000000f001',
+      workspaceId: '',
+      subjectType: 'leave' as const,
+      subjectId: '01920000-0000-7000-8000-00000000c001',
+      summary: `5 day(s) from ${day(14)}`,
+      summaryParams: { days: 5, from: day(14), to: day(18) } as Record<string, string | number> | null,
+      status: 'pending' as string,
+      currentStep: 0,
+      requestedBy: null,
+      requesterPersonId: PEOPLE[1]!.id,
+      requesterName: PEOPLE[1]!.displayName,
+      requestedAt: iso(3600_000),
+      decidedAt: null as string | null,
+      steps: [] as Array<Record<string, unknown>>,
+    },
+    {
+      id: '01920000-0000-7000-8000-00000000f002',
+      subjectType: 'regularization' as const,
+      workspaceId: '',
+      subjectId: '01920000-0000-7000-8000-00000000c002',
+      summary: `Correction for ${day(-1)}`,
+      summaryParams: { date: day(-1) } as Record<string, string | number> | null,
+      status: 'pending' as string,
+      currentStep: 0,
+      requestedBy: null,
+      requesterPersonId: PEOPLE[2]!.id,
+      requesterName: PEOPLE[2]!.displayName,
+      requestedAt: iso(7200_000),
+      decidedAt: null as string | null,
+      steps: [{ stepIndex: 0 }, { stepIndex: 1 }] as Array<Record<string, unknown>>,
+    },
+    {
+      id: '01920000-0000-7000-8000-00000000f003',
+      workspaceId: '',
+      subjectType: 'leave' as const,
+      subjectId: '01920000-0000-7000-8000-00000000c003',
+      summary: `1 day(s) from ${day(-20)}`,
+      summaryParams: { days: 1, from: day(-20), to: day(-20) } as Record<string, string | number> | null,
+      status: 'approved' as string,
+      currentStep: 0,
+      requestedBy: null,
+      requesterPersonId: PEOPLE[0]!.id,
+      requesterName: PEOPLE[0]!.displayName,
+      requestedAt: iso(20 * 86_400_000),
+      decidedAt: iso(19 * 86_400_000) as string | null,
+      steps: [] as Array<Record<string, unknown>>,
+    },
+  ]
+
   const leaveRequests: Array<Record<string, unknown>> = [
     {
       id: '01920000-0000-7000-8000-00000000c001',
@@ -402,24 +455,88 @@ export function createMockHrApi() {
     },
 
     approvals: {
-      inbox: async ({ workspaceId }: { workspaceId: string }) => ({
-        items: [
-          {
-            id: '01920000-0000-7000-8000-00000000f001',
-            workspaceId,
-            subjectType: 'leave' as const,
-            subjectId: leaveRequests[0]!.id as string,
-            summary: `5 day(s) from ${day(14)}`,
-            status: 'pending' as const,
-            currentStep: 0,
-            requestedBy: null,
-            requestedAt: iso(3600_000),
-            decidedAt: null,
-            steps: [],
-          },
-        ],
+      /**
+       * Both tabs have something in them on purpose.
+       *
+       * A demo whose "Decided" tab is empty looks like a broken filter rather than an empty
+       * history, and the two-step request is what shows the step counter at all.
+       */
+      inbox: async ({
+        workspaceId,
+        includeDecided = false,
+      }: {
+        workspaceId: string
+        includeDecided?: boolean
+      }) => ({
+        items: approvalRequests
+          .filter((r) => (includeDecided ? r.status !== 'pending' : r.status === 'pending'))
+          .map((r) => ({ ...r, workspaceId })),
         nextCursor: null,
       }),
+
+      get: async ({ workspaceId, requestId }: { workspaceId: string; requestId: string }) => {
+        const found = approvalRequests.find((r) => r.id === requestId)
+        if (!found) throw new Error('Approval request not found')
+        return { ...found, workspaceId }
+      },
+
+      decide: async ({
+        workspaceId,
+        requestId,
+        decision,
+      }: {
+        workspaceId: string
+        requestId: string
+        decision: 'approve' | 'reject'
+      }) => {
+        const found = approvalRequests.find((r) => r.id === requestId)
+        if (!found) throw new Error('Approval request not found')
+        // A middle step advances rather than settling: the inbox has to be able to show that.
+        const last = found.currentStep >= Math.max(found.steps.length - 1, 0)
+        if (decision === 'reject' || last) found.status = decision === 'approve' ? 'approved' : 'rejected'
+        else found.currentStep += 1
+        found.decidedAt = found.status === 'pending' ? null : iso()
+        return { ...found, workspaceId }
+      },
+
+      delegations: async ({ workspaceId }: { workspaceId: string }) =>
+        delegations.map((d) => ({ ...d, workspaceId })),
+
+      delegate: async ({
+        workspaceId,
+        toPersonId,
+        startsOn,
+        endsOn,
+        subjectType = null,
+        reason = null,
+      }: {
+        workspaceId: string
+        toPersonId: string
+        startsOn: string
+        endsOn: string
+        subjectType?: string | null
+        reason?: string | null
+      }) => {
+        const created = {
+          id: crypto.randomUUID(),
+          workspaceId,
+          fromPersonId: PEOPLE[0]!.id,
+          toPersonId,
+          subjectType,
+          startsOn,
+          endsOn,
+          reason,
+          createdAt: iso(),
+        }
+        delegations.push(created)
+        return created
+      },
+
+      revokeDelegation: async ({ delegationId }: { delegationId: string }) => {
+        const at = delegations.findIndex((d) => d.id === delegationId)
+        if (at >= 0) delegations.splice(at, 1)
+        return { ok: true }
+      },
     },
   }
 

@@ -36,6 +36,13 @@
       "when": 1787675369496,
       "tag": "0004_policies",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1787761769496,
+      "tag": "0005_approval_requester",
+      "breakpoints": true
     }
   ]
 }

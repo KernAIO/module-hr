@@ -557,7 +557,27 @@ export const approvalRequests = schema.table(
     /** The seam: regularization, overtime and timesheets attach here without a schema change. */
     subjectType: text('subject_type').notNull(),
     subjectId: uuid('subject_id').notNull(),
+    /**
+     * The English one-liner the request was raised with.
+     *
+     * Kept for rows raised before `summaryParams` existed, and as the fallback when a subject type
+     * has no localised rendering. New code fills both and the client prefers the params.
+     */
     summary: text('summary').notNull().default(''),
+    /**
+     * The same sentence as data, so the inbox can be read in the reader's language.
+     *
+     * A server-composed string is English for a Persian approver whatever the shell's locale says,
+     * which is how an inbox ends up half-translated. The client renders `subjectType` + these.
+     */
+    summaryParams: jsonb('summary_params').$type<Record<string, string | number>>(),
+    /**
+     * Who is asking, as a person — not the user id in `requestedBy`.
+     *
+     * An inbox that cannot say whose leave this is cannot be acted on, and the two ids genuinely
+     * differ: an employee need not have a Kern account, and a request can be raised on their behalf.
+     */
+    requesterPersonId: uuid('requester_person_id'),
     /**
      * The chain as it was when the request was raised.
      *

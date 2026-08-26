@@ -1,6 +1,7 @@
 import { defineClientModule } from '@kernhq/ui'
+import { HR_PERMISSIONS } from '../contract/permissions.js'
+import { HR_CAPABILITIES } from './capabilities.js'
 import { hrMessageBundles, t } from './i18n.js'
-import { HR_CAPABILITIES, HR_PERMISSIONS } from './permissions.js'
 
 /**
  * HR as the shell sees it.

@@ -1,5 +1,6 @@
 import { session } from '@kernhq/ui'
-import { HR_CAPABILITIES, HR_PERMISSIONS } from './index.js'
+import { HR_PERMISSIONS } from '../contract/permissions.js'
+import { HR_CAPABILITIES } from './capabilities.js'
 
 /**
  * What this module lets somebody do, and what this workspace has switched on.

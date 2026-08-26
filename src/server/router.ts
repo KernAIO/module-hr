@@ -2278,6 +2278,7 @@ export function implement_(kernel: Kernel) {
                 subjectType: 'regularization',
                 subjectId: created!.id,
                 summary: `Correction for ${input.businessDate}`,
+                summaryParams: { date: input.businessDate },
                 requesterPersonId: personId,
                 requestedBy: context.principal.userId ?? null,
                 on: input.businessDate,
@@ -2553,6 +2554,7 @@ export function implement_(kernel: Kernel) {
                 subjectType: 'leave',
                 subjectId: request!.id,
                 summary: `${sim.workingDays} day(s) from ${input.startsOn}`,
+                summaryParams: { days: sim.workingDays, from: input.startsOn, to: input.endsOn },
                 requesterPersonId: personId,
                 requestedBy: context.principal.userId ?? null,
                 on: input.startsOn,
@@ -3532,6 +3534,13 @@ export function implement_(kernel: Kernel) {
   }
 
   /** An approval request with its steps and decisions, which is the only useful shape. */
+  /**
+   * One request, with its steps, its decisions and the requester's name.
+   *
+   * The name is resolved here rather than left to the client: an inbox is one call, and a client
+   * that has to fetch the directory to read it will show ids for the moment the directory is in
+   * flight — which is the moment somebody clicks approve.
+   */
   async function hydrateApproval(tx: Tx, row: typeof approvalRequests.$inferSelect) {
     const steps = await tx
       .select()
@@ -3542,10 +3551,19 @@ export function implement_(kernel: Kernel) {
     const decisions = stepIds.length
       ? await tx.select().from(approvalDecisions).where(inArray(approvalDecisions.stepId, stepIds))
       : []
+    const [requester] = row.requesterPersonId
+      ? await tx
+          .select({ displayName: people.displayName })
+          .from(people)
+          .where(and(eq(people.workspaceId, row.workspaceId), eq(people.id, row.requesterPersonId)))
+          .limit(1)
+      : []
+
     return {
       ...row,
       subjectType: row.subjectType as never,
       status: row.status as never,
+      requesterName: requester?.displayName ?? null,
       requestedAt: row.requestedAt.toISOString(),
       decidedAt: row.decidedAt?.toISOString() ?? null,
       steps: steps.map((s) => ({

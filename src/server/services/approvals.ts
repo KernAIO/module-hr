@@ -213,6 +213,8 @@ export class ApprovalService {
       subjectType: string
       subjectId: string
       summary: string
+      /** The same sentence as data, so the inbox reads in the approver's language, not ours. */
+      summaryParams?: Record<string, string | number>
       requesterPersonId: string
       requestedBy: string | null
       on?: string
@@ -243,6 +245,8 @@ export class ApprovalService {
         subjectType: input.subjectType,
         subjectId: input.subjectId,
         summary: input.summary,
+        summaryParams: input.summaryParams ?? null,
+        requesterPersonId: input.requesterPersonId,
         chain: spec as unknown as Record<string, unknown>,
         // A chain that resolves to nobody at all is auto-approved rather than left pending for
         // ever. A one-person company has no manager, and their leave still has to be bookable.

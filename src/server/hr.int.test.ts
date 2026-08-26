@@ -7,9 +7,13 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { carryForward } from '../policy/accrual.js'
 import { hrModule } from './index.js'
 import {
+  approvalDecisions,
+  approvalRequests,
+  approvalSteps,
   attendanceDays,
   calendarDays,
   calendars,
+  delegations,
   employments,
   leaveBalanceCursor,
   leaveLedger,
@@ -784,10 +788,164 @@ describe('leave', () => {
     )
     expect(raised.autoApproved).toBe(true)
   })
+
+  it('records who is asking, and the summary as data rather than as English', async () => {
+    const approvals = new ApprovalService(kernel)
+    const raised = await run((tx) =>
+      approvals.raise(tx, WS_A, {
+        subjectType: 'leave',
+        subjectId: FIXED_REQUEST_3,
+        summary: '2 day(s) from 2026-06-08',
+        summaryParams: { days: 2, from: '2026-06-08', to: '2026-06-09' },
+        requesterPersonId: alice,
+        requestedBy: null,
+        on: '2026-06-08',
+      }),
+    )
+
+    const [row] = await run((tx) =>
+      tx.select().from(approvalRequests).where(eq(approvalRequests.id, raised.request.id)),
+    )
+
+    // The inbox cannot name the requester from `requestedBy`: that is a *user* id, and an employee
+    // need not have an account at all. Without the person id it shows a request with no owner.
+    expect(row?.requesterPersonId).toBe(alice)
+
+    // And the sentence has to survive as data, or the inbox is English for every reader whatever
+    // locale the shell is in.
+    expect(row?.summaryParams).toEqual({ days: 2, from: '2026-06-08', to: '2026-06-09' })
+  })
+})
+
+/**
+ * Delegation, end to end through the engine rather than `mayActFor` alone.
+ *
+ * The unit-shaped pieces are simple; what has to be proven on the real tables is the chain — that a
+ * live delegation moves the request into the delegate's inbox, that a decision made through one
+ * records both names against the manager's step, and that a lapsed one confers nothing. A delegation
+ * feature that silently stopped applying would look exactly like this test's absence.
+ */
+describe('delegation', () => {
+  let requester: string
+  let manager: string
+  let deputy: string
+  let colleague: string
+
+  const dayOffset = (n: number) => new Date(Date.now() + n * 86_400_000).toISOString().slice(0, 10)
+
+  beforeAll(async () => {
+    const ids = await run(async (tx) => {
+      const [boss] = await tx.insert(people).values({ workspaceId: WS_A, displayName: 'Manager' }).returning()
+      const [person] = await tx
+        .insert(people)
+        .values({ workspaceId: WS_A, displayName: 'Requester' })
+        .returning()
+      const [dep] = await tx.insert(people).values({ workspaceId: WS_A, displayName: 'Deputy' }).returning()
+      const [col] = await tx
+        .insert(people)
+        .values({ workspaceId: WS_A, displayName: 'Colleague' })
+        .returning()
+      await tx.insert(employments).values({
+        workspaceId: WS_A,
+        personId: person!.id,
+        effectiveFrom: '2026-01-01',
+        managerPersonId: boss!.id,
+      })
+      return { requester: person!.id, manager: boss!.id, deputy: dep!.id, colleague: col!.id }
+    })
+    requester = ids.requester
+    manager = ids.manager
+    deputy = ids.deputy
+    colleague = ids.colleague
+  })
+
+  const raiseForRequester = (subjectId: string) =>
+    run((tx) =>
+      new ApprovalService(kernel).raise(tx, WS_A, {
+        subjectType: 'leave',
+        subjectId,
+        summary: 'test',
+        requesterPersonId: requester,
+        requestedBy: null,
+        on: '2026-06-08',
+      }),
+    )
+
+  /** A window relative to today, because "live" and "lapsed" are both claims about *now*. */
+  const delegateManagerTo = (to: string, from: number, until: number) =>
+    run((tx) =>
+      tx.insert(delegations).values({
+        workspaceId: WS_A,
+        fromPersonId: manager,
+        toPersonId: to,
+        startsOn: dayOffset(from),
+        endsOn: dayOffset(until),
+      }),
+    )
+
+  it('moves nothing until the delegation exists, then shows it in the inbox', async () => {
+    const approvals = new ApprovalService(kernel)
+    const raised = await raiseForRequester(FIXED_REQUEST_4)
+
+    // Before any delegation the request belongs to the manager alone — not to whoever happens to
+    // sit nearby.
+    const before = await run((tx) => approvals.inboxFor(tx, WS_A, deputy, false, 50))
+    expect(before.some((r) => r.id === raised.request.id)).toBe(false)
+
+    await delegateManagerTo(deputy, -1, 365)
+    const after = await run((tx) => approvals.inboxFor(tx, WS_A, deputy, false, 50))
+    expect(after.some((r) => r.id === raised.request.id)).toBe(true)
+  })
+
+  it('lets the delegate decide in the manager’s name and records both names', async () => {
+    const approvals = new ApprovalService(kernel)
+    const raised = await raiseForRequester(FIXED_REQUEST_5)
+
+    const outcome = await run((tx) =>
+      approvals.decide(tx, WS_A, raised.request.id, deputy, 'approve', null, manager),
+    )
+    expect(outcome.status).toBe('approved')
+
+    // Both names: the step was the manager's, the hands were the deputy's. An audit that can say
+    // only one of those is missing the only fact anybody asks for.
+    const [step] = await run((tx) =>
+      tx
+        .select()
+        .from(approvalSteps)
+        .where(and(eq(approvalSteps.requestId, raised.request.id), eq(approvalSteps.stepIndex, 0)))
+        .limit(1),
+    )
+    const [decision] = await run((tx) =>
+      tx.select().from(approvalDecisions).where(eq(approvalDecisions.stepId, step!.id)),
+    )
+    expect(decision?.approverId).toBe(manager)
+    expect(decision?.onBehalfOfId).toBe(deputy)
+  })
+
+  it('refuses somebody with no delegation, and one whose window has closed', async () => {
+    const approvals = new ApprovalService(kernel)
+    const raised = await raiseForRequester(FIXED_REQUEST_6)
+
+    // A bystander fails earlier still — they are not an approver on the step at all.
+    await expect(
+      run((tx) => approvals.decide(tx, WS_A, raised.request.id, colleague, 'approve', null, manager)),
+    ).rejects.toThrow()
+
+    // Held once, expired now: yesterday's arrangement must not decide today's leave. (KernError
+    // surfaces its code rather than its detail, so the refusal itself is the assertion.)
+    await delegateManagerTo(colleague, -30, -7)
+    await expect(
+      run((tx) => approvals.decide(tx, WS_A, raised.request.id, colleague, 'approve', null, manager)),
+    ).rejects.toThrow()
+  })
 })
 
 const FIXED_REQUEST = '01920000-0000-7000-8000-00000000fa01'
 const FIXED_REQUEST_2 = '01920000-0000-7000-8000-00000000fa02'
+const FIXED_REQUEST_3 = '01920000-0000-7000-8000-00000000fa03'
+const FIXED_REQUEST_4 = '01920000-0000-7000-8000-00000000fa04'
+const FIXED_REQUEST_5 = '01920000-0000-7000-8000-00000000fa05'
+const FIXED_REQUEST_6 = '01920000-0000-7000-8000-00000000fa06'
 
 /**
  * Partitioning, and the thing about it that would be silent if wrong.

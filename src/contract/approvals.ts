@@ -117,11 +117,23 @@ export const ApprovalRequest = z.object({
   ...ws,
   subjectType: ApprovalSubjectType,
   subjectId: z.uuid(),
-  /** A one-line description of what is being approved, so an inbox is readable without joins. */
+  /**
+   * The English one-liner a request was raised with, kept as the fallback.
+   *
+   * Prefer `summaryParams`: a sentence composed on the server is English for every reader, which
+   * is how half a screen ends up untranslated while every label around it is not.
+   */
   summary: z.string().max(200),
+  /** The same sentence as data — `{ days, from, to }` for leave, `{ date }` for a correction. */
+  summaryParams: z.record(z.string(), z.union([z.string(), z.number()])).nullable(),
   status: ApprovalStatus,
   currentStep: z.number().int(),
+  /** The account that submitted it, which may be nobody: an import has no user behind it. */
   requestedBy: z.uuid().nullable(),
+  /** Whose request it is, as an employee. Not the same as `requestedBy` — see the schema. */
+  requesterPersonId: z.uuid().nullable(),
+  /** Resolved on read so an inbox needs one call, not one call plus a directory lookup. */
+  requesterName: z.string().nullable(),
   requestedAt: Timestamp,
   decidedAt: Timestamp.nullable(),
   steps: z.array(ApprovalStep),
