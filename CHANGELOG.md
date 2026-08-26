@@ -1,5 +1,11 @@
 # @kernhq/module-hr
 
+## 0.11.0
+
+### Minor Changes
+
+- feat(hr): mount the accrual settings page
+
 ## 0.10.5
 
 ### Patch Changes
