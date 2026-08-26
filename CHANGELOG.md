@@ -1,5 +1,11 @@
 # @kernhq/module-hr
 
+## 0.9.3
+
+### Patch Changes
+
+- fix: declare @kernhq/kernel and @kernhq/contracts as peerDependencies
+
 ## 0.9.2
 
 ### Patch Changes
