@@ -618,6 +618,14 @@ export const approvalSteps = schema.table(
   (t) => [
     uniqueIndex('hr_approval_steps_uq').on(t.requestId, t.stepIndex),
     index('hr_approval_steps_due_idx').on(t.workspaceId, t.status, t.dueAt),
+    /**
+     * The inbox asks `approver_ids && ARRAY[…]::uuid[]`, and no btree can answer an array overlap —
+     * so the query every manager triggers on every page load was a sequential scan over a table
+     * that only ever grows. Plain GIN indexes the array's elements, which is the operator's own
+     * shape; `btree_gin` would only be needed to fold `workspace_id` in beside it, and the
+     * workspace filter is cheap once the overlap has cut the table down to a handful of rows.
+     */
+    index('hr_approval_steps_approvers_idx').using('gin', t.approverIds),
   ],
 )
 
@@ -733,7 +741,29 @@ export const punches = schema.table(
     note: text('note'),
     createdAt: created(),
   },
-  (t) => [index('hr_punches_person_idx').on(t.workspaceId, t.personId, t.businessDate)],
+  (t) => [
+    index('hr_punches_person_idx').on(t.workspaceId, t.personId, t.businessDate),
+    /**
+     * The hourly auto-clock-out sweep. It asks for open `in` punches older than a cutoff, and until
+     * this index not one of the four columns it filters on was indexed — half a million rows a
+     * year, scanned once an hour per workspace.
+     *
+     * `voided_by_punch_id is null` is the partial predicate rather than a fourth column because
+     * drizzle emits `is null` as literal SQL, so the planner can always prove the query implies it.
+     * `direction` stays an indexed column for the opposite reason: it arrives as a bind parameter,
+     * and a generic plan cannot match a parameter against a predicate's constant.
+     *
+     * Declared on the partitioned parent, which is what gives every partition its own copy —
+     * including the ones `ensure_punch_partition` has not created yet.
+     *
+     * It only pays if the sweep bounds `at` from below and gives `business_date` a lower bound as
+     * well. `at <= cutoff` on its own matches every `in` punch the instance has ever recorded, and
+     * no index makes an unbounded result set cheap — measured, 16 partitions scanned end to end.
+     */
+    index('hr_punches_open_idx')
+      .on(t.workspaceId, t.direction, t.at)
+      .where(sql`"voided_by_punch_id" is null`),
+  ],
 )
 
 /**
