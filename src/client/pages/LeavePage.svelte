@@ -6,6 +6,7 @@ import {
   Dialog,
   EmptyState,
   formatDateRange,
+  Icon,
   messageLocale,
   navigation,
   Page,
@@ -17,6 +18,7 @@ import {
 } from '@kernhq/ui'
 import { createMutation, createQuery, useQueryClient } from '@tanstack/svelte-query'
 import { getHrApi } from '../api-instance.js'
+import LeaveLedgerPanel from '../components/LeaveLedgerPanel.svelte'
 import LeaveRequestDialog from '../components/LeaveRequestDialog.svelte'
 import { t } from '../i18n.js'
 import type { LeaveRequest } from '../index.js'
@@ -34,6 +36,10 @@ import { formatDays, hrKeys } from '../query.js'
  * Neither half may fail quietly. A refused balance used to take the strip off the page with no
  * message and leave "No time off booked" underneath it, which reads as a person with nothing —
  * no days left and none booked — rather than as a screen that never loaded.
+ *
+ * A tile is also the way in to the movements behind it. "How much do I have" and "why is it that"
+ * are the same question one step apart, and the second one had no answer on any screen: the ledger
+ * was readable over the API and nowhere else, so `hr.leave.view_ledger` gated nothing.
  */
 const api = getHrApi()
 const queryClient = useQueryClient()
@@ -83,6 +89,24 @@ const refetchAll = () => {
 }
 
 const days = (n: number) => formatDays(n, messageLocale())
+
+/**
+ * The unit a type is counted in decides the word beside the number. A type counted in hours read
+ * "7 days available" on this strip until the ledger needed the distinction anyway; half-days are
+ * still days.
+ */
+const unitWord = (unit: string, count: number) => t(unit === 'hour' ? 'hours' : 'days', { count })
+
+// ---------------------------------------------------------------- the ledger behind a tile
+
+const canLedger = $derived(canHr('leaveViewLedger'))
+/**
+ * The type whose ledger is open, rather than the row itself: held by id, the panel keeps reading the
+ * live query row, so an adjustment made inside it moves the figure at the top of the panel as soon
+ * as the invalidation lands. A captured copy would sit there stating the old number.
+ */
+let ledgerTypeId = $state<string | null>(null)
+const ledgerBalance = $derived(balances.find((b) => b.leaveTypeId === ledgerTypeId) ?? null)
 
 /**
  * The request waiting on a confirmation, and what the last attempt said.
@@ -227,11 +251,37 @@ const canCancel = (status: string) => canHr('leaveRequest') && (status === 'pend
   {:else if balances.length}
     <div class="tiles">
       {#each balances as balance (balance.leaveTypeId)}
-        <StatTile
-          label={balance.leaveTypeName}
-          value={days(balance.available)}
-          note={`${t('available')} · ${t('days', { count: balance.available })}`}
-        />
+        {#if canLedger}
+          <!--
+            The whole tile is the control, so the target is the size of the thing somebody is
+            looking at rather than a link tucked in a corner. `aria-label` names the action, which
+            is what stops a screen reader reading the number twice and the verb never.
+          -->
+          <button
+            type="button"
+            class="tile-button"
+            aria-label={t('leave_ledger_open', { name: balance.leaveTypeName })}
+            onclick={() => (ledgerTypeId = balance.leaveTypeId)}
+          >
+            <StatTile
+              class="ledger-tile"
+              label={balance.leaveTypeName}
+              value={days(balance.available)}
+              note={`${t('available')} · ${unitWord(balance.unit, balance.available)}`}
+            >
+              <span class="cue">
+                <Icon name="scroll-text" size={13} strokeWidth={1.7} />
+                {t('leave_ledger')}
+              </span>
+            </StatTile>
+          </button>
+        {:else}
+          <StatTile
+            label={balance.leaveTypeName}
+            value={days(balance.available)}
+            note={`${t('available')} · ${unitWord(balance.unit, balance.available)}`}
+          />
+        {/if}
       {/each}
     </div>
   {:else if balanceQuery.isError}
@@ -314,6 +364,13 @@ const canCancel = (status: string) => canHr('leaveRequest') && (status === 'pend
 
 <LeaveRequestDialog open={requesting} {workspaceId} {workspaceSlug} />
 
+<LeaveLedgerPanel
+  balance={ledgerBalance}
+  {workspaceId}
+  personName={session.user?.name ?? ''}
+  onClose={() => (ledgerTypeId = null)}
+/>
+
 <!--
   Cancelling is not undoing, and the person clicking has to know what it costs before it happens: a
   small ghost button beside a status badge was wired straight to the mutation, so one misclick threw
@@ -364,6 +421,30 @@ const canCancel = (status: string) => canHr('leaveRequest') && (status === 'pend
   grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
   gap: 12px;
   margin-block-end: 20px;
+}
+/*
+ * The tile is a button, so it needs the button reset undone: the global one strips background,
+ * border and padding, and the tile inside paints its own.
+ */
+.tile-button {
+  display: block;
+  width: 100%;
+  text-align: start;
+  font: inherit;
+  color: inherit;
+  border-radius: var(--kern-r-2xl);
+}
+.tile-button:hover :global(.ledger-tile) {
+  background: var(--kern-surface-card-hover);
+}
+.cue {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-block-start: 10px;
+  font-size: 12px;
+  /* A colour, not opacity: 6.74:1 on the tile in light, 6.12:1 in dark. */
+  color: var(--kern-ink-500);
 }
 /* Keeps an error or empty balance on the same rhythm as the tiles it stands in for. */
 .tiles-slot {

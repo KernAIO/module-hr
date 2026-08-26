@@ -4,6 +4,7 @@ import {
   Button,
   EmptyState,
   formatDate,
+  Icon,
   messageLocale,
   navigation,
   Page,
@@ -15,6 +16,7 @@ import {
 import { createQuery } from '@tanstack/svelte-query'
 import { getHrApi } from '../api-instance.js'
 import ClockControls from '../components/ClockControls.svelte'
+import DayDetail from '../components/DayDetail.svelte'
 import { t } from '../i18n.js'
 import { formatDuration, hrKeys, monthRange } from '../query.js'
 
@@ -30,6 +32,12 @@ import { formatDuration, hrKeys, monthRange } from '../query.js'
  * a confident statement about somebody's month made out of nothing, and the one figure on this page
  * a person might take to their manager. Until there is a day sheet to add up the tiles are
  * skeletons, and the month underneath says the load failed and offers a way to try again.
+ *
+ * A row opens. Underneath it are the punches the total was computed from, the anomalies as
+ * sentences rather than a number in a warning badge, and the two things somebody arguing with their
+ * timesheet can actually do — void a punch that is wrong, ask for one that is missing. All four
+ * procedures behind that were implemented and called from nowhere, which made
+ * `hr.attendance.manage` a permission to read.
  */
 const api = getHrApi()
 
@@ -45,6 +53,42 @@ const daysQuery = createQuery(() => ({
   queryFn: () => api.attendance.days.list({ workspaceId, from: range.from, to: range.to, limit: 100 }),
 }))
 const days = $derived(daysQuery.data?.items ?? [])
+
+/**
+ * The corrections this person has already asked for, once for the month rather than once per day.
+ *
+ * `regularizations.list` answers for one person and has no date filter, so a query per open day
+ * would be the same request repeated. It is read here and handed down filtered, which also lets a
+ * day that has one say so *before* it is opened — the reason somebody opens a day is usually the
+ * reason they already raised.
+ */
+const correctionsQuery = createQuery(() => ({
+  // The same literal shape `hrKeys` builds — `['hr', entity, workspace, …scope]` — so the module's
+  // blanket `['hr']` invalidation after a correction reaches it.
+  queryKey: ['hr', 'regularizations', workspaceId, 'me', 'pending'] as const,
+  enabled: Boolean(workspaceId),
+  queryFn: () => api.attendance.regularizations.list({ workspaceId, status: ['pending'], limit: 100 }),
+}))
+const corrections = $derived({
+  items: correctionsQuery.data?.items ?? [],
+  loading: !workspaceId || correctionsQuery.isLoading,
+  // The retained list decides, never the status: a failed background refetch leaves `error` beside
+  // a perfectly good list, and treating that as a failure would hide corrections that exist.
+  failed: correctionsQuery.isError && (correctionsQuery.data?.items ?? []).length === 0,
+  retry: () => void correctionsQuery.refetch(),
+})
+const correctionDates = $derived(new Set(corrections.items.map((r) => r.businessDate)))
+
+/**
+ * One day open at a time.
+ *
+ * An accordion rather than a set: the panel is tall — punches, anomalies, corrections — and a month
+ * with five of them open is a page nobody can find the row they wanted in.
+ */
+let openDay = $state<string | null>(null)
+const toggleDay = (id: string) => {
+  openDay = openDay === id ? null : id
+}
 
 /**
  * A disabled query is not a loading one — it is `pending` and not fetching — so without the
@@ -151,17 +195,52 @@ const dayLabel = (iso: string) =>
     {/if}
     <ul>
       {#each days as day (day.id)}
-        <li class="row">
-          <span class="date">{dayLabel(day.businessDate)}</span>
-          <span class="worked">{duration(day.workedMinutes)}</span>
-          {#if day.overtimeMinutes > 0}
-            <span class="ot">+{duration(day.overtimeMinutes)}</span>
-          {/if}
-          <!-- An anomaly is why a day needs a human; saying so beats a silent zero. -->
-          {#if day.anomalies.length}
-            <Badge tone="warning">{day.anomalies.length}</Badge>
-          {/if}
-          <Badge tone={statusTone(day.status)}>{statusLabel(day.status)}</Badge>
+        {@const open = openDay === day.id}
+        <li>
+          <!--
+            The whole row is the control, because the thing somebody wants after reading "0h worked"
+            is everything underneath it — not a chevron they have to find first.
+          -->
+          <button
+            type="button"
+            class="row"
+            aria-expanded={open}
+            aria-controls={`hr-day-${day.id}`}
+            onclick={() => toggleDay(day.id)}
+          >
+            <!--
+              One icon rotated, as `SectionLabel` does it — a `chevron-right` for the closed state
+              points into the margin under `dir="rtl"`, and there is no logical property for a
+              rotation.
+            -->
+            <span class="chev" class:closed={!open}><Icon name="chevron-down" size={14} /></span>
+            <span class="date">{dayLabel(day.businessDate)}</span>
+            <span class="worked">{duration(day.workedMinutes)}</span>
+            {#if day.overtimeMinutes > 0}
+              <span class="ot">+{duration(day.overtimeMinutes)}</span>
+            {/if}
+            <!--
+              A number in a warning badge with no noun said nothing at all. It counts things a
+              person has to look at, so it says so — and the sentences behind it are one click away
+              rather than nowhere.
+            -->
+            {#if day.anomalies.length}
+              <Badge tone="warning">{t('att_anomalies_count', { count: day.anomalies.length })}</Badge>
+            {/if}
+            {#if correctionDates.has(day.businessDate)}
+              <Badge tone="upcoming">{t('att_correction_waiting')}</Badge>
+            {/if}
+            <Badge tone={statusTone(day.status)}>{statusLabel(day.status)}</Badge>
+          </button>
+          <!--
+            The container exists whether or not it is open, so `aria-controls` above always points
+            at something; the panel's queries only run once somebody asks for them.
+          -->
+          <div id={`hr-day-${day.id}`}>
+            {#if open}
+              <DayDetail {workspaceId} {day} {corrections} />
+            {/if}
+          </div>
         </li>
       {/each}
     </ul>
@@ -213,12 +292,38 @@ ul {
   margin: 0;
   padding: 0;
 }
+/*
+ * A button, so the keyboard reaches every day the pointer does — and reset back to a row: a
+ * `<button>` inherits neither the page's font nor its text direction from the browser's defaults.
+ */
 .row {
   display: flex;
   align-items: center;
   gap: 12px;
+  width: 100%;
   padding: 8px 12px;
+  border: 0;
   border-block-end: 1px solid var(--kern-border);
+  border-radius: var(--kern-r-md);
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+.row:hover {
+  background: var(--kern-surface-hover);
+}
+.chev {
+  display: inline-flex;
+  color: var(--kern-ink-500);
+  transition: transform 0.14s;
+}
+.chev.closed {
+  transform: rotate(-90deg);
+}
+:global([dir='rtl']) .chev.closed {
+  transform: rotate(90deg);
 }
 .date {
   flex: 1;

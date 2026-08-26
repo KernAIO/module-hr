@@ -198,7 +198,13 @@ const attendance = page('./AttendancePage.svelte')
 const leave = page('./LeavePage.svelte')
 
 /** A day sheet row, shaped enough for the `{#if}`s inside the month list. */
-const day = { overtimeMinutes: 0, anomalies: [] as unknown[] }
+const day = { overtimeMinutes: 0, anomalies: [] as unknown[], businessDate: '2026-08-03' }
+/**
+ * What an expandable row reads besides the day itself: whether a correction is waiting on this
+ * date, and whether this row is the open one. Both live outside the `{#each}`, so the resolver has
+ * to be handed them or every render of the month throws.
+ */
+const row = { correctionDates: new Set<string>(), open: false }
 
 describe('the month on the attendance page', () => {
   /**
@@ -211,7 +217,7 @@ describe('the month on the attendance page', () => {
   })
 
   it('draws a day-shaped skeleton while the first fetch is in flight', () => {
-    const body = attendance.render('loading', { loading: true, days: [], daysQuery: {}, day })
+    const body = attendance.render('loading', { loading: true, days: [], daysQuery: {}, day, ...row })
     expect(body).toContain('Skeleton')
     expect(body).not.toContain('EmptyState')
   })
@@ -227,6 +233,7 @@ describe('the month on the attendance page', () => {
       days: [],
       daysQuery: { isError: true },
       day,
+      ...row,
     })
     expect(body).toContain("t('attendance_error')")
     expect(body).toContain("t('retry')")
@@ -239,6 +246,7 @@ describe('the month on the attendance page', () => {
       days: [],
       daysQuery: { isError: false },
       day,
+      ...row,
     })
     expect(body).toContain("t('attendance_none')")
     expect(body).not.toContain("t('attendance_error')")
@@ -255,6 +263,7 @@ describe('the month on the attendance page', () => {
       days: [{ id: 'a' }],
       daysQuery: { isError: true },
       day,
+      ...row,
     })
     expect(body).toContain('{#each days as day (day.id)}')
     expect(body).toContain("t('attendance_stale')")
@@ -268,9 +277,27 @@ describe('the month on the attendance page', () => {
       days: [{ id: 'a' }],
       daysQuery: { isError: false },
       day,
+      ...row,
     })
     expect(body).toContain('{#each days as day (day.id)}')
     expect(body).not.toContain("t('attendance_stale')")
+  })
+
+  /**
+   * The anomaly badge used to be `{day.anomalies.length}` — a number in a warning tone with no
+   * noun beside it and nothing to click. It counts things a person has to look at, so it says so,
+   * and the sentences behind it are one row-click away.
+   */
+  it('names what the anomaly badge counts rather than showing a bare number', () => {
+    const body = attendance.render('loading', {
+      loading: false,
+      days: [{ id: 'a' }],
+      daysQuery: { isError: false },
+      day: { ...day, anomalies: ['missing_clock_out'] },
+      ...row,
+    })
+    expect(body).toContain("t('att_anomalies_count', { count: day.anomalies.length })")
+    expect(body).not.toContain('<Badge tone="warning">{day.anomalies.length}</Badge>')
   })
 })
 

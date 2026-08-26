@@ -14,18 +14,25 @@
  * does not is how a screen works in `dev:mock` and breaks against the real API.
  */
 import { ORPCError } from '@orpc/contract'
-import type { Schedule, ScheduleAssignment } from '../contract/attendance.js'
-import type { LeaveType } from '../contract/leave.js'
+import type { ApprovalChain, ApprovalChainSpec } from '../contract/approvals.js'
+import type { Punch, Regularization, Schedule, ScheduleAssignment } from '../contract/attendance.js'
+import type { LeaveLedgerEntry, LeaveType } from '../contract/leave.js'
 import type {
   Calendar,
   CalendarDay,
   CalendarDayKind,
+  Employment,
   LegalEntity,
   Office,
   OfficeAssignment,
+  OrgUnit,
+  PersonDocument,
+  PersonSensitive,
+  Position,
   ResolvedCalendarDay,
   WorkingWeek,
 } from '../contract/models.js'
+import type { Period } from '../contract/policies.js'
 
 /**
  * A refusal the client cannot tell from the server's.
@@ -38,10 +45,15 @@ import type {
  * Every sentence below is copied from `src/server/router.ts`, because the widget renders the
  * server's own words rather than a translated string.
  */
-function refuse(code: 'CONFLICT' | 'NOT_FOUND' | 'BAD_REQUEST', message: string): never {
+function refuse(code: 'CONFLICT' | 'NOT_FOUND' | 'BAD_REQUEST', message: string, reason?: string): never {
   // A declaration, not a `const` arrow: TypeScript only narrows on a `never` return for one of
   // those, so an arrow would leave every caller believing the row after the guard is still optional.
-  throw new ORPCError(code, { message })
+  //
+  // `reason` lands in `data`, which is where `kernErrorToORPC` puts it — and it is passed *only*
+  // where the router passes one. A mock that invented a reason the server does not send would be
+  // the same bug as a mock that dropped one it does, pointing the other way: the client's lookup
+  // would fire in `dev:mock` and never in production.
+  throw new ORPCError(code, { message, data: reason ? { reason } : undefined })
 }
 
 /** Stored without the tenant, which every call stamps back on. */
@@ -363,6 +375,191 @@ export function createMockHrApi() {
     createdAt: iso(400 * 86_400_000),
     updatedAt: iso(),
   })
+
+  // ---------------------------------------------------------------- the org chart
+
+  /**
+   * An ltree label: `u` and the id with its dashes removed.
+   *
+   * The prefix is not decoration — an ltree label cannot start with a digit, and every id here
+   * does.
+   */
+  const unitLabel = (unitId: string) => `u${unitId.replaceAll('-', '')}`
+
+  const orgUnits: Row<OrgUnit>[] = []
+  const pathFor = (parentId: string | null, unitId: string): string => {
+    const parent = parentId ? orgUnits.find((u) => u.id === parentId) : undefined
+    return parent ? `${parent.path}.${unitLabel(unitId)}` : unitLabel(unitId)
+  }
+  const seedUnit = (
+    unitId: string,
+    parentId: string | null,
+    name: string,
+    code: string | null = null,
+    headPersonId: string | null = null,
+  ) => {
+    orgUnits.push({
+      id: unitId,
+      parentId,
+      path: pathFor(parentId, unitId),
+      name,
+      code,
+      headPersonId,
+      archivedAt: null,
+    })
+  }
+
+  // Parent before child, because a path is built from the one above it. Four levels deep so the
+  // tree rails and the depth figure have something to draw, and Operations is left empty and
+  // childless so archiving a department is reachable at all.
+  seedUnit(id('0a01'), null, 'Northstar', 'NS', people[0]!.id)
+  seedUnit(id('0a02'), id('0a01'), 'Engineering', 'ENG', people[0]!.id)
+  seedUnit(id('0a03'), id('0a02'), 'Platform', 'PLT', people[1]!.id)
+  seedUnit(id('0a04'), id('0a03'), 'Infrastructure')
+  seedUnit(id('0a05'), id('0a02'), 'Product Engineering')
+  seedUnit(id('0a06'), id('0a01'), 'People & Culture', 'PC', people[1]!.id)
+  seedUnit(id('0a07'), id('0a01'), 'Operations')
+
+  const positions: Row<Position>[] = [
+    {
+      id: id('05a1'),
+      title: 'Software Engineer',
+      code: 'SE',
+      jobFamily: 'Engineering',
+      level: 'L3',
+      archivedAt: null,
+    },
+    {
+      id: id('05a2'),
+      title: 'Senior Software Engineer',
+      code: 'SSE',
+      jobFamily: 'Engineering',
+      level: 'L4',
+      archivedAt: null,
+    },
+    {
+      id: id('05a3'),
+      title: 'Engineering Manager',
+      code: 'EM',
+      jobFamily: 'Engineering',
+      level: 'M1',
+      archivedAt: null,
+    },
+    // A mix on purpose: not every position is levelled, and plenty carry no code at all.
+    {
+      id: id('05a4'),
+      title: 'People Partner',
+      code: null,
+      jobFamily: 'People',
+      level: null,
+      archivedAt: null,
+    },
+    { id: id('05a5'), title: 'Office Manager', code: 'OM', jobFamily: null, level: null, archivedAt: null },
+  ]
+
+  /**
+   * Who holds which job, effective-dated.
+   *
+   * The org tree's headcount is a count of *these* — one row per person whose `effectiveTo` is
+   * still null — rather than a number stated beside the department. That is what makes archiving a
+   * department refuse for a reason somebody can act on, and it is why moving a person changes two
+   * screens at once.
+   */
+  const employments: Row<Employment>[] = [
+    // Ayşe was promoted, so her history has two rows and the current one is not the first. A single
+    // open row per person makes `employment.history` a list of one and proves nothing about the
+    // effective-dated shape it exists to show.
+    {
+      id: id('eb05'),
+      personId: people[0]!.id,
+      effectiveFrom: day(-400),
+      effectiveTo: day(-201),
+      orgUnitId: id('0a02'),
+      positionId: id('05a1'),
+      legalEntityId: id('1e01'),
+      costCenterId: null,
+      managerPersonId: null,
+      employmentType: 'full_time',
+      fte: 1,
+      contractHoursWeek: 40,
+      reason: null,
+      createdAt: iso(400 * 86_400_000),
+    },
+    {
+      id: id('eb01'),
+      personId: people[0]!.id,
+      effectiveFrom: day(-200),
+      effectiveTo: null,
+      orgUnitId: id('0a02'),
+      positionId: id('05a3'),
+      legalEntityId: id('1e01'),
+      costCenterId: null,
+      managerPersonId: null,
+      employmentType: 'full_time',
+      fte: 1,
+      contractHoursWeek: 40,
+      reason: 'Promoted to Engineering Manager',
+      createdAt: iso(200 * 86_400_000),
+    },
+    {
+      id: id('eb02'),
+      personId: people[1]!.id,
+      effectiveFrom: day(-300),
+      effectiveTo: null,
+      orgUnitId: id('0a03'),
+      positionId: id('05a2'),
+      legalEntityId: id('1e02'),
+      costCenterId: null,
+      managerPersonId: people[0]!.id,
+      employmentType: 'full_time',
+      fte: 1,
+      contractHoursWeek: 40,
+      reason: null,
+      createdAt: iso(300 * 86_400_000),
+    },
+    {
+      id: id('eb03'),
+      personId: people[2]!.id,
+      effectiveFrom: day(-250),
+      effectiveTo: null,
+      orgUnitId: id('0a02'),
+      positionId: id('05a1'),
+      legalEntityId: id('1e01'),
+      costCenterId: null,
+      managerPersonId: people[0]!.id,
+      employmentType: 'full_time',
+      fte: 1,
+      contractHoursWeek: 40,
+      reason: null,
+      createdAt: iso(250 * 86_400_000),
+    },
+    {
+      id: id('eb04'),
+      personId: people[3]!.id,
+      effectiveFrom: day(-80),
+      effectiveTo: null,
+      orgUnitId: id('0a06'),
+      positionId: id('05a4'),
+      legalEntityId: id('1e01'),
+      costCenterId: null,
+      managerPersonId: people[0]!.id,
+      employmentType: 'part_time',
+      fte: 0.8,
+      contractHoursWeek: 32,
+      reason: null,
+      createdAt: iso(80 * 86_400_000),
+    },
+  ]
+
+  /** Direct only. The tree sums the subtree itself, so a subtree total here double-counts. */
+  const unitHeadcount = (unitId: string) =>
+    employments.filter((e) => e.orgUnitId === unitId && e.effectiveTo === null).length
+
+  const descendants = (unitId: string) => {
+    const root = orgUnits.find((u) => u.id === unitId)
+    if (!root) return []
+    return orgUnits.filter((u) => u.path === root.path || u.path.startsWith(`${root.path}.`))
+  }
 
   // ---------------------------------------------------------------- calendars
 
@@ -704,6 +901,333 @@ export function createMockHrApi() {
     },
   ]
 
+  /**
+   * The recent working days, most recent first.
+   *
+   * The interesting days are pinned to positions in *this* list rather than to a raw offset from
+   * today: `day(-3)` is a Sunday one week in three, and a leave day or a missing clock-out on a
+   * Sunday is a contradiction the day sheet would then have to draw.
+   */
+  const workdays = (count: number): string[] => {
+    const out: string[] = []
+    for (let back = 0; out.length < count; back++) {
+      const date = day(-back)
+      const weekday = WEEKDAYS[new Date(`${date}T00:00:00Z`).getUTCDay()]!
+      if (weekday !== 'sat' && weekday !== 'sun') out.push(date)
+    }
+    return out
+  }
+  const WD = workdays(5)
+  /** How far the punch seed reaches back — a month plus a fortnight, so any month-start is covered. */
+  const SEED_DAYS = 45
+
+  /**
+   * An instant from a business date and a wall-clock reading **in the office's zone**.
+   *
+   * Built as UTC these read three hours late to everybody: the screens format in the viewer's zone,
+   * so a seeded `09:00` clock-in was drawn as "12:00 PM" and a nine-to-six day looked like noon to
+   * nine. Istanbul has been a fixed +03:00 with no daylight saving since 2016, so the offset is
+   * safe to write literally — a zone that still shifts would need the date to decide it.
+   */
+  const stamp = (date: string, wall: string) => new Date(`${date}T${wall}:00+03:00`).toISOString()
+
+  let punchCounter = 0
+  const punch = (
+    date: string,
+    wall: string,
+    direction: Punch['direction'],
+    over: Partial<Row<Punch>> = {},
+  ): Row<Punch> => ({
+    id: id(`9c${(++punchCounter).toString(16).padStart(4, '0')}`),
+    personId: people[0]!.id,
+    direction,
+    at: stamp(date, wall),
+    clientReportedAt: null,
+    skewMs: null,
+    businessDate: date,
+    timezone: 'Europe/Istanbul',
+    method: 'web',
+    officeId: primaryOfficeId(people[0]!.id),
+    deviceId: null,
+    geo: null,
+    trust: 'trusted',
+    voidedByPunchId: null,
+    note: null,
+    createdAt: iso(),
+    ...over,
+  })
+
+  /**
+   * The raw punches behind the day sheet.
+   *
+   * Every past working day gets a pair, not just the interesting ones. A day sheet that says eight
+   * hours with nothing underneath it is the exact statement this page's own header warns about —
+   * and opening such a row showed a total above an empty list, which reads as a broken panel.
+   *
+   * The times match the seeded `Office hours` schedule, so the arithmetic holds: 09:00 to 18:00 is
+   * nine hours, less an hour of break, is the 480 minutes the row claims.
+   *
+   * Three states the panel draws differently sit on top: a punch the device *claimed* while
+   * offline, a day whose clock-out never arrived, and a voided punch beside the correcting row that
+   * carries the reason.
+   */
+  const punches: Row<Punch>[] = []
+
+  // Far enough back to cover the current month whatever day of it this runs on.
+  for (let back = SEED_DAYS; back >= 1; back--) {
+    const date = day(-back)
+    const weekday = WEEKDAYS[new Date(`${date}T00:00:00Z`).getUTCDay()]!
+    if (weekday === 'sat' || weekday === 'sun') continue
+    if (date === WD[2]) continue // on leave, so nothing was punched
+    if (date === WD[3]) {
+      // Punched from a phone that was offline: the instant is the device's claim, and it was four
+      // minutes out. That pair of facts is what `trust` and `skewMs` exist to keep. No clock-out
+      // ever arrived, which is the day's anomaly.
+      punches.push(
+        punch(date, '09:12', 'in', {
+          method: 'mobile',
+          trust: 'claimed',
+          clientReportedAt: stamp(date, '09:08'),
+          skewMs: 240_000,
+        }),
+      )
+      continue
+    }
+    punches.push(punch(date, '09:00', 'in'))
+    punches.push(punch(date, '13:00', 'break_start'))
+    punches.push(punch(date, '14:00', 'break_end'))
+    punches.push(punch(date, date === WD[1] ? '18:45' : '18:00', 'out'))
+  }
+
+  /**
+   * The voided pair, wired the way `voidPunch` wires it.
+   *
+   * Both rows point at the correction: the original because it was voided, and the correction
+   * because it is not a punch — it exists to carry the reason and to say what it replaced. The
+   * panel hides the self-voiding row and reads the sentence out of its note.
+   */
+  const voidedOriginal = punch(WD[4]!, '08:00', 'in')
+  const voidCorrection = punch(WD[4]!, '08:00', 'in', {
+    method: 'manual',
+    note: `Voids ${voidedOriginal.id}: Badge reader at the door fired as I walked past.`,
+  })
+  voidedOriginal.voidedByPunchId = voidCorrection.id
+  voidCorrection.voidedByPunchId = voidCorrection.id
+  punches.push(voidedOriginal, voidCorrection)
+
+  /**
+   * One correction already asked for, on the day the seeded approval names.
+   *
+   * `subjectId` and `approvalRequestId` line up with the `regularization` row in the approvals
+   * inbox on purpose — the same request seen from the two screens that show it, which is the thing
+   * a demo cannot fake with two unrelated rows.
+   */
+  const regularizations: Row<Regularization>[] = [
+    {
+      id: id('c002'),
+      personId: people[0]!.id,
+      businessDate: WD[1]!,
+      punchId: punches.find((x) => x.businessDate === WD[1] && x.direction === 'out')?.id ?? null,
+      proposed: [{ direction: 'out', at: stamp(WD[1]!, '19:00') }],
+      reason: 'I worked until 19:00 finishing the migration; the clock-out is wrong.',
+      status: 'pending',
+      approvalRequestId: id('f002'),
+      appliedAt: null,
+      createdAt: iso(2 * 86_400_000),
+    },
+  ]
+
+  // ---------------------------------------------------------------- documents, sensitive, periods
+
+  const documents: Row<PersonDocument>[] = [
+    {
+      id: id('d0c1'),
+      personId: people[0]!.id,
+      fileId: id('f11e01'),
+      name: 'Employment contract',
+      kind: 'contract',
+      issuedOn: day(-400),
+      expiresOn: null,
+      uploadedBy: null,
+      createdAt: iso(400 * 86_400_000),
+    },
+    // Expiring inside the month, because "expires on" is the column the section exists for and a
+    // list where nothing ever expires never shows what it does with one.
+    {
+      id: id('d0c2'),
+      personId: people[0]!.id,
+      fileId: id('f11e02'),
+      name: 'Work permit',
+      kind: 'permit',
+      issuedOn: day(-380),
+      expiresOn: day(20),
+      uploadedBy: null,
+      createdAt: iso(380 * 86_400_000),
+    },
+    {
+      id: id('d0c3'),
+      personId: people[1]!.id,
+      fileId: id('f11e03'),
+      name: 'Employment contract',
+      kind: 'contract',
+      issuedOn: day(-300),
+      expiresOn: null,
+      uploadedBy: null,
+      createdAt: iso(300 * 86_400_000),
+    },
+  ]
+
+  /**
+   * Behind a second permission, and a separate shape for that reason.
+   *
+   * Seeded for one person only: the section has to be able to render "nothing recorded" as well as
+   * a filled-in card, and every other person here is that case.
+   */
+  const sensitive: Row<PersonSensitive>[] = [
+    {
+      personId: people[0]!.id,
+      nationalId: '12345678901',
+      birthDate: '1991-04-17',
+      iban: 'TR33 0006 1005 1978 6457 8413 26',
+      emergencyContact: { name: 'Elif Yılmaz', relationship: 'Sister', phone: '+90 532 000 0000' },
+    },
+  ]
+
+  const monthStart = (offset: number) => {
+    const base = new Date(now)
+    const d = new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth() + offset, 1))
+    return d.toISOString().slice(0, 10)
+  }
+  const monthEnd = (offset: number) => {
+    const base = new Date(now)
+    const d = new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth() + offset + 1, 0))
+    return d.toISOString().slice(0, 10)
+  }
+
+  const periods: Row<Period>[] = [
+    // Last month closed and this month open — the two states the screen switches between, so
+    // neither the lock button nor the reopen warning is reachable only in theory.
+    {
+      id: id('9e01'),
+      kind: 'payroll',
+      legalEntityId: id('1e01'),
+      startsOn: monthStart(-1),
+      endsOn: monthEnd(-1),
+      status: 'locked',
+      lockedAt: iso(5 * 86_400_000),
+      lockedBy: null,
+      note: 'Filed with payroll',
+    },
+    {
+      id: id('9e02'),
+      kind: 'payroll',
+      legalEntityId: id('1e01'),
+      startsOn: monthStart(0),
+      endsOn: monthEnd(0),
+      status: 'open',
+      lockedAt: null,
+      lockedBy: null,
+      note: null,
+    },
+    {
+      id: id('9e03'),
+      kind: 'attendance',
+      legalEntityId: null,
+      startsOn: monthStart(-1),
+      endsOn: monthEnd(-1),
+      status: 'open',
+      lockedAt: null,
+      lockedBy: null,
+      note: null,
+    },
+  ]
+
+  /** Working days in a range — what lock and unlock report as the days they froze or released. */
+  const workingDaysIn = (from: string, to: string) =>
+    eachDate(from, to).filter((date) => {
+      const weekday = WEEKDAYS[new Date(`${date}T00:00:00Z`).getUTCDay()]!
+      return weekday !== 'sat' && weekday !== 'sun' && date <= day(0)
+    }).length
+
+  // ---------------------------------------------------------------- approval chains
+
+  const chains: Row<ApprovalChain>[] = [
+    {
+      id: id('ca11'),
+      name: 'Leave — manager then HR',
+      subjectType: 'leave',
+      isDefault: true,
+      archivedAt: null,
+      spec: {
+        steps: [
+          {
+            name: 'Manager',
+            approvers: [{ kind: 'manager' }],
+            mode: 'any',
+            minApprovals: 1,
+            slaHours: 48,
+            onTimeout: 'remind',
+          },
+          {
+            name: 'HR',
+            approvers: [{ kind: 'permission', id: 'hr.leave.manage' }],
+            mode: 'any',
+            minApprovals: 1,
+            slaHours: 72,
+            onTimeout: 'escalate',
+          },
+        ],
+      },
+    },
+    // Not the default, so the table has a row without the in-use badge — which is the case the
+    // column's description is about, and a table where every row looks the same never shows it.
+    {
+      id: id('ca12'),
+      name: 'Leave — local HR only',
+      subjectType: 'leave',
+      isDefault: false,
+      archivedAt: null,
+      spec: {
+        steps: [
+          {
+            name: 'Office head',
+            approvers: [{ kind: 'office_head' }],
+            mode: 'any',
+            minApprovals: 1,
+            slaHours: null,
+            onTimeout: 'remind',
+          },
+        ],
+      },
+    },
+    {
+      id: id('ca13'),
+      name: 'Corrections — manager',
+      subjectType: 'regularization',
+      isDefault: true,
+      archivedAt: null,
+      spec: {
+        steps: [
+          {
+            name: 'Manager',
+            approvers: [{ kind: 'manager' }, { kind: 'org_unit_head' }],
+            mode: 'quorum',
+            minApprovals: 1,
+            slaHours: 24,
+            onTimeout: 'auto_approve',
+          },
+        ],
+      },
+    },
+  ]
+
+  /** Exactly one default per subject type, which is what `clearDefaultChain` keeps true. */
+  const clearDefaultChain = (subjectType: string, except: string) => {
+    for (const chain of chains) {
+      if (chain.subjectType === subjectType && chain.id !== except) chain.isDefault = false
+    }
+  }
+
   const delegations: Array<Record<string, unknown>> = []
 
   const approvalRequests = [
@@ -728,8 +1252,8 @@ export function createMockHrApi() {
       subjectType: 'regularization' as const,
       workspaceId: '',
       subjectId: id('c002'),
-      summary: `Correction for ${day(-1)}`,
-      summaryParams: { date: day(-1) } as Record<string, string | number> | null,
+      summary: `Correction for ${WD[1]}`,
+      summaryParams: { date: WD[1]! } as Record<string, string | number> | null,
       status: 'pending' as string,
       currentStep: 0,
       requestedBy: null,
@@ -778,7 +1302,128 @@ export function createMockHrApi() {
       createdAt: iso(),
       updatedAt: iso(),
     },
+    // The row `f003` in the approvals inbox refers to. It had no request behind it, so the decided
+    // tab named a subject nothing could open — and `withdrawn`, which only an approved request can
+    // reach, was unreachable in the mock.
+    {
+      id: id('c003'),
+      workspaceId: '',
+      personId: people[0]!.id,
+      leaveTypeId: id('b001'),
+      startsOn: day(-20),
+      endsOn: day(-20),
+      startPart: 'full',
+      endPart: 'full',
+      hours: null,
+      workingDays: 1,
+      minutes: 480,
+      status: 'approved',
+      reason: null,
+      documentFileId: null,
+      approvalRequestId: id('f003'),
+      decidedAt: iso(19 * 86_400_000),
+      createdAt: iso(20 * 86_400_000),
+      updatedAt: iso(19 * 86_400_000),
+    },
+    // Booked, then cancelled. The ledger below carries its consumption *and* the reversal that
+    // undid it, rather than the consumption having quietly disappeared.
+    {
+      id: id('c004'),
+      workspaceId: '',
+      personId: people[0]!.id,
+      leaveTypeId: id('b001'),
+      startsOn: day(-45),
+      endsOn: day(-44),
+      startPart: 'full',
+      endPart: 'full',
+      hours: null,
+      workingDays: 2,
+      minutes: 2 * 480,
+      status: 'cancelled',
+      reason: null,
+      documentFileId: null,
+      approvalRequestId: null,
+      decidedAt: iso(50 * 86_400_000),
+      createdAt: iso(60 * 86_400_000),
+      updatedAt: iso(50 * 86_400_000),
+    },
   ]
+
+  /**
+   * The movements behind a balance.
+   *
+   * This is the screen somebody opens when they disagree with a number, so it has to contain the
+   * shape of the argument: an entitlement granted, months of accrual, leave spent — and a
+   * **reversal sitting beside the consumption it reverses**, because a cancelled booking that
+   * showed as a gap would misrepresent the one property the ledger exists to have. Nothing here is
+   * ever edited or removed; a mistake is another row.
+   */
+  let ledgerCounter = 0
+  const entry = (
+    personId: string,
+    leaveTypeId: string,
+    kind: LeaveLedgerEntry['kind'],
+    amountMinutes: number,
+    effectiveOn: string,
+    over: Partial<Row<LeaveLedgerEntry>> = {},
+  ): Row<LeaveLedgerEntry> => ({
+    id: id(`1ed${(++ledgerCounter).toString(16).padStart(3, '0')}`),
+    personId,
+    leaveTypeId,
+    kind,
+    amountMinutes,
+    effectiveOn,
+    periodYear: Number(effectiveOn.slice(0, 4)),
+    requestId: null,
+    reversesEntryId: null,
+    policyHash: null,
+    reason: null,
+    createdBy: null,
+    createdAt: iso(),
+    ...over,
+  })
+
+  const ANNUAL = id('b001')
+  const SICK = id('b002')
+  const ME = people[0]!.id
+
+  const carriedIn = entry(ME, ANNUAL, 'carry_in', 3 * 480, `${YEAR}-01-01`, {
+    reason: 'Carried forward from last year',
+  })
+  const spentThenCancelled = entry(ME, ANNUAL, 'consumption', -2 * 480, day(-45), {
+    requestId: id('c004'),
+    reason: '2 days',
+  })
+
+  const ledger: Row<LeaveLedgerEntry>[] = [
+    carriedIn,
+    entry(ME, ANNUAL, 'grant', 20 * 480, `${YEAR}-01-01`, { reason: 'Annual entitlement' }),
+    entry(ME, ANNUAL, 'accrual', 480, `${YEAR}-01-31`),
+    entry(ME, ANNUAL, 'accrual', 480, `${YEAR}-02-28`),
+    entry(ME, ANNUAL, 'accrual', 480, `${YEAR}-03-31`),
+    // The carry-forward deadline came and went, and what was left of last year lapsed.
+    entry(ME, ANNUAL, 'expiry', -3 * 480, `${YEAR}-03-31`, {
+      reversesEntryId: carriedIn.id,
+      reason: 'Carry-forward deadline',
+    }),
+    spentThenCancelled,
+    entry(ME, ANNUAL, 'reversal', 2 * 480, day(-50), {
+      requestId: id('c004'),
+      reversesEntryId: spentThenCancelled.id,
+      reason: 'Request cancelled',
+    }),
+    entry(ME, ANNUAL, 'consumption', -480, day(-20), { requestId: id('c003'), reason: '1 day' }),
+    entry(ME, ANNUAL, 'adjustment', 480, day(-10), {
+      reason: 'Public holiday fell inside an approved request',
+    }),
+    entry(ME, SICK, 'grant', 10 * 480, `${YEAR}-01-01`, { reason: 'Annual entitlement' }),
+  ]
+  // Everybody else gets their entitlement and nothing else: a balance of zero for three of four
+  // people would read as a broken tile rather than as an untouched allowance.
+  for (const other of people.slice(1)) {
+    ledger.push(entry(other.id, ANNUAL, 'grant', 20 * 480, `${YEAR}-01-01`, { reason: 'Annual entitlement' }))
+    ledger.push(entry(other.id, SICK, 'grant', 10 * 480, `${YEAR}-01-01`, { reason: 'Annual entitlement' }))
+  }
 
   return {
     people: {
@@ -866,6 +1511,52 @@ export function createMockHrApi() {
           phone: input.phone ?? null,
         }
       },
+      /**
+       * Behind a second permission, and never folded into `Person`.
+       *
+       * Returns an empty record rather than refusing when nothing is on file: "nothing recorded" is
+       * an ordinary answer and a 404 would make the section look broken for most of the directory.
+       */
+      sensitive: {
+        get: async ({ workspaceId, personId }: { workspaceId: string; personId: string }) => {
+          const row = sensitive.find((x) => x.personId === personId)
+          return {
+            workspaceId,
+            personId,
+            nationalId: row?.nationalId ?? null,
+            birthDate: row?.birthDate ?? null,
+            iban: row?.iban ?? null,
+            emergencyContact: row?.emergencyContact ?? null,
+          }
+        },
+
+        update: async (input: {
+          workspaceId: string
+          personId: string
+          nationalId?: string | null
+          birthDate?: string | null
+          iban?: string | null
+          emergencyContact?: PersonSensitive['emergencyContact']
+        }) => {
+          let row = sensitive.find((x) => x.personId === input.personId)
+          if (!row) {
+            row = {
+              personId: input.personId,
+              nationalId: null,
+              birthDate: null,
+              iban: null,
+              emergencyContact: null,
+            }
+            sensitive.push(row)
+          }
+          if (input.nationalId !== undefined) row.nationalId = input.nationalId
+          if (input.birthDate !== undefined) row.birthDate = input.birthDate
+          if (input.iban !== undefined) row.iban = input.iban
+          if (input.emergencyContact !== undefined) row.emergencyContact = input.emergencyContact
+          return { ...row, workspaceId: input.workspaceId }
+        },
+      },
+
       offboard: async (input: { workspaceId: string; personId: string; on: string }) => {
         const found = people.find((p) => p.id === input.personId) ?? people[0]!
         found.status = 'terminated'
@@ -874,23 +1565,270 @@ export function createMockHrApi() {
     },
 
     employment: {
-      current: async ({ workspaceId, personId }: { workspaceId: string; personId: string }) => ({
-        id: id('ee01'),
-        workspaceId,
-        personId,
-        effectiveFrom: day(-400),
-        effectiveTo: null,
-        orgUnitId: null,
-        positionId: null,
-        legalEntityId: null,
-        costCenterId: null,
-        managerPersonId: people.find((x) => x.id !== personId)?.id ?? null,
-        employmentType: 'full_time' as const,
-        fte: 1,
-        contractHoursWeek: 40,
-        reason: null,
-        createdAt: iso(),
-      }),
+      /**
+       * The open row, or null.
+       *
+       * Read out of the same table the org chart counts rather than synthesised beside it — a
+       * person's department on their own page and the headcount on the chart have to be the same
+       * fact. Null is an ordinary answer: a record created a minute ago has no employment yet.
+       */
+      current: async ({ workspaceId, personId }: { workspaceId: string; personId: string }) => {
+        const row = employments.find((e) => e.personId === personId && e.effectiveTo === null)
+        return row ? { ...row, workspaceId } : null
+      },
+
+      /** Newest first: the question this answers is "what changed", and the last change is the news. */
+      history: async ({ workspaceId, personId }: { workspaceId: string; personId: string }) =>
+        employments
+          .filter((e) => e.personId === personId)
+          .slice()
+          .sort((a, b) => b.effectiveFrom.localeCompare(a.effectiveFrom))
+          .map((e) => ({ ...e, workspaceId })),
+
+      /**
+       * Closes the open row and opens a new one. Never an update.
+       *
+       * Overwriting would lose the answer to "who did she report to in March", which is the
+       * question a leave approval from March needs — so the previous row is closed the day before
+       * the new one starts and everything unstated is carried forward from it.
+       */
+      change: async (input: {
+        workspaceId: string
+        personId: string
+        effectiveFrom: string
+        orgUnitId?: string | null
+        positionId?: string | null
+        legalEntityId?: string | null
+        costCenterId?: string | null
+        managerPersonId?: string | null
+        employmentType?: Employment['employmentType']
+        fte?: number
+        contractHoursWeek?: number | null
+        reason?: string | null
+      }) => {
+        const open = employments.find((e) => e.personId === input.personId && e.effectiveTo === null)
+        if (open) {
+          const dayBefore = new Date(Date.parse(`${input.effectiveFrom}T00:00:00Z`) - 86_400_000)
+          open.effectiveTo = dayBefore.toISOString().slice(0, 10)
+        }
+        const created: Row<Employment> = {
+          id: crypto.randomUUID(),
+          personId: input.personId,
+          effectiveFrom: input.effectiveFrom,
+          effectiveTo: null,
+          orgUnitId: input.orgUnitId !== undefined ? input.orgUnitId : (open?.orgUnitId ?? null),
+          positionId: input.positionId !== undefined ? input.positionId : (open?.positionId ?? null),
+          legalEntityId:
+            input.legalEntityId !== undefined ? input.legalEntityId : (open?.legalEntityId ?? null),
+          costCenterId: input.costCenterId !== undefined ? input.costCenterId : (open?.costCenterId ?? null),
+          managerPersonId:
+            input.managerPersonId !== undefined ? input.managerPersonId : (open?.managerPersonId ?? null),
+          employmentType: input.employmentType ?? open?.employmentType ?? 'full_time',
+          fte: input.fte ?? open?.fte ?? 1,
+          contractHoursWeek:
+            input.contractHoursWeek !== undefined
+              ? input.contractHoursWeek
+              : (open?.contractHoursWeek ?? null),
+          reason: input.reason ?? null,
+          createdAt: iso(),
+        }
+        employments.push(created)
+        return { ...created, workspaceId: input.workspaceId }
+      },
+    },
+
+    documents: {
+      list: async ({ workspaceId, personId }: { workspaceId: string; personId: string }) =>
+        documents
+          .filter((d) => d.personId === personId)
+          .slice()
+          .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+          .map((d) => ({ ...d, workspaceId })),
+
+      attach: async (input: {
+        workspaceId: string
+        personId: string
+        fileId: string
+        name: string
+        kind?: string
+        issuedOn?: string | null
+        expiresOn?: string | null
+      }) => {
+        const created: Row<PersonDocument> = {
+          id: crypto.randomUUID(),
+          personId: input.personId,
+          fileId: input.fileId,
+          name: input.name,
+          kind: input.kind ?? 'other',
+          issuedOn: input.issuedOn ?? null,
+          expiresOn: input.expiresOn ?? null,
+          uploadedBy: null,
+          createdAt: iso(),
+        }
+        documents.push(created)
+        return { ...created, workspaceId: input.workspaceId }
+      },
+
+      remove: async ({ documentId }: { workspaceId: string; personId: string; documentId: string }) => {
+        const at = documents.findIndex((d) => d.id === documentId)
+        if (at < 0) refuse('NOT_FOUND', 'Document not found')
+        documents.splice(at, 1)
+        return { ok: true as const }
+      },
+    },
+
+    org: {
+      units: {
+        tree: async ({
+          workspaceId,
+          includeArchived = false,
+        }: {
+          workspaceId: string
+          includeArchived?: boolean
+        }) =>
+          orgUnits
+            .filter((u) => includeArchived || u.archivedAt === null)
+            .slice()
+            .sort((a, b) => a.path.localeCompare(b.path))
+            .map((u) => ({ ...u, workspaceId, headcount: unitHeadcount(u.id) })),
+
+        create: async (input: {
+          workspaceId: string
+          name: string
+          parentId?: string | null
+          code?: string | null
+          headPersonId?: string | null
+        }) => {
+          const unitId = crypto.randomUUID()
+          const created: Row<OrgUnit> = {
+            id: unitId,
+            parentId: input.parentId ?? null,
+            path: pathFor(input.parentId ?? null, unitId),
+            name: input.name,
+            code: input.code ?? null,
+            headPersonId: input.headPersonId ?? null,
+            archivedAt: null,
+          }
+          orgUnits.push(created)
+          return { ...created, workspaceId: input.workspaceId }
+        },
+
+        update: async (input: {
+          workspaceId: string
+          unitId: string
+          name?: string
+          code?: string | null
+          headPersonId?: string | null
+        }) => {
+          const found = orgUnits.find((u) => u.id === input.unitId)
+          if (!found) refuse('NOT_FOUND', 'Department not found')
+          if (input.name !== undefined) found.name = input.name
+          if (input.code !== undefined) found.code = input.code
+          if (input.headPersonId !== undefined) found.headPersonId = input.headPersonId
+          return { ...found, workspaceId: input.workspaceId }
+        },
+
+        /**
+         * Reparent a unit and rewrite the path of everything beneath it.
+         *
+         * Moving a unit under its own descendant would detach that branch from the root — the one
+         * way an ltree hierarchy is corrupted beyond repair by an ordinary drag — so it is refused
+         * before anything is written, exactly as the router refuses it.
+         */
+        move: async (input: { workspaceId: string; unitId: string; parentId: string | null }) => {
+          const unit = orgUnits.find((u) => u.id === input.unitId)
+          if (!unit) refuse('NOT_FOUND', 'Department not found')
+          let parentPath: string | null = null
+          if (input.parentId) {
+            const target = orgUnits.find((u) => u.id === input.parentId)
+            if (!target) refuse('NOT_FOUND', 'Department not found')
+            if (target.path === unit.path || target.path.startsWith(`${unit.path}.`)) {
+              refuse('BAD_REQUEST', 'A department cannot be moved underneath itself.')
+            }
+            parentPath = target.path
+          }
+          const label = unit.path.split('.').pop()!
+          const nextPath = parentPath ? `${parentPath}.${label}` : label
+          // The whole subtree in one pass, the way the server's single UPDATE does it — walking
+          // and reparenting one node at a time is where a half-moved branch comes from.
+          const moved = descendants(unit.id)
+          const wasPath = unit.path
+          for (const row of moved) row.path = `${nextPath}${row.path.slice(wasPath.length)}`
+          unit.parentId = input.parentId
+          return moved
+            .slice()
+            .sort((a, b) => a.path.localeCompare(b.path))
+            .map((u) => ({ ...u, workspaceId: input.workspaceId }))
+        },
+
+        archive: async ({ unitId }: { workspaceId: string; unitId: string }) => {
+          const found = orgUnits.find((u) => u.id === unitId)
+          if (!found) refuse('NOT_FOUND', 'Department not found')
+          const held = unitHeadcount(unitId)
+          if (held > 0) {
+            refuse('CONFLICT', `${held} people still report into this department. Move them first.`)
+          }
+          found.archivedAt = iso()
+          return { ok: true as const }
+        },
+      },
+
+      positions: {
+        list: async ({
+          workspaceId,
+          includeArchived = false,
+        }: {
+          workspaceId: string
+          includeArchived?: boolean
+        }) =>
+          positions
+            .filter((row) => includeArchived || row.archivedAt === null)
+            .map((row) => ({ ...row, workspaceId })),
+
+        create: async (input: {
+          workspaceId: string
+          title: string
+          code?: string | null
+          jobFamily?: string | null
+          level?: string | null
+        }) => {
+          const created: Row<Position> = {
+            id: crypto.randomUUID(),
+            title: input.title,
+            code: input.code ?? null,
+            jobFamily: input.jobFamily ?? null,
+            level: input.level ?? null,
+            archivedAt: null,
+          }
+          positions.push(created)
+          return { ...created, workspaceId: input.workspaceId }
+        },
+
+        update: async (input: {
+          workspaceId: string
+          positionId: string
+          title?: string
+          code?: string | null
+          jobFamily?: string | null
+          level?: string | null
+        }) => {
+          const found = positions.find((row) => row.id === input.positionId)
+          if (!found) refuse('NOT_FOUND', 'Position not found')
+          if (input.title !== undefined) found.title = input.title
+          if (input.code !== undefined) found.code = input.code
+          if (input.jobFamily !== undefined) found.jobFamily = input.jobFamily
+          if (input.level !== undefined) found.level = input.level
+          return { ...found, workspaceId: input.workspaceId }
+        },
+
+        // No refusal here: the router archives a position without checking who holds it.
+        archive: async ({ positionId }: { workspaceId: string; positionId: string }) => {
+          const found = positions.find((row) => row.id === positionId)
+          if (!found) refuse('NOT_FOUND', 'Position not found')
+          found.archivedAt = iso()
+          return { ok: true as const }
+        },
+      },
     },
 
     offices: {
@@ -1593,28 +2531,102 @@ export function createMockHrApi() {
         },
       },
       balance: {
-        /** One row per type somebody can still book, so the tiles say as much as the picker offers. */
-        get: async ({ personId }: { personId?: string }) =>
-          leaveTypes
+        /**
+         * Summed from the ledger, never stored.
+         *
+         * The ledger screen exists to explain this number, so a tile that stated its own would
+         * contradict the screen that opens from it — on first click, which is the worst place for
+         * two numbers to disagree.
+         */
+        get: async ({ personId, periodYear }: { personId?: string; periodYear?: number }) => {
+          const who = personId ?? people[0]!.id
+          const year = periodYear ?? YEAR
+          return leaveTypes
             .filter((lt) => lt.archivedAt === null)
-            .map((lt, index) => {
-              const balanceMinutes = [20, 10, 0][index] ?? 0
-              const pending = index === 0 ? 5 : 0
+            .map((lt) => {
+              const rows = ledger.filter(
+                (e) => e.personId === who && e.leaveTypeId === lt.id && e.periodYear === year,
+              )
+              const balanceMinutes = rows.reduce((sum, e) => sum + e.amountMinutes, 0)
+              const mine = leaveRequests.filter(
+                (r) => r.personId === who && r.leaveTypeId === lt.id,
+              ) as Array<Record<string, unknown>>
+              const minutesOf = (status: string) =>
+                mine.filter((r) => r.status === status).reduce((sum, r) => sum + Number(r.minutes ?? 0), 0)
+              const pendingMinutes = minutesOf('pending')
+              const bookedMinutes = minutesOf('approved')
+              const perUnit = lt.unit === 'hour' ? 60 : 480
               return {
-                personId: personId ?? people[0]!.id,
+                personId: who,
                 leaveTypeId: lt.id,
                 leaveTypeName: lt.name,
                 unit: lt.unit,
-                periodYear: YEAR,
-                balanceMinutes: balanceMinutes * 480,
-                bookedMinutes: 0,
-                pendingMinutes: pending * 480,
-                availableMinutes: (balanceMinutes - pending) * 480,
-                balance: balanceMinutes,
-                available: balanceMinutes - pending,
+                periodYear: year,
+                balanceMinutes,
+                bookedMinutes,
+                pendingMinutes,
+                availableMinutes: balanceMinutes - pendingMinutes,
+                balance: Math.round((balanceMinutes / perUnit) * 100) / 100,
+                available: Math.round(((balanceMinutes - pendingMinutes) / perUnit) * 100) / 100,
               }
-            }),
+            })
+        },
       },
+
+      ledger: {
+        /** Newest first, so the movement somebody is arguing about is the one at the top. */
+        list: async ({
+          workspaceId,
+          personId,
+          leaveTypeId,
+          periodYear,
+          limit = 50,
+        }: {
+          workspaceId: string
+          personId: string
+          leaveTypeId?: string
+          periodYear?: number
+          limit?: number
+        }) => {
+          const items = ledger
+            .filter(
+              (e) =>
+                e.personId === personId &&
+                (!leaveTypeId || e.leaveTypeId === leaveTypeId) &&
+                (periodYear === undefined || e.periodYear === periodYear),
+            )
+            .slice()
+            .sort((a, b) => b.effectiveOn.localeCompare(a.effectiveOn) || b.id.localeCompare(a.id))
+          return {
+            items: items.slice(0, limit).map((e) => ({ ...e, workspaceId })),
+            nextCursor: null,
+            total: items.length,
+          }
+        },
+      },
+
+      /** Appends. There is no edit and no delete — a wrong adjustment is corrected by another row. */
+      adjust: async (input: {
+        workspaceId: string
+        personId: string
+        leaveTypeId: string
+        kind?: LeaveLedgerEntry['kind']
+        amountMinutes: number
+        effectiveOn: string
+        reason: string
+      }) => {
+        const created = entry(
+          input.personId,
+          input.leaveTypeId,
+          input.kind ?? 'adjustment',
+          input.amountMinutes,
+          input.effectiveOn,
+          { reason: input.reason },
+        )
+        ledger.push(created)
+        return { ...created, workspaceId: input.workspaceId }
+      },
+
       requests: {
         list: async ({ workspaceId }: { workspaceId: string }) => ({
           items: leaveRequests.map((r) => ({ ...r, workspaceId })),
@@ -1672,9 +2684,29 @@ export function createMockHrApi() {
           leaveRequests.push(row)
           return row
         },
+        /**
+         * Two end states, not one, and each refuses differently.
+         *
+         * `withdrawn` is the requester taking approved leave back and `cancelled` is a request that
+         * never got that far — telling somebody their own withdrawal was "already cancelled" is a
+         * small lie about who did what, which is why the router carries a reason beside each
+         * sentence rather than one sentence for both.
+         *
+         * The old version fell back to `leaveRequests[0]` when the id did not match, so an unknown
+         * id cancelled somebody else's leave and reported success.
+         */
         cancel: async ({ requestId }: { workspaceId: string; requestId: string }) => {
-          const row = leaveRequests.find((r) => r.id === requestId) ?? leaveRequests[0]!
-          row.status = 'cancelled'
+          const row = leaveRequests.find((r) => r.id === requestId)
+          if (!row) refuse('NOT_FOUND', 'Leave request not found')
+          if (row.status === 'cancelled') {
+            refuse('CONFLICT', 'That request is already cancelled.', 'hr.leave.already_cancelled')
+          }
+          if (row.status === 'withdrawn') {
+            refuse('CONFLICT', 'That request was already withdrawn.', 'hr.leave.already_withdrawn')
+          }
+          row.status = row.status === 'approved' ? 'withdrawn' : 'cancelled'
+          row.decidedAt = iso()
+          row.updatedAt = iso()
           return { ...row }
         },
       },
@@ -1715,56 +2747,192 @@ export function createMockHrApi() {
        * constraint error, and the widget renders that sentence. A mock that accepts all four
        * leaves a probe edited into a component as the only way to reach that branch — which is
        * exactly what happened, in a file nobody meant to ship.
+       *
+       * Each carries the router's `reason` beside its sentence. The sentence is English; the reason
+       * is what a client can translate, and it reaches `data.reason` on both sides.
        */
       clockIn: async () => {
-        if (clockedInAt !== null) refuse('CONFLICT', 'You are already clocked in.')
+        if (clockedInAt !== null)
+          refuse('CONFLICT', 'You are already clocked in.', 'hr.clock.already_clocked_in')
         clockedInAt = Date.now()
         return mockPunch('in')
       },
       clockOut: async () => {
-        if (clockedInAt === null) refuse('CONFLICT', 'You are not clocked in.')
+        if (clockedInAt === null) refuse('CONFLICT', 'You are not clocked in.', 'hr.clock.not_clocked_in')
         clockedInAt = null
         onBreak = false
         return mockPunch('out')
       },
       breakStart: async () => {
-        if (clockedInAt === null) refuse('CONFLICT', 'Clock in before starting a break.')
-        if (onBreak) refuse('CONFLICT', 'You are already on a break.')
+        if (clockedInAt === null)
+          refuse('CONFLICT', 'Clock in before starting a break.', 'hr.clock.break_before_clock_in')
+        if (onBreak) refuse('CONFLICT', 'You are already on a break.', 'hr.clock.already_on_break')
         onBreak = true
         return mockPunch('break_start')
       },
       breakEnd: async () => {
-        if (!onBreak) refuse('CONFLICT', 'You are not on a break.')
+        if (!onBreak) refuse('CONFLICT', 'You are not on a break.', 'hr.clock.not_on_break')
         onBreak = false
         return mockPunch('break_end')
       },
       days: {
-        list: async ({ workspaceId }: { workspaceId: string }) => ({
-          items: [0, 1, 2, 3, 4].map((n) => ({
-            id: id(`a000${n}`),
-            workspaceId,
-            personId: people[0]!.id,
-            businessDate: day(-n),
-            scheduledMinutes: 480,
-            workedMinutes: n === 2 ? 0 : 480 + (n === 1 ? 45 : 0),
-            breakMinutes: 60,
-            overtimeMinutes: n === 1 ? 45 : 0,
-            // Null, not zero: the demo workspace has no overtime policy with an annual cap, and
-            // "no ceiling applied" is a different fact from "one applied and nothing exceeded it".
-            beyondCapMinutes: null,
-            lateMinutes: 0,
-            earlyLeaveMinutes: 0,
-            status: n === 2 ? ('leave' as const) : ('present' as const),
-            leaveRequestId: null,
-            anomalies: [],
-            firstIn: iso(n * 86_400_000),
-            lastOut: iso(n * 86_400_000 - 8 * 3600_000),
-            policyHash: null,
-            locked: false,
-            computedAt: iso(),
-          })),
-          nextCursor: null,
-        }),
+        /**
+         * A month of day sheets, built for the range asked for.
+         *
+         * The page asks for `monthRange()`, so a fixed handful of rows answered the same five days
+         * whatever it asked and left the rest of the month empty. Weekends come out of the working
+         * week; the days worth looking at are pinned to `WD`, and the totals on a day that has
+         * punches are read off them rather than invented beside them.
+         */
+        list: async ({
+          workspaceId,
+          personId,
+          from,
+          to,
+          limit = 50,
+        }: {
+          workspaceId: string
+          personId?: string
+          from: string
+          to: string
+          limit?: number
+        }) => {
+          const who = personId ?? people[0]!.id
+          const today = day(0)
+          // Built up to `limit` rather than built and then sliced: a caller that asks for a decade
+          // would otherwise materialise every day of it to return the first fifty.
+          const items = []
+          for (const date of eachDate(from, to)) {
+            if (date > today) break
+            if (items.length >= limit) break
+            items.push(attendanceDay(date, who, workspaceId))
+          }
+          return { items, nextCursor: null }
+        },
+      },
+
+      punches: {
+        list: async ({
+          workspaceId,
+          personId,
+          from,
+          to,
+          includeVoided = false,
+          limit = 50,
+        }: {
+          workspaceId: string
+          personId?: string
+          from: string
+          to: string
+          includeVoided?: boolean
+          limit?: number
+        }) => {
+          const who = personId ?? people[0]!.id
+          const items = punches
+            .filter(
+              (row) =>
+                row.personId === who &&
+                row.businessDate >= from &&
+                row.businessDate <= to &&
+                (includeVoided || row.voidedByPunchId === null),
+            )
+            .sort((a, b) => a.at.localeCompare(b.at))
+          return { items: items.slice(0, limit).map((row) => ({ ...row, workspaceId })), nextCursor: null }
+        },
+
+        /**
+         * A void writes a correcting row; it never edits or deletes the original.
+         *
+         * The correction is stamped with the original's own instant and direction and points at
+         * itself, so nothing counts it as a punch — it is there to carry the reason and to say what
+         * it replaced. That is the whole difference between a corrected timesheet and an edited one.
+         */
+        void: async ({
+          workspaceId,
+          punchId,
+          reason,
+        }: {
+          workspaceId: string
+          punchId: string
+          reason: string
+        }) => {
+          void workspaceId
+          const original = punches.find((row) => row.id === punchId)
+          if (!original) refuse('NOT_FOUND', 'Punch not found')
+          if (original.voidedByPunchId) refuse('CONFLICT', 'That punch is already voided')
+          const correction = punch(original.businessDate, '00:00', original.direction, {
+            at: original.at,
+            method: 'manual',
+            note: `Voids ${punchId}: ${reason}`,
+          })
+          correction.voidedByPunchId = correction.id
+          original.voidedByPunchId = correction.id
+          punches.push(correction)
+          return { ok: true as const }
+        },
+      },
+
+      regularizations: {
+        list: async ({
+          workspaceId,
+          personId,
+          status,
+          limit = 50,
+        }: {
+          workspaceId: string
+          personId?: string
+          status?: string[]
+          limit?: number
+        }) => {
+          const who = personId ?? people[0]!.id
+          const items = regularizations
+            .filter((row) => row.personId === who && (!status?.length || status.includes(row.status)))
+            .sort((a, b) => b.businessDate.localeCompare(a.businessDate))
+          return { items: items.slice(0, limit).map((row) => ({ ...row, workspaceId })), nextCursor: null }
+        },
+
+        request: async (input: {
+          workspaceId: string
+          personId?: string
+          businessDate: string
+          punchId?: string | null
+          proposed: Array<{ direction: string; at: string }>
+          reason: string
+        }) => {
+          const who = input.personId ?? people[0]!.id
+          const created: Row<Regularization> = {
+            id: crypto.randomUUID(),
+            personId: who,
+            businessDate: input.businessDate,
+            punchId: input.punchId ?? null,
+            proposed: input.proposed as Regularization['proposed'],
+            reason: input.reason,
+            status: 'pending',
+            approvalRequestId: crypto.randomUUID(),
+            appliedAt: null,
+            createdAt: iso(),
+          }
+          regularizations.push(created)
+          // The same engine leave uses, so the request appears in the approvals inbox rather than
+          // only in the list it was made from — one request, both screens, as the server has it.
+          approvalRequests.push({
+            id: created.approvalRequestId!,
+            workspaceId: '',
+            subjectType: 'regularization' as const,
+            subjectId: created.id,
+            summary: `Correction for ${input.businessDate}`,
+            summaryParams: { date: input.businessDate },
+            status: 'pending',
+            currentStep: 0,
+            requestedBy: null,
+            requesterPersonId: who,
+            requesterName: people.find((x) => x.id === who)?.displayName ?? '',
+            requestedAt: iso(),
+            decidedAt: null,
+            steps: [],
+          })
+          return { ...created, workspaceId: input.workspaceId }
+        },
       },
 
       schedules: {
@@ -1869,6 +3037,76 @@ export function createMockHrApi() {
       },
     },
 
+    periods: {
+      list: async ({
+        workspaceId,
+        kind,
+        limit = 50,
+      }: {
+        workspaceId: string
+        kind?: string
+        limit?: number
+      }) => {
+        const items = periods
+          .filter((row) => !kind || row.kind === kind)
+          .slice()
+          .sort((a, b) => b.startsOn.localeCompare(a.startsOn))
+        return { items: items.slice(0, limit).map((row) => ({ ...row, workspaceId })), nextCursor: null }
+      },
+
+      create: async (input: {
+        workspaceId: string
+        kind?: Period['kind']
+        legalEntityId?: string | null
+        startsOn: string
+        endsOn: string
+      }) => {
+        if (input.endsOn < input.startsOn) refuse('BAD_REQUEST', 'A period cannot end before it starts.')
+        const created: Row<Period> = {
+          id: crypto.randomUUID(),
+          kind: input.kind ?? 'payroll',
+          legalEntityId: input.legalEntityId ?? null,
+          startsOn: input.startsOn,
+          endsOn: input.endsOn,
+          status: 'open',
+          lockedAt: null,
+          lockedBy: null,
+          note: null,
+        }
+        periods.push(created)
+        return { ...created, workspaceId: input.workspaceId }
+      },
+
+      lock: async (input: { workspaceId: string; periodId: string; note?: string | null }) => {
+        const found = periods.find((row) => row.id === input.periodId)
+        if (!found) refuse('NOT_FOUND', 'Period not found')
+        if (found.status === 'locked') refuse('CONFLICT', 'That period is already locked.')
+        found.status = 'locked'
+        found.lockedAt = iso()
+        found.note = input.note ?? null
+        return {
+          ...found,
+          workspaceId: input.workspaceId,
+          lockedDays: workingDaysIn(found.startsOn, found.endsOn),
+        }
+      },
+
+      /**
+       * Reopens it. No refusal for a period that is already open — the router has none either, and
+       * inventing one here would be a rule the server does not have.
+       */
+      unlock: async (input: { workspaceId: string; periodId: string; reason: string }) => {
+        const found = periods.find((row) => row.id === input.periodId)
+        if (!found) refuse('NOT_FOUND', 'Period not found')
+        const days = found.status === 'locked' ? workingDaysIn(found.startsOn, found.endsOn) : 0
+        found.status = 'open'
+        found.lockedAt = null
+        found.lockedBy = null
+        found.note = `Reopened: ${input.reason}`
+        return { ...found, workspaceId: input.workspaceId, unlockedDays: days }
+      },
+    },
+
     approvals: {
       /**
        * Both tabs have something in them on purpose.
@@ -1914,6 +3152,58 @@ export function createMockHrApi() {
         return { ...found, workspaceId }
       },
 
+      chains: {
+        /** Archived chains are gone from here: the list is what a request can still be routed by. */
+        list: async ({ workspaceId, subjectType }: { workspaceId: string; subjectType?: string }) =>
+          chains
+            .filter((c) => c.archivedAt === null && (!subjectType || c.subjectType === subjectType))
+            .map((c) => ({ ...c, workspaceId })),
+
+        create: async (input: {
+          workspaceId: string
+          name: string
+          subjectType: ApprovalChain['subjectType']
+          spec: ApprovalChainSpec
+          isDefault?: boolean
+        }) => {
+          const created: Row<ApprovalChain> = {
+            id: crypto.randomUUID(),
+            name: input.name,
+            subjectType: input.subjectType,
+            spec: clone(input.spec),
+            isDefault: input.isDefault ?? false,
+            archivedAt: null,
+          }
+          chains.push(created)
+          // Exactly one default per subject type: promoting this one demotes whichever held it.
+          if (created.isDefault) clearDefaultChain(created.subjectType, created.id)
+          return { ...created, workspaceId: input.workspaceId }
+        },
+
+        update: async (input: {
+          workspaceId: string
+          chainId: string
+          name?: string
+          spec?: ApprovalChainSpec
+          isDefault?: boolean
+        }) => {
+          const found = chains.find((c) => c.id === input.chainId)
+          if (!found) refuse('NOT_FOUND', 'Approval chain not found')
+          if (input.name !== undefined) found.name = input.name
+          if (input.spec !== undefined) found.spec = clone(input.spec)
+          if (input.isDefault !== undefined) found.isDefault = input.isDefault
+          if (found.isDefault) clearDefaultChain(found.subjectType, found.id)
+          return { ...found, workspaceId: input.workspaceId }
+        },
+
+        archive: async ({ chainId }: { workspaceId: string; chainId: string }) => {
+          const found = chains.find((c) => c.id === chainId)
+          if (!found) refuse('NOT_FOUND', 'Approval chain not found')
+          found.archivedAt = iso()
+          return { ok: true as const }
+        },
+      },
+
       delegations: async ({ workspaceId }: { workspaceId: string }) =>
         delegations.map((d) => ({ ...d, workspaceId })),
 
@@ -1955,25 +3245,63 @@ export function createMockHrApi() {
     },
   }
 
-  function mockPunch(direction: string) {
+  /** Kept, not just returned: expanding today's row after clocking in has to show the punch. */
+  function mockPunch(direction: Punch['direction']) {
+    const row = punch(day(0), '00:00', direction, { at: new Date().toISOString() })
+    punches.push(row)
+    return { ...row, workspaceId: '' }
+  }
+
+  /**
+   * One day's sheet, derived the way the server's is.
+   *
+   * `firstIn` and `lastOut` are read off the live punches rather than stated beside them, so a void
+   * or a fresh clock-in moves the header of the panel it sits above instead of contradicting it.
+   */
+  function attendanceDay(date: string, personId: string, workspaceId: string) {
+    const weekday = WEEKDAYS[new Date(`${date}T00:00:00Z`).getUTCDay()]!
+    const weekend = weekday === 'sat' || weekday === 'sun'
+    const live = punches
+      .filter((row) => row.personId === personId && row.businessDate === date && !row.voidedByPunchId)
+      .sort((a, b) => a.at.localeCompare(b.at))
+    const firstIn = live.find((row) => row.direction === 'in')?.at ?? null
+    const lastOut = [...live].reverse().find((row) => row.direction === 'out')?.at ?? null
+
+    const leave = date === WD[2]
+    // A day whose clock-out never arrived. It is the only seeded anomaly, and without one the
+    // counted badge on the row and the list of sentences inside the panel are both unreachable.
+    const unclosed = date === WD[3]
+    const overtime = date === WD[1] ? 45 : 0
+    const worked = weekend || leave ? 0 : unclosed ? 240 : 480 + overtime
+
     return {
-      id: crypto.randomUUID(),
-      workspaceId: '',
-      personId: people[0]!.id,
-      direction,
-      at: new Date().toISOString(),
-      clientReportedAt: null,
-      skewMs: null,
-      businessDate: day(0),
-      timezone: 'Europe/Istanbul',
-      method: 'web',
-      officeId: primaryOfficeId(people[0]!.id),
-      deviceId: null,
-      geo: null,
-      trust: 'trusted',
-      voidedByPunchId: null,
-      note: null,
-      createdAt: new Date().toISOString(),
+      id: id(`a${date.replaceAll('-', '')}`),
+      workspaceId,
+      personId,
+      businessDate: date,
+      scheduledMinutes: weekend ? 0 : 480,
+      workedMinutes: date === day(0) && clockedInAt === null ? 0 : worked,
+      breakMinutes: weekend || leave ? 0 : 60,
+      overtimeMinutes: overtime,
+      // Null, not zero: the demo workspace has no overtime policy with an annual cap, and
+      // "no ceiling applied" is a different fact from "one applied and nothing exceeded it".
+      beyondCapMinutes: null,
+      lateMinutes: 0,
+      earlyLeaveMinutes: 0,
+      status: weekend
+        ? ('weekend' as const)
+        : leave
+          ? ('leave' as const)
+          : unclosed || date === day(0)
+            ? ('pending' as const)
+            : ('present' as const),
+      leaveRequestId: leave ? ((leaveRequests[0]?.id as string | null) ?? null) : null,
+      anomalies: unclosed ? ['missing_clock_out'] : [],
+      firstIn,
+      lastOut: unclosed ? null : lastOut,
+      policyHash: null,
+      locked: false,
+      computedAt: iso(),
     }
   }
 }

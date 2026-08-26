@@ -18,6 +18,10 @@ import { getHrApi } from '../api-instance.js'
 import { t } from '../i18n.js'
 import { canHr } from '../permissions.js'
 import { hrKeys, isoDate } from '../query.js'
+import PersonDocumentsSection from './PersonDocumentsSection.svelte'
+import PersonJobSection from './PersonJobSection.svelte'
+import PersonSensitiveSection from './PersonSensitiveSection.svelte'
+import { explainRefusal } from './refusal.js'
 
 /**
  * One person, beside the directory rather than instead of it.
@@ -28,6 +32,12 @@ import { hrKeys, isoDate } from '../query.js'
  *
  * The record is editable here: name and contact, and ending employment. Those APIs existed before
  * this panel did; showing three fields and no actions was not a finished screen.
+ *
+ * Below the identity list the panel is three sections, each of them a permission or a capability
+ * this module declared and then reached from nowhere: the **job** and its effective-dated history,
+ * the **personal details** `hr.person.view_sensitive` exists for, and the **documents** the
+ * `documents` capability switches on. Each owns its own queries, its own four states and its own
+ * gate — the panel decides where they sit, not whether they may be seen.
  */
 interface Props {
   personId: string
@@ -53,6 +63,13 @@ const resolutionQuery = createQuery(() => ({
 }))
 const resolution = $derived(resolutionQuery.data)
 
+/**
+ * The open period, for the reporting line only.
+ *
+ * `PersonJobSection` reads the same key for everything it draws, so this is one request rather than
+ * two: what the job *is* belongs to that section, and what it implies about who somebody reports to
+ * belongs beside the office in the list below.
+ */
 const employmentQuery = createQuery(() => ({
   queryKey: hrKeys.employment(workspaceId, personId),
   enabled: Boolean(workspaceId && personId) && canHr('employmentView'),
@@ -69,27 +86,6 @@ const managerQuery = createQuery(() => ({
 
 const close = () =>
   void navigation.go(`/${workspaceSlug}/hr`, { replaceState: true, keepFocus: true, noScroll: true })
-
-/**
- * The sentence to put in front of somebody when a write here fails.
- *
- * A refusal arrives as two pieces: a machine-readable `reason` a module translates, and the
- * English sentence the router wrote for a reader. Nothing under `people.*` sends a reason today —
- * its refusals are a record that has gone and a field the server will not take — so this uses the
- * second, and only for the codes that carry a sentence somebody wrote. Everything else is machine
- * text in English: a network drop, a 500, a gateway, and `Forbidden` and `Unauthorized`, which are
- * one word each. A toast is the last place to paste any of them, so they fall back to this
- * module's own string.
- *
- * When a `people.*` refusal does grow a reason, it is read the way `ClockControls.svelte` reads a
- * punch's — keyed by the code, never by the sentence.
- */
-const READABLE = new Set(['BAD_REQUEST', 'CONFLICT', 'NOT_FOUND'])
-function explain(error: unknown, fallback: string): string {
-  const failure = error as { code?: unknown; message?: string }
-  const readable = typeof failure.code === 'string' && READABLE.has(failure.code)
-  return (readable ? failure.message : '') || fallback
-}
 
 let editing = $state(false)
 let displayName = $state('')
@@ -129,7 +125,7 @@ const save = createMutation(() => ({
     void queryClient.invalidateQueries({ queryKey: ['hr'] })
     editing = false
   },
-  onError: (error) => toast.error(explain(error, t('person_save_error'))),
+  onError: (error) => toast.error(explainRefusal(error, t('person_save_error'))),
   onSettled: () => {
     saving = false
   },
@@ -158,7 +154,7 @@ const offboard = createMutation(() => ({
     void queryClient.invalidateQueries({ queryKey: ['hr'] })
     offboarding = false
   },
-  onError: (error) => toast.error(explain(error, t('person_offboard_error'))),
+  onError: (error) => toast.error(explainRefusal(error, t('person_offboard_error'))),
   onSettled: () => {
     ending = false
   },
@@ -169,23 +165,6 @@ const submitOffboard = () => {
   ending = true
   offboard.mutate()
 }
-
-/**
- * The employment types the server can send, as words.
- *
- * A map rather than a chain: the parameter used to be called `t`, which shadowed the message
- * function and turned every branch into a call on a string. An unknown value falls through to
- * itself, so a type added on the server shows up as its raw name rather than as nothing.
- */
-const EMPLOYMENT_KEYS: Record<string, string> = {
-  full_time: 'employment_full_time',
-  part_time: 'employment_part_time',
-  contract: 'employment_contract',
-  intern: 'employment_intern',
-  temporary: 'employment_temporary',
-  freelance: 'employment_freelance',
-}
-const typeLabel = (value: string) => (EMPLOYMENT_KEYS[value] ? t(EMPLOYMENT_KEYS[value]) : value)
 
 /**
  * The clock where this person works, in the reader's language.
@@ -278,10 +257,6 @@ const left = $derived(person?.status === 'terminated')
         <dt>{t('manager')}</dt>
         <dd>{managerQuery.data.displayName}</dd>
       {/if}
-      {#if employment}
-        <dt>{t('employment')}</dt>
-        <dd>{typeLabel(employment.employmentType)}</dd>
-      {/if}
     </dl>
 
     <Badge tone={person.status === 'active' ? 'active' : person.status === 'on_leave' ? 'upcoming' : 'grey'}
@@ -295,6 +270,10 @@ const left = $derived(person?.status === 'terminated')
               ? t('status_offboarding')
               : t('status_terminated')}</Badge
     >
+
+    <PersonJobSection {personId} {workspaceId} personName={person.displayName} />
+    <PersonSensitiveSection {personId} {workspaceId} personName={person.displayName} />
+    <PersonDocumentsSection {personId} {workspaceId} personName={person.displayName} />
     </div>
   {:else if personQuery.isError}
     <!--

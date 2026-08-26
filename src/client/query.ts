@@ -50,6 +50,27 @@ export const hrKeys = {
   entities: (ws: string) => ['hr', 'entities', ws] as const,
   officePeople: (ws: string, officeId: string, primaryOnly: boolean) =>
     ['hr', 'office-people', ws, officeId, primaryOnly ? 'primary' : 'all'] as const,
+  /**
+   * The ledger is keyed by the leave type *and* the year as well as the person: the panel anchors
+   * its running balance on the balance the server computed for one entitlement year, so serving it
+   * another year's entries from cache would draw a column of numbers reconciling to nothing.
+   */
+  leaveLedger: (ws: string, personId: string, leaveTypeId: string, periodYear: number) =>
+    ['hr', 'leave-ledger', ws, personId, leaveTypeId, periodYear] as const,
+  employmentHistory: (ws: string, personId: string) => ['hr', 'employment-history', ws, personId] as const,
+  documents: (ws: string, personId: string) => ['hr', 'documents', ws, personId] as const,
+  /** Fetched only where the viewer holds `hr.person.view_sensitive`, so it is its own entry. */
+  sensitive: (ws: string, personId: string) => ['hr', 'sensitive', ws, personId] as const,
+  /**
+   * The org editor asks for archived units too, so it cannot share `orgUnits` with the chart —
+   * a toggle that changes what a query asks for has to change the key, or the cache answers the
+   * question it was asked last time and the switch appears to do nothing.
+   */
+  orgUnitsAll: (ws: string) => ['hr', 'org-units', ws, 'with-archived'] as const,
+  positions: (ws: string) => ['hr', 'positions', ws, 'with-archived'] as const,
+  /** Every period in one read: `periods.list` returns no cursor, so there is nothing to page. */
+  periods: (ws: string) => ['hr', 'periods', ws] as const,
+  approvalChains: (ws: string) => ['hr', 'approval-chains', ws] as const,
 } as const
 
 /** `YYYY-MM-DD` for a date, in the viewer's own zone rather than UTC. */

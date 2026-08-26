@@ -76,6 +76,16 @@ export const hrClientModule = defineClientModule({
       capability: HR_CAPABILITIES.offices,
     },
     {
+      path: '/hr/org',
+      component: () => import('./pages/OrgPage.svelte'),
+      get title() {
+        return t('org_title')
+      },
+      // No capability: departments and positions are part of `core`, and `hr.org.view` is a default
+      // member permission — the chart is the one HR screen most of a company opens.
+      permission: HR_PERMISSIONS.orgView,
+    },
+    {
       // Last: the shell matches in order, and `/hr` would otherwise swallow the paths above it.
       path: '/hr',
       component: () => import('./pages/DirectoryPage.svelte'),
@@ -295,6 +305,32 @@ export const hrClientModule = defineClientModule({
       capability: HR_CAPABILITIES.attendance,
       order: 40,
       component: () => import('./settings/SchedulesSettings.svelte'),
+    },
+    {
+      id: 'approvals',
+      get label() {
+        return t('settings_approvals')
+      },
+      icon: 'list-checks',
+      scope: 'workspace',
+      permission: HR_PERMISSIONS.approvalManage,
+      capability: HR_CAPABILITIES.approvals,
+      order: 50,
+      component: () => import('./settings/ApprovalsSettings.svelte'),
+    },
+    {
+      // After approvals rather than beside it: locking a month is the last thing an admin does in a
+      // cycle, and it is the one entry here that stops other people's screens changing.
+      id: 'periods',
+      get label() {
+        return t('settings_periods')
+      },
+      icon: 'lock',
+      scope: 'workspace',
+      permission: HR_PERMISSIONS.periodManage,
+      capability: HR_CAPABILITIES.periods,
+      order: 60,
+      component: () => import('./settings/PeriodsSettings.svelte'),
     },
   ],
 

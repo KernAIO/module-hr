@@ -70,4 +70,11 @@ const active = (path: string) => pathname === `/${workspaceSlug}${path}`
       label={t('offices_title')}
     />
   {/if}
+  <!--
+    No capability: departments and positions belong to the module's always-on core, and
+    `hr.org.view` is a default member permission — the chart is the HR screen most of a company
+    opens. A route with no entry here is reachable only by typing its URL, which is the same as not
+    shipping it.
+  -->
+  <SidebarItem href={href('/hr/org')} icon="git-branch" active={active('/hr/org')} label={t('org_title')} />
 </SidebarGroup>
