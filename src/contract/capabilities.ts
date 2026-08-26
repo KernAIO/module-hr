@@ -133,6 +133,23 @@ export const hrCapabilities = defineCapabilities([
 export type HrCapabilityId = (typeof hrCapabilities)[number]['id']
 
 /**
+ * The message ids a screen reads a capability's `label` and `description` through.
+ *
+ * `CapabilityDef.label` is documented as "an i18n message id or an English fallback", and putting
+ * the id *in* the field would leave the fallback nowhere: core's module admin and the shell's mock
+ * read this manifest raw, with no HR bundle merged, so they would print `hr.cap_leave` at a person.
+ * So the literals above stay the fallback and the id is derived from the capability's own id — a
+ * capability added to the list becomes translatable the moment somebody writes its two strings, and
+ * nothing that parses this list sees a new field.
+ *
+ * The `hr.` prefix is written out rather than left to `scopedT`, because a caller has to be able to
+ * tell a resolved string from a key that resolved to itself, and `t()` answers a miss with the
+ * *namespaced* key.
+ */
+export const capabilityLabelKey = (id: string) => `hr.cap_${id}`
+export const capabilityDescriptionKey = (id: string) => `hr.cap_${id}_desc`
+
+/**
  * Which procedures sit behind which capability.
  *
  * Declared as data because a missing `requiresCapability` is invisible: the procedure compiles,

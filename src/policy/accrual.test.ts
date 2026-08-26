@@ -4,6 +4,7 @@ import {
   accrueForPeriod,
   carryExpiryDate,
   carryForward,
+  carryHasLapsed,
   completedMonths,
   completedYears,
   daysPerYearFor,
@@ -175,10 +176,15 @@ describe('accrueForPeriod', () => {
 })
 
 describe('carryForward', () => {
-  const policy = { maxMinutes: 5 * DAY, expiresAfterMonths: 3 }
+  const policy = { maxDays: 5, minutesPerDay: DAY, expiresAfterMonths: 3 }
+  const yearStart = '2026-01-01'
 
   it('carries everything under the cap', () => {
-    expect(carryForward(3 * DAY, policy)).toEqual({ carriedMinutes: 3 * DAY, expiredMinutes: 0 })
+    expect(carryForward(3 * DAY, policy, yearStart)).toEqual({
+      carriedMinutes: 3 * DAY,
+      expiredMinutes: 0,
+      expiresOn: '2026-04-01',
+    })
   })
 
   /**
@@ -187,39 +193,229 @@ describe('carryForward', () => {
    * in any leave system.
    */
   it('expires the excess and says how much', () => {
-    expect(carryForward(9 * DAY, policy)).toEqual({
+    expect(carryForward(9 * DAY, policy, yearStart)).toEqual({
       carriedMinutes: 5 * DAY,
       expiredMinutes: 4 * DAY,
+      expiresOn: '2026-04-01',
+    })
+  })
+
+  /**
+   * The cap is written in days and the balance is kept in minutes, so something has to convert it —
+   * and assuming eight hours is wrong in both directions. On a seven-and-a-half-hour day a
+   * five-day cap read as 2400 minutes never bites; on a nine-hour day it expires leave somebody
+   * was entitled to keep.
+   */
+  it('converts the cap at the day length it is given', () => {
+    const shortDay = { maxDays: 5, minutesPerDay: 450, expiresAfterMonths: null }
+    expect(carryForward(2400, shortDay, yearStart)).toEqual({
+      carriedMinutes: 2250,
+      expiredMinutes: 150,
+      expiresOn: null,
+    })
+
+    const longDay = { maxDays: 5, minutesPerDay: 540, expiresAfterMonths: null }
+    expect(carryForward(2700, longDay, yearStart)).toEqual({
+      carriedMinutes: 2700,
+      expiredMinutes: 0,
+      expiresOn: null,
     })
   })
 
   it('carries nothing from a zero or negative balance', () => {
-    expect(carryForward(0, policy).carriedMinutes).toBe(0)
-    expect(carryForward(-DAY, policy)).toEqual({ carriedMinutes: 0, expiredMinutes: 0 })
+    expect(carryForward(0, policy, yearStart).carriedMinutes).toBe(0)
+    expect(carryForward(-DAY, policy, yearStart)).toEqual({
+      carriedMinutes: 0,
+      expiredMinutes: 0,
+      expiresOn: null,
+    })
   })
 
   it('expires everything when the cap is zero', () => {
-    expect(carryForward(4 * DAY, { maxMinutes: 0, expiresAfterMonths: null })).toEqual({
-      carriedMinutes: 0,
-      expiredMinutes: 4 * DAY,
-    })
+    expect(
+      carryForward(4 * DAY, { maxDays: 0, minutesPerDay: DAY, expiresAfterMonths: null }, yearStart),
+    ).toEqual({ carriedMinutes: 0, expiredMinutes: 4 * DAY, expiresOn: null })
   })
 })
 
 describe('carryExpiryDate', () => {
   it('measures from the start of the new year, not the carry date', () => {
-    expect(carryExpiryDate('2026-01-01', { maxMinutes: 0, expiresAfterMonths: 3 })).toBe('2026-04-01')
+    expect(carryExpiryDate('2026-01-01', 3)).toBe('2026-04-01')
   })
   it('crosses a year boundary', () => {
-    expect(carryExpiryDate('2026-11-01', { maxMinutes: 0, expiresAfterMonths: 4 })).toBe('2027-03-01')
+    expect(carryExpiryDate('2026-11-01', 4)).toBe('2027-03-01')
   })
   it('clamps to a short month', () => {
     // 31 January plus one month is 28 February, not 31 February.
-    expect(carryExpiryDate('2026-01-31', { maxMinutes: 0, expiresAfterMonths: 1 })).toBe('2026-02-28')
-    expect(carryExpiryDate('2024-01-31', { maxMinutes: 0, expiresAfterMonths: 1 })).toBe('2024-02-29')
+    expect(carryExpiryDate('2026-01-31', 1)).toBe('2026-02-28')
+    expect(carryExpiryDate('2024-01-31', 1)).toBe('2024-02-29')
   })
   it('is null when carried leave never expires', () => {
-    expect(carryExpiryDate('2026-01-01', { maxMinutes: 0, expiresAfterMonths: null })).toBeNull()
+    expect(carryExpiryDate('2026-01-01', null)).toBeNull()
+  })
+})
+
+/**
+ * The boundary is a day, and which side of it the carried leave is still usable on is the whole
+ * question — "three months to use it" has to mean the same thing to the person booking leave on
+ * the last morning as it does to the job that sweeps it away.
+ */
+describe('carryHasLapsed', () => {
+  const expiresOn = carryExpiryDate('2026-01-01', 3)
+
+  it('is still usable on the last day of the window', () => {
+    expect(carryHasLapsed('2026-03-31', expiresOn)).toBe(false)
+  })
+
+  it('has lapsed on the expiry date itself', () => {
+    expect(carryHasLapsed('2026-04-01', expiresOn)).toBe(true)
+  })
+
+  it('never lapses where nothing expires', () => {
+    expect(carryHasLapsed('2099-12-31', null)).toBe(false)
+  })
+})
+
+/**
+ * The other three frequencies.
+ *
+ * `AccrualConfig.frequency` has always offered four and the engine read it in one expression, so
+ * three of the four were a setting an admin could save and nothing would obey.
+ */
+describe('accrueForPeriod by frequency', () => {
+  const january = { from: '2026-01-01', to: '2026-01-31' }
+  const march = { from: '2026-03-01', to: '2026-03-31' }
+  const april = { from: '2026-04-01', to: '2026-04-30' }
+  /** 14 days a year, flat, so a tier never enters the arithmetic under test. */
+  const flat: AccrualPolicy = { ...TR, seniorityTiers: [] }
+  const YEAR = 14 * DAY
+
+  describe('annual', () => {
+    const annual: AccrualPolicy = { ...flat, frequency: 'annual' }
+
+    it('grants the whole year in January and nothing in the months after it', () => {
+      const jan = accrueForPeriod({ policy: annual, period: january, hiredOn: '2020-06-01', fte: 1 })
+      expect(jan.minutes).toBe(YEAR)
+      expect(accrueForPeriod({ policy: annual, period: march, hiredOn: '2020-06-01', fte: 1 }).minutes).toBe(
+        0,
+      )
+    })
+
+    it('grants a mid-year joiner the rest of the year, once', () => {
+      // 15 March to 31 December is 292 of 2026's 365 days — four fifths of the entitlement.
+      const at = accrueForPeriod({ policy: annual, period: march, hiredOn: '2026-03-15', fte: 1 })
+      expect(at.minutes).toBe(Math.round(YEAR * (292 / 365)))
+      const after = accrueForPeriod({ policy: annual, period: april, hiredOn: '2026-03-15', fte: 1 })
+      expect(after.minutes).toBe(0)
+    })
+
+    it('scales the grant by FTE', () => {
+      const half = accrueForPeriod({ policy: annual, period: january, hiredOn: '2020-06-01', fte: 0.5 })
+      expect(half.minutes).toBe(YEAR / 2)
+    })
+  })
+
+  describe('anniversary', () => {
+    const anniversary: AccrualPolicy = { ...flat, frequency: 'anniversary' }
+
+    it('grants a full year on the anniversary month and on no other', () => {
+      const on = accrueForPeriod({ policy: anniversary, period: march, hiredOn: '2020-03-15', fte: 1 })
+      expect(on.minutes).toBe(YEAR)
+      const off = accrueForPeriod({ policy: anniversary, period: april, hiredOn: '2020-03-15', fte: 1 })
+      expect(off.minutes).toBe(0)
+    })
+
+    it('grants nothing in the month somebody was hired', () => {
+      // The first anniversary is a year away; a hire date is not one.
+      const r = accrueForPeriod({ policy: anniversary, period: march, hiredOn: '2026-03-15', fte: 1 })
+      expect(r.minutes).toBe(0)
+    })
+
+    it('moves a 29 February anniversary to the 28th in a common year', () => {
+      const r = accrueForPeriod({
+        policy: anniversary,
+        period: { from: '2026-02-01', to: '2026-02-28' },
+        hiredOn: '2024-02-29',
+        fte: 1,
+      })
+      expect(r.minutes).toBe(YEAR)
+    })
+
+    it('grants nothing to somebody who left before their anniversary', () => {
+      const r = accrueForPeriod({
+        policy: anniversary,
+        period: march,
+        hiredOn: '2020-03-15',
+        terminatedOn: '2026-03-10',
+        fte: 1,
+      })
+      expect(r.minutes).toBe(0)
+    })
+  })
+
+  describe('per_hour_worked', () => {
+    const hourly: AccrualPolicy = { ...flat, frequency: 'per_hour_worked' }
+
+    it('accrues the period at the ratio of hours worked to hours scheduled', () => {
+      const full = accrueForPeriod({
+        policy: hourly,
+        period: january,
+        hiredOn: '2020-01-01',
+        fte: 1,
+        scheduledMinutes: 10_000,
+        workedMinutes: 10_000,
+      })
+      // January is 31 of 365 days at 14 days a year.
+      expect(full.minutes).toBe(Math.round((YEAR * 31) / 365))
+
+      const half = accrueForPeriod({
+        policy: hourly,
+        period: january,
+        hiredOn: '2020-01-01',
+        fte: 1,
+        scheduledMinutes: 10_000,
+        workedMinutes: 5_000,
+      })
+      expect(half.minutes).toBe(Math.round((YEAR * 31) / 365 / 2))
+      expect(half.reason).toContain('50% of scheduled hours')
+    })
+
+    it('credits hours worked beyond the schedule', () => {
+      const over = accrueForPeriod({
+        policy: hourly,
+        period: january,
+        hiredOn: '2020-01-01',
+        fte: 1,
+        scheduledMinutes: 10_000,
+        workedMinutes: 12_000,
+      })
+      expect(over.minutes).toBe(Math.round(((YEAR * 31) / 365) * 1.2))
+    })
+
+    it('accrues nothing, and says why, where nothing was scheduled', () => {
+      const r = accrueForPeriod({
+        policy: hourly,
+        period: january,
+        hiredOn: '2020-01-01',
+        fte: 1,
+        scheduledMinutes: 0,
+        workedMinutes: 600,
+      })
+      expect(r.minutes).toBe(0)
+      expect(r.reason).toContain('scheduled')
+    })
+
+    it('respects the waiting period like every other frequency', () => {
+      const r = accrueForPeriod({
+        policy: { ...hourly, waitingPeriodMonths: 6 },
+        period: january,
+        hiredOn: '2025-12-01',
+        fte: 1,
+        scheduledMinutes: 10_000,
+        workedMinutes: 10_000,
+      })
+      expect(r.minutes).toBe(0)
+    })
   })
 })
 

@@ -1,7 +1,8 @@
-import type { JobDef, Kernel } from '@kernhq/kernel'
+import type { JobDef, Kernel, Tx } from '@kernhq/kernel'
 import { and, eq, gt, gte, inArray, isNull, lte, notExists, sql } from 'drizzle-orm'
 import { alias } from 'drizzle-orm/pg-core'
-import { accrueForPeriod, carryForward } from '../policy/accrual.js'
+import { accrueForPeriod, carryExpiryDate, carryForward, carryHasLapsed } from '../policy/accrual.js'
+import { daysInMonth } from '../policy/calendar.js'
 import {
   attendanceDays,
   employments,
@@ -32,8 +33,20 @@ const AUTO_CLOCK_OUT_LOOKBACK_DAYS = 3
  * One rule runs through all of it: **a cron expression fires in UTC, and this module's users do
  * not live there.** A nightly job at 00:00 UTC closes an Amsterdam shift at 01:00 and an Istanbul
  * one at 03:00, and gets Tehran's half-hour offset wrong in a way nobody would ever guess from the
- * code. So the jobs run hourly and fan out per office, deciding for each whether *that office's*
- * local boundary has passed.
+ * code. So the two calendar jobs — `accrue-leave` and `carry-forward` — run hourly and fan out per
+ * office, asking each whether *that office's* local boundary has passed.
+ *
+ * That was the comment for months while no handler read the offices table: `accrue-leave` fired
+ * once a month and asked Postgres for `date_trunc('month', now())`, which is the database session's
+ * timezone, so a New York office was credited January's accrual at 21:00 on 31 January local. A
+ * boundary is a date in a zone, so it is `todayIn(office.timezone)` and nothing else.
+ *
+ * Running hourly means a handler is entered twenty-four times for every boundary it acts on, so
+ * each is idempotent by construction rather than by scheduling: the ledger is asked what it already
+ * holds before anything is written.
+ *
+ * `auto-clock-out` is the exception, and says so where it lives: an elapsed hour is the same hour in
+ * every zone, so an office decides which *zone* its punch is stamped in, not when the sweep fires.
  */
 export function hrJobs(): JobDef[] {
   return [
@@ -70,211 +83,310 @@ export function hrJobs(): JobDef[] {
 
     {
       /**
-       * Monthly accrual.
+       * Monthly accrual, on each office's own first of the month.
        *
-       * Runs on the 1st for the month that just ended, per office rather than once in UTC — "the
-       * month has ended" is a different moment in Istanbul and Amsterdam, and a single UTC-timed
-       * run credits one of them a day early.
+       * Hourly rather than monthly, because "the month has ended" is a different instant in Istanbul
+       * and in New York and a cron expression only knows UTC. Every office is asked what date it is
+       * standing on; the ones that have reached the 1st accrue the month behind them.
+       *
+       * Offices that turned the same month are one accrual, not one each: what a period grants
+       * depends on the period, and the office decides only *when* that period ended. Which is also
+       * why the month's bounds are arithmetic here rather than `date_trunc('month', now())` — that
+       * asked the database session's timezone, which is an accident of deployment.
        *
        * It writes through the same path `accrual.run` uses, so a scheduled credit and a manual one
        * are the same operation and cannot drift. Idempotent per person, per type, per period: a
-       * retry after a partial failure credits only what is missing.
+       * retry after a partial failure, and the twenty-three further ticks of the same local day,
+       * credit only what is missing.
        */
       name: 'accrue-leave',
-      cron: '0 2 1 * *',
+      cron: '0 * * * *',
       handler: async (_input, { kernel }) => {
         const resolve = new ResolveService()
         const policySvc = new PolicyService(resolve)
         const ledger = new LedgerService()
+        const at = new Date()
 
         for (const workspaceId of await activeWorkspaces(kernel))
           await kernel.database.withWorkspace(workspaceId, async (tx) => {
-            // The month that just ended, computed by Postgres so month lengths and leap years are
-            // its problem rather than this file's.
-            const bounds = await tx.execute<{ from: string; to: string }>(sql`
-              select (date_trunc('month', now()) - interval '1 month')::date::text as from,
-                     (date_trunc('month', now()) - interval '1 day')::date::text as to
-            `)
-            const previous = bounds.rows[0]
-            if (!previous) return
-            const { from, to } = previous
+            const turned = new Map<string, { from: string; to: string; officeIds: Set<string> }>()
+            for (const office of await officeDays(tx, workspaceId, at)) {
+              if (!office.today.endsWith('-01')) continue
+              const { from, to } = monthBefore(office.today)
+              const group = turned.get(to) ?? { from, to, officeIds: new Set<string>() }
+              group.officeIds.add(office.id)
+              turned.set(to, group)
+            }
+            if (!turned.size) return
 
             const staff = await tx
               .select()
               .from(people)
               .where(and(eq(people.workspaceId, workspaceId), inArray(people.status, ['active', 'on_leave'])))
             if (!staff.length) return
+            const everyone = staff.map((p) => p.id)
 
-            const ids = staff.map((p) => p.id)
-            const resolved = await policySvc.forPeople(tx, workspaceId, ids, 'accrual', to)
             const types = await tx
               .select()
               .from(leaveTypes)
               .where(and(eq(leaveTypes.workspaceId, workspaceId), isNull(leaveTypes.archivedAt)))
             const typeByKey = new Map(types.map((t) => [t.key, t]))
 
-            const employmentRows = await tx
-              .select()
-              .from(employments)
-              .where(
-                and(
-                  eq(employments.workspaceId, workspaceId),
-                  inArray(employments.personId, ids),
-                  isNull(employments.effectiveTo),
-                ),
+            for (const { from, to, officeIds } of turned.values()) {
+              // Resolved on the last day of the period, not today: somebody who transferred in
+              // January accrues January against the office that actually employed them for it.
+              const ids = await inOffices(resolve, tx, workspaceId, everyone, to, officeIds)
+              if (!ids.length) continue
+              const mine = new Set(ids)
+
+              const resolved = await policySvc.forPeople(tx, workspaceId, ids, 'accrual', to)
+
+              const employmentRows = await tx
+                .select()
+                .from(employments)
+                .where(
+                  and(
+                    eq(employments.workspaceId, workspaceId),
+                    inArray(employments.personId, ids),
+                    isNull(employments.effectiveTo),
+                  ),
+                )
+              const employmentBy = new Map(employmentRows.map((e) => [e.personId, e]))
+
+              const already = new Set(
+                (
+                  await tx
+                    .select({ personId: leaveLedger.personId, leaveTypeId: leaveLedger.leaveTypeId })
+                    .from(leaveLedger)
+                    .where(
+                      and(
+                        eq(leaveLedger.workspaceId, workspaceId),
+                        eq(leaveLedger.kind, 'accrual'),
+                        eq(leaveLedger.effectiveOn, to),
+                        inArray(leaveLedger.personId, ids),
+                      ),
+                    )
+                ).map((e) => `${e.personId}:${e.leaveTypeId}`),
               )
-            const employmentBy = new Map(employmentRows.map((e) => [e.personId, e]))
 
-            const already = new Set(
-              (
-                await tx
-                  .select({ personId: leaveLedger.personId, leaveTypeId: leaveLedger.leaveTypeId })
-                  .from(leaveLedger)
-                  .where(
-                    and(
-                      eq(leaveLedger.workspaceId, workspaceId),
-                      eq(leaveLedger.kind, 'accrual'),
-                      eq(leaveLedger.effectiveOn, to),
-                      inArray(leaveLedger.personId, ids),
-                    ),
-                  )
-              ).map((e) => `${e.personId}:${e.leaveTypeId}`),
-            )
+              let credited = 0
+              for (const person of staff) {
+                if (!mine.has(person.id)) continue
+                const policy = resolved.get(person.id)
+                if (!policy?.config || !person.hiredOn) continue
+                const config = policy.config as Record<string, unknown>
+                const type = typeByKey.get(config.leaveTypeKey as string)
+                if (!type || already.has(`${person.id}:${type.id}`)) continue
 
-            let credited = 0
-            for (const person of staff) {
-              const policy = resolved.get(person.id)
-              if (!policy?.config || !person.hiredOn) continue
-              const config = policy.config as Record<string, unknown>
-              const type = typeByKey.get(config.leaveTypeKey as string)
-              if (!type || already.has(`${person.id}:${type.id}`)) continue
+                const employment = employmentBy.get(person.id)
+                const result = accrueForPeriod({
+                  policy: {
+                    frequency: config.frequency as never,
+                    daysPerYear: config.daysPerYear as number,
+                    minutesPerDay: config.minutesPerDay as number,
+                    seniorityTiers: config.seniorityTiers as never,
+                    waitingPeriodMonths: config.waitingPeriodMonths as number,
+                    roundToMinutes: config.roundToMinutes as number,
+                  },
+                  period: { from, to },
+                  hiredOn: person.hiredOn,
+                  terminatedOn: person.terminatedOn,
+                  fte: employment ? Number.parseFloat(employment.fte ?? '1') : 1,
+                })
+                if (result.minutes <= 0) continue
 
-              const employment = employmentBy.get(person.id)
-              const result = accrueForPeriod({
-                policy: {
-                  frequency: config.frequency as never,
-                  daysPerYear: config.daysPerYear as number,
-                  minutesPerDay: config.minutesPerDay as number,
-                  seniorityTiers: config.seniorityTiers as never,
-                  waitingPeriodMonths: config.waitingPeriodMonths as number,
-                  roundToMinutes: config.roundToMinutes as number,
-                },
-                period: { from, to },
-                hiredOn: person.hiredOn,
-                terminatedOn: person.terminatedOn,
-                fte: employment ? Number.parseFloat(employment.fte ?? '1') : 1,
-              })
-              if (result.minutes <= 0) continue
-
-              const year = Number(to.slice(0, 4))
-              await ledger.lockAndRead(tx, workspaceId, person.id, type.id, year)
-              await ledger.append(tx, workspaceId, {
-                personId: person.id,
-                leaveTypeId: type.id,
-                kind: 'accrual',
-                amountMinutes: result.minutes,
-                effectiveOn: to,
-                periodYear: year,
-                reason: result.reason,
-              })
-              credited++
+                const year = Number(to.slice(0, 4))
+                await ledger.lockAndRead(tx, workspaceId, person.id, type.id, year)
+                await ledger.append(tx, workspaceId, {
+                  personId: person.id,
+                  leaveTypeId: type.id,
+                  kind: 'accrual',
+                  amountMinutes: result.minutes,
+                  effectiveOn: to,
+                  periodYear: year,
+                  reason: result.reason,
+                })
+                credited++
+              }
+              if (credited)
+                kernel.log.info(
+                  { module: 'hr', workspaceId, credited, from, to, offices: officeIds.size },
+                  'leave accrued',
+                )
             }
-            if (credited) kernel.log.info({ module: 'hr', workspaceId, credited, from, to }, 'leave accrued')
           })
       },
     },
 
     {
       /**
-       * Carry-forward and expiry, on the turn of the entitlement year.
+       * Carry-forward and expiry, on each office's own turn of the year.
        *
-       * Writes **both halves**: what carried and what lapsed, as separate ledger entries. A balance
-       * that silently shrinks at midnight on 1 January is the most disputed number in any leave
-       * system, and "you had 9 days, 5 carried, 4 expired under the cap" is a sentence somebody can
-       * check. Runs on the 2nd so a late December accrual has already landed.
+       * Two things, on the same hourly tick, because both are a date in an office's zone:
+       *
+       * 1. **The carry**, when an office reaches 2 January — the 2nd so a late December accrual has
+       *    already landed. It writes **both halves**: what carried and what lapsed, as separate
+       *    ledger entries. A balance that silently shrinks at midnight on 1 January is the most
+       *    disputed number in any leave system, and "you had 9 days, 5 carried, 4 expired under the
+       *    cap" is a sentence somebody can check.
+       * 2. **The lapse**, on every other day of the year, for carried leave that has reached the
+       *    date it expires on. The cap and the deadline are two different rules and only the first
+       *    of them was ever written: a policy saying "three months to use it" took nothing away in
+       *    April, so the deadline was a setting an admin could save and nothing would obey.
+       *
+       * The day length the cap converts at comes from the **accrual** policy, which is the only
+       * place a working day is stated — `CarryForwardConfig` gives a cap in days and nothing to
+       * multiply it by. Eight hours was assumed here for months, so on a seven-and-a-half-hour day
+       * a five-day cap read as 2400 minutes against 2250 accrued and never bit at all.
        */
       name: 'carry-forward',
-      cron: '0 4 2 1 *',
+      cron: '0 * * * *',
       handler: async (_input, { kernel }) => {
         const resolve = new ResolveService()
         const policySvc = new PolicyService(resolve)
         const ledger = new LedgerService()
-        const thisYear = new Date().getUTCFullYear()
-        const lastYear = thisYear - 1
+        const at = new Date()
 
         for (const workspaceId of await activeWorkspaces(kernel))
           await kernel.database.withWorkspace(workspaceId, async (tx) => {
+            const days = await officeDays(tx, workspaceId, at)
+            if (!days.length) return
+
             const staff = await tx
               .select({ id: people.id })
               .from(people)
               .where(and(eq(people.workspaceId, workspaceId), inArray(people.status, ['active', 'on_leave'])))
             if (!staff.length) return
+            const everyone = staff.map((p) => p.id)
 
-            const ids = staff.map((p) => p.id)
-            const resolved = await policySvc.forPeople(
-              tx,
-              workspaceId,
-              ids,
-              'carry_forward',
-              `${lastYear}-12-31`,
-            )
             const types = await tx.select().from(leaveTypes).where(eq(leaveTypes.workspaceId, workspaceId))
             const typeByKey = new Map(types.map((t) => [t.key, t]))
 
-            let moved = 0
-            for (const person of staff) {
-              const policy = resolved.get(person.id)
-              if (!policy?.config) continue
-              const config = policy.config as Record<string, unknown>
-              const type = typeByKey.get(config.leaveTypeKey as string)
-              if (!type) continue
-
-              const minutesPerDay = 8 * 60
-              const balance = await ledger.lockAndRead(tx, workspaceId, person.id, type.id, lastYear)
-              if (balance <= 0) continue
-
-              const { carriedMinutes, expiredMinutes } = carryForward(balance, {
-                maxMinutes: Math.round((config.maxDays as number) * minutesPerDay),
-                expiresAfterMonths: (config.expiresAfterMonths as number | null) ?? null,
-              })
-
-              // The old year is closed out in full, then what survives opens the new one. Two
-              // entries rather than a transfer, so each year's ledger sums to what that year held.
-              if (expiredMinutes > 0)
-                await ledger.append(tx, workspaceId, {
-                  personId: person.id,
-                  leaveTypeId: type.id,
-                  kind: 'expiry',
-                  amountMinutes: -expiredMinutes,
-                  effectiveOn: `${lastYear}-12-31`,
-                  periodYear: lastYear,
-                  reason: `Above the ${config.maxDays} day carry-forward cap`,
-                })
-
-              if (carriedMinutes > 0) {
-                await ledger.append(tx, workspaceId, {
-                  personId: person.id,
-                  leaveTypeId: type.id,
-                  kind: 'carry_out',
-                  amountMinutes: -carriedMinutes,
-                  effectiveOn: `${lastYear}-12-31`,
-                  periodYear: lastYear,
-                  reason: `Carried into ${thisYear}`,
-                })
-                await ledger.lockAndRead(tx, workspaceId, person.id, type.id, thisYear)
-                await ledger.append(tx, workspaceId, {
-                  personId: person.id,
-                  leaveTypeId: type.id,
-                  kind: 'carry_in',
-                  amountMinutes: carriedMinutes,
-                  effectiveOn: `${thisYear}-01-01`,
-                  periodYear: thisYear,
-                  reason: `Carried from ${lastYear}`,
-                })
-                moved++
-              }
+            // ---- the turn of the year, for the offices that have reached it
+            const turning = new Map<number, Set<string>>()
+            for (const office of days) {
+              if (!office.today.endsWith('-01-02')) continue
+              const year = Number(office.today.slice(0, 4))
+              const group = turning.get(year) ?? new Set<string>()
+              group.add(office.id)
+              turning.set(year, group)
             }
-            if (moved) kernel.log.info({ module: 'hr', workspaceId, moved }, 'leave carried forward')
+
+            for (const [year, officeIds] of turning) {
+              const lastYear = year - 1
+              const closesOn = `${lastYear}-12-31`
+              const opensOn = `${year}-01-01`
+              const ids = await inOffices(resolve, tx, workspaceId, everyone, closesOn, officeIds)
+              if (!ids.length) continue
+
+              const carryPolicies = await policySvc.forPeople(tx, workspaceId, ids, 'carry_forward', closesOn)
+              const accrualPolicies = await policySvc.forPeople(tx, workspaceId, ids, 'accrual', closesOn)
+
+              let moved = 0
+              for (const personId of ids) {
+                const policy = carryPolicies.get(personId)
+                if (!policy?.config) continue
+                const config = policy.config as Record<string, unknown>
+                const type = typeByKey.get(config.leaveTypeKey as string)
+                if (!type) continue
+
+                // A cap in days needs a day, and only the accrual policy states one. Without it the
+                // honest move is to touch nothing and say so: guessing eight hours is how a cap
+                // silently stops biting on a 7.5-hour week, and inventing one here would make the
+                // carried figure disagree with every accrual that produced it.
+                const accrual = accrualPolicies.get(personId)?.config as Record<string, unknown> | null
+                const minutesPerDay = accrual?.minutesPerDay as number | undefined
+                if (!minutesPerDay) {
+                  kernel.log.warn(
+                    { module: 'hr', workspaceId, personId, policyId: policy.policyId },
+                    'carry-forward skipped: no accrual policy states the length of a working day',
+                  )
+                  continue
+                }
+
+                const balance = await ledger.lockAndRead(tx, workspaceId, personId, type.id, lastYear)
+                if (balance <= 0) continue
+
+                const { carriedMinutes, expiredMinutes, expiresOn } = carryForward(
+                  balance,
+                  {
+                    maxDays: config.maxDays as number,
+                    minutesPerDay,
+                    expiresAfterMonths: (config.expiresAfterMonths as number | null) ?? null,
+                  },
+                  opensOn,
+                )
+
+                // The old year is closed out in full, then what survives opens the new one. Two
+                // entries rather than a transfer, so each year's ledger sums to what that year held.
+                if (expiredMinutes > 0)
+                  await ledger.append(tx, workspaceId, {
+                    personId,
+                    leaveTypeId: type.id,
+                    kind: 'expiry',
+                    amountMinutes: -expiredMinutes,
+                    effectiveOn: closesOn,
+                    periodYear: lastYear,
+                    reason: `Above the ${config.maxDays} day carry-forward cap`,
+                  })
+
+                if (carriedMinutes > 0) {
+                  await ledger.append(tx, workspaceId, {
+                    personId,
+                    leaveTypeId: type.id,
+                    kind: 'carry_out',
+                    amountMinutes: -carriedMinutes,
+                    effectiveOn: closesOn,
+                    periodYear: lastYear,
+                    reason: `Carried into ${year}`,
+                  })
+                  await ledger.lockAndRead(tx, workspaceId, personId, type.id, year)
+                  await ledger.append(tx, workspaceId, {
+                    personId,
+                    leaveTypeId: type.id,
+                    kind: 'carry_in',
+                    amountMinutes: carriedMinutes,
+                    effectiveOn: opensOn,
+                    periodYear: year,
+                    // The deadline is on the entry a person reads, not only in a policy screen they
+                    // never open. The sweep below recomputes it rather than parsing it back.
+                    reason: expiresOn
+                      ? `Carried from ${lastYear} · use by ${dayBefore(expiresOn)}`
+                      : `Carried from ${lastYear}`,
+                  })
+                  moved++
+                }
+              }
+              if (moved)
+                kernel.log.info(
+                  { module: 'hr', workspaceId, year, moved, offices: officeIds.size },
+                  'leave carried forward',
+                )
+            }
+
+            // ---- carried leave that has reached its deadline, in each office's own calendar
+            const local = new Map<string, Set<string>>()
+            for (const office of days) {
+              const group = local.get(office.today) ?? new Set<string>()
+              group.add(office.id)
+              local.set(office.today, group)
+            }
+
+            for (const [today, officeIds] of local) {
+              const ids = await inOffices(resolve, tx, workspaceId, everyone, today, officeIds)
+              if (!ids.length) continue
+              const lapsed = await lapseCarriedLeave({
+                tx,
+                workspaceId,
+                ledger,
+                policySvc,
+                today,
+                personIds: ids,
+                typeByKey,
+              })
+              if (lapsed)
+                kernel.log.info({ module: 'hr', workspaceId, today, lapsed }, 'carried leave expired')
+            }
           })
       },
     },
@@ -283,8 +395,15 @@ export function hrJobs(): JobDef[] {
       /**
        * Close shifts somebody forgot to clock out of.
        *
-       * Hourly, and per office rather than globally: "it is past 3am" is a different moment in every
-       * office, and a single UTC-timed sweep would close a Tehran shift mid-afternoon.
+       * Hourly, and the one job here whose boundary is **not** a date in an office's calendar: a
+       * shift closes `auto_clock_out_after_minutes` after the punch that opened it, and an elapsed
+       * hour is the same hour everywhere. What the office decides is the **zone** — the zone of the
+       * office the person worked in **on the day being closed**, not the one they work in today.
+       * Somebody who transferred from Istanbul to Amsterdam has their forgotten Istanbul shift
+       * closed in Istanbul time.
+       *
+       * So the ladder is walked once per business date rather than once per shift, which is the
+       * batching `ResolveService` asks for and which a call per row quietly gave up.
        *
        * The auto clock-out is written as a punch like any other, with `method: 'manual'` and a note,
        * so the sheet shows that a machine closed the day rather than the person. That distinction is
@@ -328,7 +447,7 @@ export function hrJobs(): JobDef[] {
             // window a schedule configures is hours, not days — and three days leaves slack for the
             // job itself having been down.
             const since = new Date(cutoff.getTime() - AUTO_CLOCK_OUT_LOOKBACK_DAYS * 86_400_000)
-            const sinceDate = new Date(since.getTime() - 86_400_000).toISOString().slice(0, 10)
+            const sinceDate = dayBefore(since.toISOString().slice(0, 10))
 
             // "Still open" is a question about the punches of one person-day, and it used to be
             // answered here — a query per candidate row, before anything was known about the person
@@ -390,14 +509,25 @@ export function hrJobs(): JobDef[] {
               const seen = shifts.get(key)
               if (!seen || row.at > seen.at) shifts.set(key, row)
             }
+            if (!shifts.size) return
+
+            // One ladder walk per business date rather than one per shift. The resolution is what
+            // says which office — and so which zone — the day belongs to, and it is asked **as of
+            // that day**: a sweep that asks as of today closes a transferred employee's old shift
+            // in their new office's time.
+            const perDate = new Map<string, string[]>()
+            for (const row of shifts.values())
+              perDate.set(row.businessDate, [...(perDate.get(row.businessDate) ?? []), row.personId])
+            const zones = new Map<string, string>()
+            for (const [businessDate, personIds] of perDate)
+              for (const [personId, r] of await resolve.forPeople(tx, workspaceId, personIds, businessDate))
+                zones.set(`${personId}:${businessDate}`, r.timezone)
 
             for (const row of shifts.values()) {
-              // As of the day being closed, not as of now: the shift this closes may have started
-              // yesterday, and the zone written onto the punch is the one they worked in.
-              const resolution = await resolve.forPerson(tx, workspaceId, row.personId, row.businessDate)
               const schedule = await attendance.scheduleFor(tx, workspaceId, row.personId, row.businessDate)
               if (!schedule.autoClockOutAfterMinutes) continue
               if (Date.now() - row.at.getTime() < schedule.autoClockOutAfterMinutes * 60_000) continue
+              const timezone = zones.get(`${row.personId}:${row.businessDate}`) ?? 'UTC'
 
               await tx.insert(punches).values({
                 workspaceId,
@@ -405,7 +535,7 @@ export function hrJobs(): JobDef[] {
                 direction: 'out',
                 at: new Date(row.at.getTime() + schedule.autoClockOutAfterMinutes * 60_000),
                 businessDate: row.businessDate,
-                timezone: resolution.timezone,
+                timezone,
                 method: 'manual',
                 trust: 'trusted',
                 note: 'Closed automatically: no clock-out recorded',
@@ -415,11 +545,11 @@ export function hrJobs(): JobDef[] {
                 workspaceId,
                 row.personId,
                 row.businessDate,
-                resolution.timezone,
+                timezone,
                 schedule,
               )
               kernel.log.info(
-                { module: 'hr', personId: row.personId, businessDate: row.businessDate },
+                { module: 'hr', personId: row.personId, businessDate: row.businessDate, timezone },
                 'auto clock-out',
               )
             }
@@ -505,4 +635,180 @@ async function activeWorkspaces(kernel: Kernel): Promise<string[]> {
   return rows.map((r) => r.workspace_id)
 }
 
-export { inArray, offices, todayIn }
+/** An office and the date it is currently standing on. */
+interface OfficeDay {
+  id: string
+  name: string
+  timezone: string
+  today: string
+}
+
+/**
+ * Every live office of a workspace, with the date it is on at `at`.
+ *
+ * The whole fan-out is this one function: a job asks which offices have crossed the boundary it
+ * cares about instead of asking a cron expression, which only ever knows UTC.
+ */
+async function officeDays(tx: Tx, workspaceId: string, at: Date): Promise<OfficeDay[]> {
+  const rows = await tx
+    .select({ id: offices.id, name: offices.name, timezone: offices.timezone })
+    .from(offices)
+    .where(and(eq(offices.workspaceId, workspaceId), isNull(offices.archivedAt)))
+  return rows.map((o) => ({ ...o, today: todayIn(o.timezone, at) }))
+}
+
+/**
+ * Which of these people a set of offices decides for, on a date.
+ *
+ * Only the primary office votes, and `ResolveService` is the only implementation of that — so the
+ * question is asked there rather than by joining `office_assignments` here and growing a second,
+ * subtly different ladder. Nobody falls out of every group: a workspace always has a default
+ * office, and it answers for anyone without an assignment of their own.
+ */
+async function inOffices(
+  resolve: ResolveService,
+  tx: Tx,
+  workspaceId: string,
+  personIds: string[],
+  on: string,
+  officeIds: Set<string>,
+): Promise<string[]> {
+  const resolutions = await resolve.forPeople(tx, workspaceId, personIds, on)
+  return personIds.filter((id) => {
+    const officeId = resolutions.get(id)?.primaryOfficeId
+    return !!officeId && officeIds.has(officeId)
+  })
+}
+
+/**
+ * Take away carried leave that has passed its deadline, and say so on the record.
+ *
+ * The deadline is **recomputed** from the carry-forward policy in force on the 1st of January the
+ * leave was carried into, rather than parsed back out of the entry that carried it: a policy is
+ * effective-dated, so the same question asked of the same date gives the same answer for ever, and
+ * a date encoded in a `reason` string is a column nobody declared.
+ *
+ * How much is left of the carry is a FIFO question — carried days are spent before the new year's
+ * own accrual, so what lapses is the carry minus everything spent since, and never more than the
+ * balance actually standing. That also makes the sweep idempotent without a marker: the entry it
+ * writes is itself spending, so the second run finds nothing left to take.
+ */
+async function lapseCarriedLeave(args: {
+  tx: Tx
+  workspaceId: string
+  ledger: LedgerService
+  policySvc: PolicyService
+  today: string
+  personIds: string[]
+  typeByKey: Map<string, { id: string }>
+}): Promise<number> {
+  const { tx, workspaceId, ledger, policySvc, today, personIds, typeByKey } = args
+  const thisYear = Number(today.slice(0, 4))
+
+  // Only the years that actually carried anything, and only as far back as a deadline can reach:
+  // `expiresAfterMonths` is capped at 24 by the contract.
+  const carriedYears = await tx
+    .selectDistinct({ periodYear: leaveLedger.periodYear })
+    .from(leaveLedger)
+    .where(
+      and(
+        eq(leaveLedger.workspaceId, workspaceId),
+        eq(leaveLedger.kind, 'carry_in'),
+        inArray(leaveLedger.personId, personIds),
+        gte(leaveLedger.periodYear, thisYear - 2),
+        lte(leaveLedger.periodYear, thisYear),
+      ),
+    )
+  if (!carriedYears.length) return 0
+
+  let lapsed = 0
+  for (const { periodYear } of carriedYears) {
+    const yearStart = `${periodYear}-01-01`
+    const policies = await policySvc.forPeople(tx, workspaceId, personIds, 'carry_forward', yearStart)
+
+    const due = personIds.filter((personId) => {
+      const config = policies.get(personId)?.config as Record<string, unknown> | null | undefined
+      if (!config) return false
+      const expiresOn = carryExpiryDate(yearStart, (config.expiresAfterMonths as number | null) ?? null)
+      return carryHasLapsed(today, expiresOn)
+    })
+    if (!due.length) continue
+
+    const sums = await tx
+      .select({
+        personId: leaveLedger.personId,
+        leaveTypeId: leaveLedger.leaveTypeId,
+        kind: leaveLedger.kind,
+        total: sql<number>`sum(${leaveLedger.amountMinutes})::int`,
+      })
+      .from(leaveLedger)
+      .where(
+        and(
+          eq(leaveLedger.workspaceId, workspaceId),
+          eq(leaveLedger.periodYear, periodYear),
+          inArray(leaveLedger.personId, due),
+        ),
+      )
+      .groupBy(leaveLedger.personId, leaveLedger.leaveTypeId, leaveLedger.kind)
+
+    const tally = new Map<string, { carriedIn: number; balance: number; spent: number }>()
+    for (const row of sums) {
+      const key = `${row.personId}:${row.leaveTypeId}`
+      const t = tally.get(key) ?? { carriedIn: 0, balance: 0, spent: 0 }
+      const total = Number(row.total)
+      t.balance += total
+      if (row.kind === 'carry_in') t.carriedIn += total
+      if (total < 0) t.spent += -total
+      tally.set(key, t)
+    }
+
+    for (const personId of due) {
+      const config = policies.get(personId)?.config as Record<string, unknown>
+      const type = typeByKey.get(config.leaveTypeKey as string)
+      if (!type) continue
+      const expiresOn = carryExpiryDate(yearStart, (config.expiresAfterMonths as number | null) ?? null)
+      if (!expiresOn) continue
+
+      const t = tally.get(`${personId}:${type.id}`)
+      if (!t?.carriedIn) continue
+      const remaining = Math.min(Math.max(0, t.carriedIn - t.spent), t.balance)
+      if (remaining <= 0) continue
+
+      await ledger.lockAndRead(tx, workspaceId, personId, type.id, periodYear)
+      await ledger.append(tx, workspaceId, {
+        personId,
+        leaveTypeId: type.id,
+        kind: 'expiry',
+        amountMinutes: -remaining,
+        effectiveOn: expiresOn,
+        periodYear,
+        reason: `Carried leave not used by ${dayBefore(expiresOn)}`,
+      })
+      lapsed++
+    }
+  }
+  return lapsed
+}
+
+/** The month before the one a `YYYY-MM-01` names, as its own first and last day. */
+function monthBefore(firstOfMonth: string): { from: string; to: string } {
+  const [y, m] = firstOfMonth.split('-').map(Number) as [number, number]
+  const year = m === 1 ? y - 1 : y
+  const month = m === 1 ? 12 : m - 1
+  const mm = String(month).padStart(2, '0')
+  const last = String(daysInMonth(year, month)).padStart(2, '0')
+  return { from: `${year}-${mm}-01`, to: `${year}-${mm}-${last}` }
+}
+
+/**
+ * The day before a `YYYY-MM-DD`.
+ *
+ * An expiry date is the first day the leave is *gone*, which is not the date to show somebody or to
+ * bound a sweep with — "use by 31 March" and "expires 1 April" are the same rule and only one of
+ * them reads as an instruction.
+ */
+function dayBefore(date: string): string {
+  const d = new Date(`${date}T00:00:00Z`)
+  d.setUTCDate(d.getUTCDate() - 1)
+  return d.toISOString().slice(0, 10)
+}

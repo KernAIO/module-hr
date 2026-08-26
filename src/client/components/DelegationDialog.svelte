@@ -1,5 +1,15 @@
 <script lang="ts">
-import { Badge, Button, Dialog, EmptyState, Field, Input, Select, Skeleton } from '@kernhq/ui'
+import {
+  Badge,
+  Button,
+  Dialog,
+  EmptyState,
+  Field,
+  formatDateRange,
+  Input,
+  Select,
+  Skeleton,
+} from '@kernhq/ui'
 import { createMutation, createQuery, useQueryClient } from '@tanstack/svelte-query'
 import { getHrApi } from '../api-instance.js'
 import { t } from '../i18n.js'
@@ -70,8 +80,7 @@ const datesInvalid = $derived(Boolean(startsOn) && Boolean(endsOn) && endsOn < s
 
 const nameOf = (personId: string) => people.find((p) => p.id === personId)?.displayName ?? '—'
 
-const range = (from: string, to: string) =>
-  new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).formatRange(new Date(from), new Date(to))
+const range = (from: string, to: string) => formatDateRange(from, to)
 </script>
 
 <Dialog

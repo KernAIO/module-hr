@@ -4,7 +4,9 @@ import {
   Badge,
   Button,
   Dialog,
+  EmptyState,
   Field,
+  formatDate,
   Input,
   navigation,
   RightPanel,
@@ -68,6 +70,27 @@ const managerQuery = createQuery(() => ({
 const close = () =>
   void navigation.go(`/${workspaceSlug}/hr`, { replaceState: true, keepFocus: true, noScroll: true })
 
+/**
+ * The sentence to put in front of somebody when a write here fails.
+ *
+ * A refusal arrives as two pieces: a machine-readable `reason` a module translates, and the
+ * English sentence the router wrote for a reader. Nothing under `people.*` sends a reason today —
+ * its refusals are a record that has gone and a field the server will not take — so this uses the
+ * second, and only for the codes that carry a sentence somebody wrote. Everything else is machine
+ * text in English: a network drop, a 500, a gateway, and `Forbidden` and `Unauthorized`, which are
+ * one word each. A toast is the last place to paste any of them, so they fall back to this
+ * module's own string.
+ *
+ * When a `people.*` refusal does grow a reason, it is read the way `ClockControls.svelte` reads a
+ * punch's — keyed by the code, never by the sentence.
+ */
+const READABLE = new Set(['BAD_REQUEST', 'CONFLICT', 'NOT_FOUND'])
+function explain(error: unknown, fallback: string): string {
+  const failure = error as { code?: unknown; message?: string }
+  const readable = typeof failure.code === 'string' && READABLE.has(failure.code)
+  return (readable ? failure.message : '') || fallback
+}
+
 let editing = $state(false)
 let displayName = $state('')
 let workEmail = $state('')
@@ -82,6 +105,14 @@ $effect(() => {
     phone = person.phone ?? ''
   }
 })
+
+/**
+ * `saving` and `ending` rather than `isPending`: the disabled attribute only reaches the button on
+ * the next render, so two quick clicks both fire — twice through here is two history rows for one
+ * decision. These are set in the same tick as the first click.
+ */
+let saving = $state(false)
+let ending = $state(false)
 
 const save = createMutation(() => ({
   mutationFn: () =>
@@ -98,8 +129,17 @@ const save = createMutation(() => ({
     void queryClient.invalidateQueries({ queryKey: ['hr'] })
     editing = false
   },
-  onError: (error: Error) => toast.error(error.message),
+  onError: (error) => toast.error(explain(error, t('person_save_error'))),
+  onSettled: () => {
+    saving = false
+  },
 }))
+
+const submitSave = () => {
+  if (saving) return
+  saving = true
+  save.mutate()
+}
 
 let offboarding = $state(false)
 let lastDay = $state(isoDate())
@@ -118,8 +158,17 @@ const offboard = createMutation(() => ({
     void queryClient.invalidateQueries({ queryKey: ['hr'] })
     offboarding = false
   },
-  onError: (error: Error) => toast.error(error.message),
+  onError: (error) => toast.error(explain(error, t('person_offboard_error'))),
+  onSettled: () => {
+    ending = false
+  },
 }))
+
+const submitOffboard = () => {
+  if (ending) return
+  ending = true
+  offboard.mutate()
+}
 
 /**
  * The employment types the server can send, as words.
@@ -138,13 +187,55 @@ const EMPLOYMENT_KEYS: Record<string, string> = {
 }
 const typeLabel = (value: string) => (EMPLOYMENT_KEYS[value] ? t(EMPLOYMENT_KEYS[value]) : value)
 
+/**
+ * The clock where this person works, in the reader's language.
+ *
+ * `formatDate` rather than a bare `Intl` call: an interface in Persian writes its own digits, and
+ * a time in Latin ones beside them is the one thing on the panel that did not get translated. The
+ * zone comes from the office record, so it is guarded — an unknown one must not take the panel
+ * down with it.
+ */
+function officeTime(timezone: string): string {
+  try {
+    return formatDate(new Date().toISOString(), {
+      timeZone: timezone,
+      hour: 'numeric',
+      minute: '2-digit',
+    })
+  } catch {
+    return '—'
+  }
+}
+
 const canManage = $derived(canHr('personManage'))
 const left = $derived(person?.status === 'terminated')
 </script>
 
-<RightPanel onClose={close} title={person?.displayName ?? ''}>
+{#snippet footerActions()}
+  <div class="actions">
+    <!-- Disabled with the reason beside it, not hidden: the button was there a moment ago, and a
+         control that vanishes after an action reads as a bug rather than as a finished job. -->
+    {#if left}<span class="note">{t('offboard_already')}</span>{/if}
+    <Button size="sm" variant="secondary" onclick={() => (editing = true)}>{t('edit_person')}</Button>
+    <Button size="sm" variant="danger" disabled={left} onclick={() => (offboarding = true)}>
+      {t('offboard')}
+    </Button>
+  </div>
+{/snippet}
+
+<RightPanel
+  onClose={close}
+  title={person?.displayName ?? t('person_panel')}
+  footer={canManage && person ? footerActions : undefined}
+>
   {#if personQuery.isLoading}
-    <div class="pad"><Skeleton height="120px" /></div>
+    <div class="pad">
+      <div class="head">
+        <Skeleton width="56px" height="56px" radius="50%" />
+        <Skeleton width="150px" height="14px" />
+      </div>
+      <Skeleton lines={4} />
+    </div>
   {:else if person}
     <div class="pad">
     <div class="head">
@@ -163,11 +254,7 @@ const left = $derived(person?.status === 'terminated')
       {#if resolution?.timezone}
         <dt>{t('local_time')}</dt>
         <dd>
-          {new Intl.DateTimeFormat(undefined, {
-            timeZone: resolution.timezone,
-            hour: 'numeric',
-            minute: '2-digit',
-          }).format(new Date())}
+          {officeTime(resolution.timezone)}
           <span class="meta">{resolution.timezone}</span>
         </dd>
       {/if}
@@ -177,11 +264,7 @@ const left = $derived(person?.status === 'terminated')
       {/if}
       {#if person.hiredOn}
         <dt>{t('started')}</dt>
-        <dd>
-          {new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).format(
-            new Date(`${person.hiredOn}T00:00:00`),
-          )}
-        </dd>
+        <dd>{formatDate(`${person.hiredOn}T00:00:00`)}</dd>
       {/if}
       {#if person.phone}
         <dt>{t('phone')}</dt>
@@ -213,16 +296,34 @@ const left = $derived(person?.status === 'terminated')
               : t('status_terminated')}</Badge
     >
     </div>
-  {/if}
-
-  {#snippet footer()}
-    {#if canManage && person && !left}
-      <div class="actions">
-        <Button size="sm" variant="secondary" onclick={() => (editing = true)}>{t('edit_person')}</Button>
-        <Button size="sm" variant="danger" onclick={() => (offboarding = true)}>{t('offboard')}</Button>
+  {:else if personQuery.isError}
+    <!--
+      The panel used to draw nothing here: an untitled 440px column with a close button and no
+      word in it, which reads as a record that is empty rather than as one that failed to load.
+      The other two queries are details on the record, so they stay silent when they fail; this
+      one is the record.
+    -->
+    <div class="pad">
+      <EmptyState compact icon="triangle-alert" title={t('person_error')}>
+        {#snippet actions()}
+          <Button size="sm" variant="secondary" onclick={() => void personQuery.refetch()}>
+            {t('retry')}
+          </Button>
+        {/snippet}
+      </EmptyState>
+    </div>
+  {:else}
+    <!--
+      No workspace yet. The query is disabled until one arrives, and a disabled query is not
+      "loading" — so without this branch the panel is briefly a blank column on every first paint.
+    -->
+    <div class="pad">
+      <div class="head">
+        <Skeleton width="56px" height="56px" radius="50%" />
+        <Skeleton width="150px" height="14px" />
       </div>
-    {/if}
-  {/snippet}
+    </div>
+  {/if}
 </RightPanel>
 
 <Dialog bind:open={editing} title={t('edit_person')}>
@@ -251,8 +352,8 @@ const left = $derived(person?.status === 'terminated')
   {#snippet footer()}
     <Button variant="ghost" onclick={() => (editing = false)}>{t('common.cancel')}</Button>
     <Button
-      onclick={() => save.mutate()}
-      disabled={displayName.trim().length === 0}
+      onclick={submitSave}
+      disabled={displayName.trim().length === 0 || saving}
       loading={save.isPending}>{t('common.save')}</Button
     >
   {/snippet}
@@ -278,7 +379,7 @@ const left = $derived(person?.status === 'terminated')
   </div>
   {#snippet footer()}
     <Button variant="ghost" onclick={() => (offboarding = false)}>{t('common.cancel')}</Button>
-    <Button variant="danger" onclick={() => offboard.mutate()} loading={offboard.isPending}
+    <Button variant="danger" onclick={submitOffboard} disabled={!lastDay || ending} loading={offboard.isPending}
       >{t('offboard')}</Button
     >
   {/snippet}
@@ -319,7 +420,14 @@ dd {
 .actions {
   display: flex;
   gap: 8px;
+  align-items: center;
   justify-content: end;
+}
+/* A colour, not opacity: opacity fades text against the panel whatever token it names. */
+.note {
+  margin-inline-end: auto;
+  font-size: 12px;
+  color: var(--kern-ink-500);
 }
 .form {
   display: grid;

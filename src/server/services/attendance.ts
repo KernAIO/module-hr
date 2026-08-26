@@ -1,11 +1,12 @@
 import { KernError, type Tx, uuidv7 } from '@kernhq/kernel'
-import { and, asc, eq, gte, inArray, isNull, lte, or, sql } from 'drizzle-orm'
+import { and, asc, eq, gte, inArray, isNull, lt, lte, or, sql } from 'drizzle-orm'
 import type { ScheduleWeek } from '../../contract/index.js'
 import { weekdayOf } from '../../policy/calendar.js'
 import { dateIn, previousDate } from '../../policy/time.js'
 import {
   attributeToShift,
   computeDay,
+  type OvertimePolicy,
   openState,
   type PunchInput,
   type RoundingPolicy,
@@ -325,12 +326,14 @@ export class AttendanceService {
       )
       .limit(1)
 
+    const overtimePolicy = await this.overtimePolicyFor(tx, workspaceId, personId, businessDate)
     const computed = computeDay({
       businessDate,
       timeZone: timezone,
       shift: schedule.shiftFor(businessDate),
       punches: punchInputs,
       rounding: schedule.rounding,
+      overtime: overtimePolicy,
       excused: !!onLeave,
     })
 
@@ -347,6 +350,7 @@ export class AttendanceService {
         workedMinutes: computed.workedMinutes,
         breakMinutes: computed.breakMinutes,
         overtimeMinutes: computed.overtimeMinutes,
+        beyondCapMinutes: computed.beyondCapMinutes,
         lateMinutes: computed.lateMinutes,
         earlyLeaveMinutes: computed.earlyLeaveMinutes,
         status,
@@ -364,6 +368,7 @@ export class AttendanceService {
           workedMinutes: computed.workedMinutes,
           breakMinutes: computed.breakMinutes,
           overtimeMinutes: computed.overtimeMinutes,
+          beyondCapMinutes: computed.beyondCapMinutes,
           lateMinutes: computed.lateMinutes,
           earlyLeaveMinutes: computed.earlyLeaveMinutes,
           status,
@@ -381,6 +386,66 @@ export class AttendanceService {
       })
 
     return { locked: false }
+  }
+
+  /**
+   * The overtime rules that apply to one person on one date, as numbers a pure function can use.
+   *
+   * Resolved here rather than passed in, unlike the schedule: `computeDay` may not touch the
+   * database and every caller of `recomputeDay` would otherwise have to walk the policy ladder
+   * itself, which is how a rule ends up applied on three paths out of four.
+   *
+   * Undefined where no policy applies, which is what a workspace that never configured overtime
+   * means — every minute past the schedule counts, exactly as it did before the policy was read at
+   * all.
+   */
+  private async overtimePolicyFor(
+    tx: Tx,
+    workspaceId: string,
+    personId: string,
+    businessDate: string,
+  ): Promise<OvertimePolicy | undefined> {
+    const resolved = await this.policies.forPerson(tx, workspaceId, personId, 'overtime', businessDate)
+    if (!resolved.config) return undefined
+    const config = resolved.config as { thresholdMinutes?: number; capMinutesPerYear?: number | null }
+    const capMinutes = config.capMinutesPerYear ?? null
+    return {
+      thresholdMinutes: config.thresholdMinutes ?? 0,
+      capMinutes,
+      alreadyCountedMinutes:
+        capMinutes === null ? 0 : await this.overtimeCountedBefore(tx, workspaceId, personId, businessDate),
+    }
+  }
+
+  /**
+   * Overtime already counted this year, on the days *before* this one.
+   *
+   * Strictly before, so a day's figure depends only on days that precede it and recomputing one
+   * cannot depend on the order the sweep happens to visit them in. The days after it are then stale
+   * against a cap that filled earlier, which the nightly recomputation settles — an order-dependent
+   * sheet would not settle at all.
+   *
+   * The year is the calendar one, because `capMinutesPerYear` is what the config offers; a legal
+   * entity closing its year elsewhere would need the cap to say so first.
+   */
+  private async overtimeCountedBefore(
+    tx: Tx,
+    workspaceId: string,
+    personId: string,
+    businessDate: string,
+  ): Promise<number> {
+    const [row] = await tx
+      .select({ minutes: sql<string>`coalesce(sum(${attendanceDays.overtimeMinutes}), 0)` })
+      .from(attendanceDays)
+      .where(
+        and(
+          eq(attendanceDays.workspaceId, workspaceId),
+          eq(attendanceDays.personId, personId),
+          gte(attendanceDays.businessDate, `${businessDate.slice(0, 4)}-01-01`),
+          lt(attendanceDays.businessDate, businessDate),
+        ),
+      )
+    return Number(row?.minutes ?? 0)
   }
 
   /**

@@ -1,4 +1,7 @@
 import type { IsoDate } from '../contract/index.js'
+// Overtime lives beside the accrual arithmetic because a capped hour often becomes compensatory
+// leave rather than pay. It is the same function either way, so it is imported rather than copied.
+import { overtimeFor } from './accrual.js'
 import { dateIn, minutesOfDayIn, nextDate, previousDate, zonedToInstant } from './time.js'
 
 /**
@@ -36,6 +39,23 @@ export interface RoundingPolicy {
 
 export const NO_ROUNDING: RoundingPolicy = { stepMinutes: 0, direction: 'nearest' }
 
+/**
+ * An overtime policy as a day sees it, already resolved.
+ *
+ * `computeDay` is pure and stays pure, so which policy applies to this person on this date — and
+ * how much of the cap the year has already used — are answered by the caller against the ladder and
+ * the sheet, and arrive here as numbers. Absent, every minute past the schedule counts, which is
+ * what a workspace with no overtime policy means.
+ */
+export interface OvertimePolicy {
+  /** Minutes past the schedule before overtime starts counting. */
+  thresholdMinutes: number
+  /** Cap for the containing period, in minutes. Null is uncapped. */
+  capMinutes: number | null
+  /** Overtime already counted in that period, on days before this one. */
+  alreadyCountedMinutes: number
+}
+
 export type PunchDirection = 'in' | 'out' | 'break_start' | 'break_end'
 
 export interface PunchInput {
@@ -50,6 +70,18 @@ export interface DayComputation {
   workedMinutes: number
   breakMinutes: number
   overtimeMinutes: number
+  /**
+   * Hours worked past the schedule that the cap would not take.
+   *
+   * Reported rather than dropped: a jurisdiction capping overtime caps what may be *worked*, so
+   * these are hours somebody actually put in and a compliance report has to be able to sum them.
+   *
+   * **Null and zero say different things.** Null is no cap in force — nothing to exceed, and
+   * nothing a report should count as compliant. Zero is a cap in force that this day stayed inside.
+   * Only the policy separates them, so the distinction is drawn here rather than re-derived
+   * wherever the number is stored.
+   */
+  beyondCapMinutes: number | null
   lateMinutes: number
   earlyLeaveMinutes: number
   status: 'present' | 'absent' | 'partial' | 'pending'
@@ -256,11 +288,14 @@ export function computeDay(opts: {
   shift: ShiftSpec | null
   punches: PunchInput[]
   rounding?: RoundingPolicy
+  /** The resolved overtime policy. Absent, everything past the schedule is overtime. */
+  overtime?: OvertimePolicy
   /** Approved leave or a holiday: not an absence, whatever the punches say. */
   excused?: boolean
 }): DayComputation {
   const { businessDate, timeZone, shift, excused } = opts
   const rounding = opts.rounding ?? NO_ROUNDING
+  const capMinutes = opts.overtime?.capMinutes ?? null
   const punches = [...opts.punches].sort((a, b) => a.at - b.at)
   const anomalies: string[] = []
 
@@ -273,6 +308,7 @@ export function computeDay(opts: {
       workedMinutes: 0,
       breakMinutes: 0,
       overtimeMinutes: 0,
+      beyondCapMinutes: capMinutes === null ? null : 0,
       lateMinutes: 0,
       earlyLeaveMinutes: 0,
       status: excused ? 'present' : scheduledMinutes > 0 ? 'absent' : 'present',
@@ -347,7 +383,21 @@ export function computeDay(opts: {
     earlyLeaveMinutes = Math.max(0, Math.round((scheduledEnd - lastOut) / 60000) - shift.graceOutMinutes)
   }
 
-  const overtimeMinutes = Math.max(0, workedMinutes - scheduledMinutes)
+  // The threshold and the cap an admin configured, applied here rather than validated on save and
+  // then ignored: `max(0, worked - scheduled)` obeyed neither, so a 30-minute threshold and the
+  // Turkish 270-hour annual cap both saved successfully and changed nothing.
+  const overtime = overtimeFor({
+    workedMinutes,
+    scheduledMinutes,
+    thresholdMinutes: opts.overtime?.thresholdMinutes ?? 0,
+    capMinutes,
+    alreadyCountedMinutes: opts.overtime?.alreadyCountedMinutes ?? 0,
+  })
+  const overtimeMinutes = overtime.overtimeMinutes
+  const beyondCapMinutes = capMinutes === null ? null : overtime.beyondCapMinutes
+  // The number is for a report to sum; this is what puts it in front of the person reviewing the
+  // day. Both are derived here, from the same value, so the two cannot disagree about one fact.
+  if (beyondCapMinutes) anomalies.push('overtime_beyond_cap')
 
   const status: DayComputation['status'] = anomalies.includes('missing_clock_out')
     ? 'pending'
@@ -361,6 +411,7 @@ export function computeDay(opts: {
     workedMinutes,
     breakMinutes: Math.round(breakMs / 60000),
     overtimeMinutes,
+    beyondCapMinutes,
     lateMinutes,
     earlyLeaveMinutes,
     status,

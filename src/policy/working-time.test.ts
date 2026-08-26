@@ -581,3 +581,93 @@ describe('computeDay', () => {
     expect(r.workedMinutes).toBeGreaterThanOrEqual(0)
   })
 })
+
+/**
+ * The overtime policy an admin configured, applied to a day.
+ *
+ * `computeDay` derived overtime as everything past the schedule, so a threshold and a statutory cap
+ * were saved, resolvable, and read by nothing. These are the cases that separate the two.
+ */
+describe('computeDay against an overtime policy', () => {
+  const tenHours = [
+    { at: at('2026-06-15', '09:00'), direction: 'in' as const },
+    { at: at('2026-06-15', '20:00'), direction: 'out' as const },
+  ]
+  const worked = (overtime?: Parameters<typeof computeDay>[0]['overtime']) =>
+    computeDay({
+      businessDate: '2026-06-15',
+      timeZone: IST,
+      shift: DAY_SHIFT,
+      punches: tenHours,
+      overtime,
+    })
+
+  it('counts everything past the schedule when no policy applies', () => {
+    // 11h on the clock less the hour of break is 600 worked against 480 scheduled.
+    const r = worked()
+    expect(r.workedMinutes).toBe(600)
+    expect(r.overtimeMinutes).toBe(120)
+    // No cap was in force, which is not the same fact as a cap nothing exceeded.
+    expect(r.beyondCapMinutes).toBeNull()
+  })
+
+  it('ignores the minutes below the threshold', () => {
+    const r = worked({ thresholdMinutes: 30, capMinutes: null, alreadyCountedMinutes: 0 })
+    expect(r.overtimeMinutes).toBe(90)
+    expect(r.beyondCapMinutes).toBeNull()
+  })
+
+  it('counts nothing at all where the day never reaches the threshold', () => {
+    const r = computeDay({
+      businessDate: '2026-06-15',
+      timeZone: IST,
+      shift: DAY_SHIFT,
+      punches: [
+        { at: at('2026-06-15', '09:00'), direction: 'in' },
+        { at: at('2026-06-15', '18:15'), direction: 'out' },
+      ],
+      overtime: { thresholdMinutes: 30, capMinutes: null, alreadyCountedMinutes: 0 },
+    })
+    expect(r.overtimeMinutes).toBe(0)
+  })
+
+  /** Turkish law caps overtime *worked* at 270 hours a year, not merely how it is paid. */
+  it('stops at the annual cap and reports the hours beyond it', () => {
+    const r = worked({
+      thresholdMinutes: 0,
+      capMinutes: 270 * 60,
+      alreadyCountedMinutes: 270 * 60 - 45,
+    })
+    expect(r.overtimeMinutes).toBe(45)
+    expect(r.beyondCapMinutes).toBe(75)
+    // The hours were worked whatever the cap says, so the day still shows them.
+    expect(r.workedMinutes).toBe(600)
+    expect(r.anomalies).toContain('overtime_beyond_cap')
+  })
+
+  it('counts nothing once the cap is already full', () => {
+    const r = worked({ thresholdMinutes: 0, capMinutes: 270 * 60, alreadyCountedMinutes: 270 * 60 })
+    expect(r.overtimeMinutes).toBe(0)
+    expect(r.beyondCapMinutes).toBe(120)
+  })
+
+  it('leaves a day inside the cap alone', () => {
+    const r = worked({ thresholdMinutes: 0, capMinutes: 270 * 60, alreadyCountedMinutes: 0 })
+    expect(r.overtimeMinutes).toBe(120)
+    expect(r.beyondCapMinutes).toBe(0)
+    expect(r.anomalies).toEqual([])
+  })
+
+  it('reports no overtime on a day with no punches', () => {
+    const r = computeDay({
+      businessDate: '2026-06-15',
+      timeZone: IST,
+      shift: DAY_SHIFT,
+      punches: [],
+      overtime: { thresholdMinutes: 30, capMinutes: 60, alreadyCountedMinutes: 0 },
+    })
+    expect(r.overtimeMinutes).toBe(0)
+    // A cap was in force and this day stayed inside it — zero, not null, on a day nobody worked.
+    expect(r.beyondCapMinutes).toBe(0)
+  })
+})

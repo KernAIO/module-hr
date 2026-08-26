@@ -85,6 +85,33 @@ const reset = () => {
   employmentType = 'full_time'
 }
 
+/**
+ * The sentence to put in front of somebody when the hire is refused.
+ *
+ * A refusal arrives as two pieces: a machine-readable `reason` a module translates, and the
+ * English sentence the router wrote for a reader. `people.create` sends no reason today — an
+ * employee number already taken and a field the server will not take are what it refuses on — so
+ * this uses the second, and only for the codes that carry a sentence somebody wrote. A network
+ * drop, a 500 and a gateway carry machine text, and `Forbidden` is one word; a toast is the last
+ * place to paste any of them, so they fall back to this module's own string.
+ *
+ * When `people.create` does grow a reason, it is read the way `ClockControls.svelte` reads a
+ * punch's — keyed by the code, never by the sentence.
+ */
+const READABLE = new Set(['BAD_REQUEST', 'CONFLICT', 'NOT_FOUND'])
+function explain(error: unknown, fallback: string): string {
+  const failure = error as { code?: unknown; message?: string }
+  const readable = typeof failure.code === 'string' && READABLE.has(failure.code)
+  return (readable ? failure.message : '') || fallback
+}
+
+/**
+ * `creating` rather than `create.isPending`: the disabled attribute only reaches the button on the
+ * next render, so two quick clicks both fire — and here that is two people in the directory with
+ * the same name and two employee numbers.
+ */
+let creating = $state(false)
+
 const create = createMutation(() => ({
   mutationFn: () =>
     api.people.create({
@@ -110,10 +137,20 @@ const create = createMutation(() => ({
     shown = false
     dismiss()
   },
-  onError: (error: Error) => toast.error(error.message),
+  onError: (error) => toast.error(explain(error, t('person_create_error'))),
+  onSettled: () => {
+    creating = false
+  },
 }))
 
-const canSubmit = $derived(displayName.trim().length > 0 && canHr('personManage'))
+const submit = () => {
+  if (creating) return
+  creating = true
+  create.mutate()
+}
+
+const canManage = $derived(canHr('personManage'))
+const canSubmit = $derived(displayName.trim().length > 0 && canManage && !creating)
 </script>
 
 <Dialog
@@ -163,6 +200,12 @@ const canSubmit = $derived(displayName.trim().length > 0 && canHr('personManage'
   </div>
 
   {#snippet footer()}
+    <!--
+      The URL reaches this dialog whether or not the person may use it — the Add person button is
+      gated, a pasted `?new=1` is not — so the submit says why it is dead rather than looking
+      broken.
+    -->
+    {#if !canManage}<span class="note">{t('person_manage_denied')}</span>{/if}
     <Button
       variant="ghost"
       onclick={() => {
@@ -170,7 +213,7 @@ const canSubmit = $derived(displayName.trim().length > 0 && canHr('personManage'
         dismiss()
       }}>{t('common.cancel')}</Button
     >
-    <Button onclick={() => create.mutate()} disabled={!canSubmit} loading={create.isPending}>
+    <Button onclick={submit} disabled={!canSubmit} loading={create.isPending}>
       {t('add_person')}
     </Button>
   {/snippet}
@@ -180,5 +223,12 @@ const canSubmit = $derived(displayName.trim().length > 0 && canHr('personManage'
 .form {
   display: grid;
   gap: 14px;
+}
+/* A colour, not opacity: opacity fades text against the dialog whatever token it names. */
+.note {
+  margin-inline-end: auto;
+  align-self: center;
+  font-size: 12px;
+  color: var(--kern-ink-500);
 }
 </style>

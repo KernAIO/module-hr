@@ -819,6 +819,21 @@ export const attendanceDays = schema.table(
     workedMinutes: integer('worked_minutes').notNull().default(0),
     breakMinutes: integer('break_minutes').notNull().default(0),
     overtimeMinutes: integer('overtime_minutes').notNull().default(0),
+    /**
+     * Overtime the policy's cap will not take — null where no cap was in force.
+     *
+     * Nullable rather than zero-by-default, because the two mean different things and a report has
+     * to tell them apart: null is "no cap applied to this day", zero is "a cap applied and nothing
+     * exceeded it". `computeDay` draws that distinction itself and this stores its answer — it is
+     * not re-derived here, or the two would eventually disagree.
+     *
+     * A statutory ceiling like Türkiye's 270 annual hours is a number somebody has to sum over a
+     * year, which is why it is a column and not only the `overtime_beyond_cap` anomaly beside it:
+     * text cannot be summed. The anomaly stays, and cannot drift from this — both come out of the
+     * same value one line apart in a pure function, and both are rebuilt on every recompute. The
+     * column is what a report sums; the anomaly is what puts the day in front of a person.
+     */
+    beyondCapMinutes: integer('beyond_cap_minutes'),
     lateMinutes: integer('late_minutes').notNull().default(0),
     earlyLeaveMinutes: integer('early_leave_minutes').notNull().default(0),
     status: text('status').notNull().default('absent'),

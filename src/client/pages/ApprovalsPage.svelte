@@ -4,6 +4,8 @@ import {
   type BadgeTone,
   Button,
   EmptyState,
+  formatCount,
+  formatDateTime,
   navigation,
   Page,
   PageHeader,
@@ -18,9 +20,9 @@ import DecisionDialog from '../components/DecisionDialog.svelte'
 import DelegationDialog from '../components/DelegationDialog.svelte'
 import { t } from '../i18n.js'
 import type { ApprovalRequest } from '../index.js'
-import { canHr } from '../permissions.js'
+import { canHr, HR_CAPABILITIES } from '../permissions.js'
 import { hrKeys } from '../query.js'
-import { dateRange, day, summarise } from '../summary.js'
+import { summarise } from '../summary.js'
 
 /**
  * Everything waiting on me, across every kind of request.
@@ -51,6 +53,25 @@ let deciding = $state<{ request: ApprovalRequest; decision: 'approve' | 'reject'
 let delegating = $state(false)
 let decideError = $state<string | null>(null)
 
+/**
+ * `submitting` rather than `decide.isPending`: the disabled attribute only reaches the confirm
+ * button on the next render, so two quick clicks both fire and one request is decided twice. This
+ * is set in the same tick as the click.
+ */
+let submitting = $state(false)
+
+/**
+ * Delegation is two questions, and the button was only asking one.
+ *
+ * `hr.approval.delegate` defaults to owner, admin and member, so every member saw the button — and
+ * `DelegationDialog` then calls `approvals.delegations`, which sits behind the `approvals`
+ * capability. That capability is off by default, so in a fresh workspace the dialog opened and
+ * 404'd on its first query. A capability that is off has no surface at all, not a surface that
+ * fails when you touch it.
+ */
+const hasChains = $derived(session.hasCapability('hr', HR_CAPABILITIES.approvals))
+const showDelegation = $derived(hasChains && canHr('approvalDelegate'))
+
 const inboxQuery = createQuery(() => ({
   queryKey: hrKeys.approvalInbox(workspaceId, includeDecided),
   enabled: Boolean(workspaceId),
@@ -73,10 +94,67 @@ const decide = createMutation(() => ({
     // is invalidated rather than guessing which keys moved.
     void queryClient.invalidateQueries({ queryKey: ['hr'] })
   },
-  onError: () => {
-    decideError = t('decide_error')
+  onError: (error) => {
+    decideError = decideFailure(error)
+    // A refusal is the server saying its inbox is not the one on screen, so the row behind the
+    // dialog is stale as well as the decision. Re-read all of HR exactly as a decision that landed
+    // does — without this the same dead row sits in the table and every retry earns the same
+    // sentence.
+    void queryClient.invalidateQueries({ queryKey: ['hr'] })
+  },
+  onSettled: () => {
+    submitting = false
   },
 }))
+
+/**
+ * The decision refusals this module has its own sentence for, keyed by the `reason` the router
+ * sends beside the refusal — never by the sentence, because a list of sentences is a list somebody
+ * has to keep in sync and the day it drifts the reader is told nothing.
+ *
+ * Empty on purpose. `approvals.decide` refuses through `KernError.conflict`, whose reason argument
+ * is kept on the server and never serialised, so every refusal arrives today as the sentence the
+ * router wrote for a person. The day `decide()` sends a reason, its string lands here and nothing
+ * else has to change.
+ */
+const decideRefusalMessages: Record<string, string> = {}
+
+/**
+ * What a refused decision says to the person who made it.
+ *
+ * A decision is refused when the request is no longer theirs to decide — somebody else approved it,
+ * the requester cancelled it, or a delegation moved the step — and the router's sentence is the
+ * only thing that says which of those happened. It used to be thrown away here for a flat "The
+ * decision could not be recorded", which tells a manager staring at a live-looking row nothing at
+ * all. Everything else that can fail carries machine text in English, so it falls back to this
+ * module's own string.
+ *
+ * The test is the transport's `code`, never the sentence: `KernError.conflict` is what arrives as
+ * CONFLICT, so a refusal added to `decide()` later reaches the reader without anyone editing this
+ * file. The same shape as `ClockControls.svelte` and the approvals widget.
+ */
+function decideFailure(error: unknown): string {
+  const failure = error as { code?: unknown; message?: string; data?: { reason?: unknown } }
+  if (failure.code !== 'CONFLICT') return t('decide_error')
+  const reason = typeof failure.data?.reason === 'string' ? failure.data.reason : null
+  const key = reason ? decideRefusalMessages[reason] : undefined
+  // `t()` answers a key it has no string for with the key itself, so both ways of not having one —
+  // a reason no key covers, and a key whose string has not been merged — land on the router's
+  // sentence rather than putting `hr.decide_refused_…` in front of somebody.
+  const translated = key ? t(key) : undefined
+  return (translated && translated !== key ? translated : failure.message) || t('decide_error')
+}
+
+const ask = (request: ApprovalRequest, decision: 'approve' | 'reject') => {
+  decideError = null
+  deciding = { request, decision }
+}
+
+const confirmDecision = (comment: string) => {
+  if (!deciding || submitting) return
+  submitting = true
+  decide.mutate({ requestId: deciding.request.id, decision: deciding.decision, comment })
+}
 
 const SUBJECT_LABELS: Record<string, () => string> = {
   leave: () => t('leave_title'),
@@ -100,9 +178,6 @@ const STATUS_LABELS: Record<string, () => string> = {
   cancelled: () => t('approval_status_cancelled'),
 }
 
-const when = (iso: string) =>
-  new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(iso))
-
 const stepOf = (request: ApprovalRequest) =>
   t('approvals_step_of', { n: String(request.currentStep + 1), total: String(request.steps.length) })
 </script>
@@ -112,7 +187,7 @@ const stepOf = (request: ApprovalRequest) =>
   title={t('approvals_title')}
 >
   {#snippet actions()}
-    {#if canHr('approvalDelegate')}
+    {#if showDelegation}
       <Button size="sm" variant="secondary" icon="users" onclick={() => (delegating = true)}>
         {t('delegate')}
       </Button>
@@ -135,26 +210,20 @@ const stepOf = (request: ApprovalRequest) =>
 
   <SectionLabel
     label={includeDecided ? t('approvals_decided') : t('approvals_waiting')}
-    count={items.length}
+    count={formatCount(items.length, 999)}
   />
 
+  <!--
+    Held rows outrank the error. Every decision taken here invalidates all of `['hr']`, so a failed
+    background refetch leaves TanStack in `error` with the last good inbox still in `data` — an
+    error branch above this one would blank a working table, and take its approve buttons with it,
+    on a transient failure. The error is the whole page only when there is nothing else to draw.
+  -->
   {#if inboxQuery.isLoading}
     <div class="rows">
       {#each [1, 2, 3] as n (n)}<Skeleton height="56px" />{/each}
     </div>
-  {:else if inboxQuery.isError}
-    <EmptyState icon="triangle-alert" title={t('approvals_error')}>
-      {#snippet actions()}
-        <Button variant="secondary" onclick={() => void inboxQuery.refetch()}>{t('retry')}</Button>
-      {/snippet}
-    </EmptyState>
-  {:else if items.length === 0}
-    <EmptyState
-      icon="check-check"
-      title={includeDecided ? t('approvals_decided_none') : t('approvals_none')}
-      description={includeDecided ? t('approvals_decided_none_desc') : t('approvals_none_desc')}
-    />
-  {:else}
+  {:else if items.length > 0}
     <div class="table" role="table" aria-label={t('approvals_title')}>
       <div class="thead" role="row">
         <span role="columnheader">{t('approvals_request')}</span>
@@ -170,7 +239,7 @@ const stepOf = (request: ApprovalRequest) =>
             <span class="summary">{summarise(item)}</span>
           </span>
           <span class="cell muted" role="cell">{item.requesterName ?? '—'}</span>
-          <span class="cell muted" role="cell">{when(item.requestedAt)}</span>
+          <span class="cell muted" role="cell">{formatDateTime(item.requestedAt)}</span>
           <span class="cell" role="cell">
             {#if includeDecided}
               <Badge tone={STATUS_TONES[item.status] ?? 'grey'}>
@@ -182,50 +251,55 @@ const stepOf = (request: ApprovalRequest) =>
           </span>
           <span class="cell actions" role="cell">
             {#if item.status === 'pending'}
-              <Button
-                size="sm"
-                variant="secondary"
-                onclick={() => {
-                  decideError = null
-                  deciding = { request: item, decision: 'reject' }
-                }}
-              >
+              <Button size="sm" variant="secondary" onclick={() => ask(item, 'reject')}>
                 {t('reject')}
               </Button>
-              <Button
-                size="sm"
-                onclick={() => {
-                  decideError = null
-                  deciding = { request: item, decision: 'approve' }
-                }}
-              >
-                {t('approve')}
-              </Button>
+              <Button size="sm" onclick={() => ask(item, 'approve')}>{t('approve')}</Button>
             {/if}
           </span>
         </div>
       {/each}
     </div>
+  {:else if inboxQuery.isError}
+    <EmptyState icon="triangle-alert" title={t('approvals_error')}>
+      {#snippet actions()}
+        <Button variant="secondary" onclick={() => void inboxQuery.refetch()}>{t('retry')}</Button>
+      {/snippet}
+    </EmptyState>
+  {:else}
+    <EmptyState
+      icon="check-check"
+      title={includeDecided ? t('approvals_decided_none') : t('approvals_none')}
+      description={includeDecided ? t('approvals_decided_none_desc') : t('approvals_none_desc')}
+    />
   {/if}
 
-  <p class="hint">{t('approvals_chains_hint')}</p>
+  <!--
+    Only where the workspace has chains. With the capability off there is no chain to configure —
+    the requester's manager approves, implicitly — so this line sent a reader to a settings screen
+    that is not there.
+  -->
+  {#if hasChains}
+    <p class="hint">{t('approvals_chains_hint')}</p>
+  {/if}
 </Page>
 
 <DecisionDialog
   request={deciding?.request ?? null}
   decision={deciding?.decision ?? 'approve'}
-  pending={decide.isPending}
+  pending={submitting}
   error={decideError}
-  onConfirm={(comment) => {
-    if (deciding) decide.mutate({ requestId: deciding.request.id, decision: deciding.decision, comment })
-  }}
+  onConfirm={confirmDecision}
   onCancel={() => {
     deciding = null
     decideError = null
   }}
 />
 
-<DelegationDialog open={delegating} {workspaceId} onClose={() => (delegating = false)} />
+<!-- Only where the workspace has approval chains: every procedure inside it is behind that one. -->
+{#if showDelegation}
+  <DelegationDialog open={delegating} {workspaceId} onClose={() => (delegating = false)} />
+{/if}
 
 <style>
 .filters {

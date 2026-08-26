@@ -344,7 +344,7 @@ function rulesFor(type: LeaveType): string[] {
   {:else if typesQuery.isError}
     <EmptyState icon="triangle-alert" title={t('leave_types_error')}>
       {#snippet actions()}
-        <Button variant="secondary" onclick={() => void typesQuery.refetch()}>{t('common.retry')}</Button>
+        <Button variant="secondary" onclick={() => void typesQuery.refetch()}>{t('retry')}</Button>
       {/snippet}
     </EmptyState>
   {:else if types.length === 0}

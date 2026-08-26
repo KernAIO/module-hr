@@ -3,7 +3,10 @@ import {
   Badge,
   Button,
   Card,
+  Dialog,
   EmptyState,
+  formatDateRange,
+  messageLocale,
   navigation,
   Page,
   PageHeader,
@@ -16,6 +19,7 @@ import { createMutation, createQuery, useQueryClient } from '@tanstack/svelte-qu
 import { getHrApi } from '../api-instance.js'
 import LeaveRequestDialog from '../components/LeaveRequestDialog.svelte'
 import { t } from '../i18n.js'
+import type { LeaveRequest } from '../index.js'
 import { canHr } from '../permissions.js'
 import { formatDays, hrKeys } from '../query.js'
 
@@ -26,6 +30,10 @@ import { formatDays, hrKeys } from '../query.js'
  * this page with — and the number they need before deciding anything is `available`, not `balance`.
  * Pending requests are already spoken for; showing the raw balance is how somebody books a week
  * they do not have and finds out at approval.
+ *
+ * Neither half may fail quietly. A refused balance used to take the strip off the page with no
+ * message and leave "No time off booked" underneath it, which reads as a person with nothing —
+ * no days left and none booked — rather than as a screen that never loaded.
  */
 const api = getHrApi()
 const queryClient = useQueryClient()
@@ -49,16 +57,120 @@ const requestsQuery = createQuery(() => ({
 }))
 const requests = $derived(requestsQuery.data?.items ?? [])
 
+/**
+ * A disabled query is `pending` and not fetching, so it is not "loading" — without the workspace
+ * test the first frame of this page shows the empty state of both halves to somebody who has
+ * twenty days left.
+ */
+const balanceLoading = $derived(!workspaceId || balanceQuery.isLoading)
+const requestsLoading = $derived(!workspaceId || requestsQuery.isLoading)
+
+/**
+ * A failed refetch that still has an answer to show.
+ *
+ * Everything here is invalidated by a cancellation and by any decision an approver makes, so a
+ * refetch failing while the last good balance is still in `data` is the ordinary case — an error
+ * branch above the data would blank a working page for as long as core takes to come back. One
+ * strip for both queries rather than two: when core is unreachable both fail, and two identical
+ * warnings stacked on one page is noise.
+ */
+const stale = $derived(
+  (balanceQuery.isError && balances.length > 0) || (requestsQuery.isError && requests.length > 0),
+)
+const refetchAll = () => {
+  void balanceQuery.refetch()
+  void requestsQuery.refetch()
+}
+
+const days = (n: number) => formatDays(n, messageLocale())
+
+/**
+ * The request waiting on a confirmation, and what the last attempt said.
+ *
+ * `cancelInFlight` rather than `cancel.isPending`: the disabled attribute only reaches the button
+ * on the next render, so two quick clicks both fire — and the second one arrives at a request the
+ * first has already cancelled, which the server answers with a refusal the person did nothing to
+ * deserve.
+ */
+let cancelling = $state<LeaveRequest | null>(null)
+let cancelInFlight = $state(false)
+let cancelError = $state<string | null>(null)
+
 const cancel = createMutation(() => ({
   mutationFn: (requestId: string) => api.leave.requests.cancel({ workspaceId, requestId }),
   onSuccess: () => {
+    cancelling = null
+    cancelError = null
     toast.success(t('leave_cancelled_toast'))
-    void queryClient.invalidateQueries({ queryKey: ['hr', 'leave-balance'] })
-    void queryClient.invalidateQueries({ queryKey: ['hr', 'leave-requests'] })
-    void queryClient.invalidateQueries({ queryKey: ['hr', 'leave-calendar'] })
+    // Cancelling moves a balance and the team calendar as well as this list, so the whole module's
+    // cache is invalidated rather than guessing which keys moved.
+    void queryClient.invalidateQueries({ queryKey: ['hr'] })
   },
-  onError: (error: Error) => toast.error(error.message),
+  onError: (error) => {
+    cancelError = cancelFailure(error)
+    // A refusal is the server saying its picture of this request is not the one on screen — most
+    // often because somebody decided it, or it was already cancelled from another device. Re-read
+    // all of HR exactly as a cancellation that landed does; without this the same dead row sits in
+    // the list and every retry earns the same sentence.
+    void queryClient.invalidateQueries({ queryKey: ['hr'] })
+  },
+  onSettled: () => {
+    cancelInFlight = false
+  },
 }))
+
+/**
+ * The cancellation refusals this module has its own sentence for, keyed by the `reason` the router
+ * sends beside the refusal — never by the sentence, because a list of sentences is a list somebody
+ * has to keep in sync and the day it drifts the reader is told nothing.
+ *
+ * Empty on purpose. `leave.requests.cancel` refuses through `KernError.conflict`, whose reason
+ * argument reaches the client as `data.reason` — `kernErrorToORPC` serialises it — so a refusal
+ * names itself in a form this module can translate. Anything the router refuses without one still
+ * arrives as its own sentence, which is the fallback below and not a failure.
+ */
+const cancelRefusalMessages: Record<string, string> = {
+  'hr.leave.already_cancelled': 'leave_cancel_refused_cancelled',
+  'hr.leave.already_withdrawn': 'leave_cancel_refused_withdrawn',
+}
+
+/**
+ * What a refused cancellation says to the person who asked for it.
+ *
+ * A cancellation is refused when the request is no longer theirs to cancel — it is already
+ * cancelled, or withdrawn — and the router's sentence is the only thing that says which. It used to
+ * be `error.message` for everything, which puts a gateway's English at somebody who reads Persian
+ * and cannot act on it either way. Everything else that can fail here carries machine text, so it
+ * falls back to this module's own string.
+ *
+ * The test is the transport's `code`, never the sentence: `KernError.conflict` is what arrives as
+ * CONFLICT, so a refusal added to `cancel()` later reaches the reader without anyone editing this
+ * file. The same shape as `ClockControls.svelte` and the approvals inbox.
+ */
+function cancelFailure(error: unknown): string {
+  const failure = error as { code?: unknown; message?: string; data?: { reason?: unknown } }
+  if (failure.code !== 'CONFLICT') return t('leave_cancel_error')
+  const reason = typeof failure.data?.reason === 'string' ? failure.data.reason : null
+  const key = reason ? cancelRefusalMessages[reason] : undefined
+  // `t()` answers a key it has no string for with the key itself, so both ways of not having one —
+  // a reason no key covers, and a key whose string has not been merged — land on the router's
+  // sentence rather than putting `hr.leave_cancel_refused_…` in front of somebody.
+  const translated = key ? t(key) : undefined
+  return (translated && translated !== key ? translated : failure.message) || t('leave_cancel_error')
+}
+
+const confirmCancel = () => {
+  if (!cancelling || cancelInFlight) return
+  cancelInFlight = true
+  cancelError = null
+  cancel.mutate(cancelling.id)
+}
+
+const closeCancel = () => {
+  if (cancelInFlight) return
+  cancelling = null
+  cancelError = null
+}
 
 const statusLabel = (s: string) =>
   s === 'pending'
@@ -75,16 +187,17 @@ const statusTone = (s: string) =>
   s === 'approved' ? 'done' : s === 'pending' ? 'upcoming' : s === 'rejected' ? 'declined' : 'grey'
 
 /**
- * A date range, through `Intl.formatRange`.
- *
- * Not two dates and a dash: a hand-built range reads backwards under `dir="rtl"` — the earlier date
- * ends up on the right — and `formatRange` collapses the parts the two dates share for free.
+ * `formatDateRange` rather than `Intl` directly: it formats in the reader's *interface* language,
+ * which is the one the rest of the row is written in, and it uses `formatRange` — a hand-built range
+ * reads backwards under `dir="rtl"`, with the earlier date on the right.
  */
-function range(from: string, to: string): string {
-  const fmt = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' })
-  return fmt.formatRange(new Date(`${from}T00:00:00`), new Date(`${to}T00:00:00`))
-}
+const dateRange = (from: string, to: string) => formatDateRange(`${from}T00:00:00`, `${to}T00:00:00`)
 
+/**
+ * An approved request can still be cancelled: the server reverses the ledger rather than deleting
+ * it, so the balance goes back up and the history still says what happened. What it must not be is
+ * one click away — see the dialog at the bottom of this file.
+ */
 const canCancel = (status: string) => canHr('leaveRequest') && (status === 'pending' || status === 'approved')
 </script>
 
@@ -100,40 +213,87 @@ const canCancel = (status: string) => canHr('leaveRequest') && (status === 'pend
 </PageHeader>
 
 <Page>
-  {#if balanceQuery.isLoading}
-    <Skeleton height="88px" />
+  {#if stale}
+    <p class="stale" role="status">
+      <span>{t('leave_stale')}</span>
+      <Button size="sm" variant="ghost" onclick={refetchAll}>{t('retry')}</Button>
+    </p>
+  {/if}
+
+  {#if balanceLoading}
+    <div class="tiles">
+      {#each [1, 2, 3] as n (n)}<Skeleton height="96px" />{/each}
+    </div>
   {:else if balances.length}
     <div class="tiles">
       {#each balances as balance (balance.leaveTypeId)}
         <StatTile
           label={balance.leaveTypeName}
-          value={formatDays(balance.available)}
+          value={days(balance.available)}
           note={`${t('available')} · ${t('days', { count: balance.available })}`}
         />
       {/each}
     </div>
+  {:else if balanceQuery.isError}
+    <div class="tiles-slot">
+      <EmptyState icon="triangle-alert" title={t('balance_error')}>
+        {#snippet actions()}
+          <Button variant="secondary" onclick={() => void balanceQuery.refetch()}>{t('retry')}</Button>
+        {/snippet}
+      </EmptyState>
+    </div>
+  {:else}
+    <!--
+      No balances means no leave types: the server returns one row per type, so an empty answer is a
+      workspace nobody has configured yet rather than a person with nothing left. The way out is
+      only offered to somebody who has it — a member cannot create a leave type, and a button that
+      404s is worse than none.
+    -->
+    <div class="tiles-slot">
+      <EmptyState
+        icon="tree-palm"
+        compact
+        title={t('leave_types_none')}
+        description={canHr('leaveManage') ? t('leave_types_none_desc') : undefined}
+      >
+        {#snippet actions()}
+          {#if canHr('leaveManage')}
+            <Button
+              size="sm"
+              variant="secondary"
+              icon="settings"
+              href={`/${workspaceSlug}/settings/hr/leave`}
+            >
+              {t('leave_types')}
+            </Button>
+          {/if}
+        {/snippet}
+      </EmptyState>
+    </div>
   {/if}
 
   <h2>{t('leave_title')}</h2>
-  {#if requestsQuery.isLoading}
-    <Skeleton height="120px" />
-  {:else if requests.length === 0}
-    <EmptyState icon="tree-palm" title={t('leave_none')} description={t('leave_none_desc')} />
-  {:else}
+  {#if requestsLoading}
+    <div class="rows">
+      {#each [1, 2, 3] as n (n)}<Skeleton height="58px" />{/each}
+    </div>
+  {:else if requests.length}
     <ul>
       {#each requests as request (request.id)}
         <li>
           <Card>
             <div class="row">
-              <span class="dates">{range(request.startsOn, request.endsOn)}</span>
-              <span class="meta">{formatDays(request.workingDays)} {t('days', { count: request.workingDays })}</span>
+              <span class="dates">{dateRange(request.startsOn, request.endsOn)}</span>
+              <span class="meta">{days(request.workingDays)} {t('days', { count: request.workingDays })}</span>
               <Badge tone={statusTone(request.status)}>{statusLabel(request.status)}</Badge>
               {#if canCancel(request.status)}
                 <Button
                   size="sm"
                   variant="ghost"
-                  disabled={cancel.isPending}
-                  onclick={() => cancel.mutate(request.id)}>{t('cancel_request')}</Button
+                  onclick={() => {
+                    cancelError = null
+                    cancelling = request
+                  }}>{t('cancel_request')}</Button
                 >
               {/if}
             </div>
@@ -141,10 +301,62 @@ const canCancel = (status: string) => canHr('leaveRequest') && (status === 'pend
         </li>
       {/each}
     </ul>
+  {:else if requestsQuery.isError}
+    <EmptyState icon="triangle-alert" title={t('leave_requests_error')}>
+      {#snippet actions()}
+        <Button variant="secondary" onclick={() => void requestsQuery.refetch()}>{t('retry')}</Button>
+      {/snippet}
+    </EmptyState>
+  {:else}
+    <EmptyState icon="tree-palm" title={t('leave_none')} description={t('leave_none_desc')} />
   {/if}
 </Page>
 
 <LeaveRequestDialog open={requesting} {workspaceId} {workspaceSlug} />
+
+<!--
+  Cancelling is not undoing, and the person clicking has to know what it costs before it happens: a
+  small ghost button beside a status badge was wired straight to the mutation, so one misclick threw
+  away a granted week. The body names the dates, the days that come back and the fact that the team
+  stops seeing the absence — an approved request also says so in its own line, because those are the
+  days colleagues have already planned around.
+-->
+<Dialog
+  open={cancelling !== null}
+  size="sm"
+  title={t('leave_cancel_title')}
+  onOpenChange={(next) => {
+    if (!next) closeCancel()
+  }}
+>
+  {#if cancelling}
+    <p class="body">
+      {t('leave_cancel_body', {
+        count: cancelling.workingDays,
+        range: dateRange(cancelling.startsOn, cancelling.endsOn),
+      })}
+    </p>
+    {#if cancelling.status === 'approved'}
+      <p class="body note">{t('leave_cancel_approved')}</p>
+    {/if}
+  {/if}
+  {#if cancelError}
+    <p class="body failed" role="alert">{cancelError}</p>
+  {/if}
+
+  {#snippet footer()}
+    <!--
+      Secondary, as in `DecisionDialog`: on a destructive confirmation the way *out* must not be the
+      faintest control on it. And it says "Keep it booked" rather than `cancel` — the shared string
+      every other dialog here uses — because "Cancel" beside "Cancel request" asks somebody to work
+      out which of two identical words abandons the booking and which destroys it.
+    -->
+    <Button variant="secondary" onclick={closeCancel} disabled={cancelInFlight}>
+      {t('leave_cancel_keep')}
+    </Button>
+    <Button variant="danger" loading={cancelInFlight} onclick={confirmCancel}>{t('cancel_request')}</Button>
+  {/snippet}
+</Dialog>
 
 <style>
 .tiles {
@@ -152,6 +364,33 @@ const canCancel = (status: string) => canHr('leaveRequest') && (status === 'pend
   grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
   gap: 12px;
   margin-block-end: 20px;
+}
+/* Keeps an error or empty balance on the same rhythm as the tiles it stands in for. */
+.tiles-slot {
+  margin-block-end: 20px;
+}
+.rows {
+  display: grid;
+  gap: 8px;
+}
+/*
+ * The warning ink is 4.37:1 on `--kern-canvas`, which is what this page sits on — under the 4.5 a
+ * 12.5px line has to clear. On its own tint it is 4.58:1 in light and 5.28:1 in dark, and the tint
+ * is what makes the strip read as a notice rather than as another row.
+ */
+.stale {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-block: 0 12px;
+  padding-block: 6px;
+  padding-inline: 12px 8px;
+  border-radius: var(--kern-r-md);
+  background: var(--kern-warning-tint);
+  color: var(--kern-warning);
+  font-size: 12.5px;
 }
 h2 {
   font-size: 13.5px;
@@ -176,5 +415,21 @@ ul {
 .meta {
   color: var(--kern-ink-500);
   font-size: 12px;
+}
+.body {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.55;
+  color: var(--kern-ink-700);
+}
+/* A colour, not opacity: opacity fades the text against the dialog whatever token it names. */
+.note {
+  margin-block-start: 8px;
+  color: var(--kern-ink-500);
+}
+/* A dialog body sits on --kern-surface-raised, not the page: 6.33:1 there in light, 5.04:1 in dark. */
+.failed {
+  margin-block-start: 8px;
+  color: var(--kern-danger);
 }
 </style>

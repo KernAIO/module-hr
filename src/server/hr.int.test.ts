@@ -5,7 +5,6 @@ import { call } from '@orpc/server'
 import { and, eq, inArray, isNull } from 'drizzle-orm'
 import pg from 'pg'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
-import { carryForward } from '../policy/accrual.js'
 import { zonedToInstant } from '../policy/time.js'
 import { hrModule } from './index.js'
 import { hrJobs } from './jobs.js'
@@ -2602,115 +2601,6 @@ describe('accrual run', () => {
 })
 
 /**
- * Carry-forward across the turn of the year.
- *
- * The subtle part is that it is **three** entries, not a transfer: the old year is closed out in
- * full (what lapsed, then what left) and the new year opened with what survived. Each year's ledger
- * then sums to what that year actually held, which is what makes "you had 9 days, 5 carried, 4
- * expired under the cap" a sentence somebody can check against the list.
- */
-describe('carry-forward', () => {
-  const svcLedger = new LedgerService()
-  let carol: string
-  let annualType: string
-
-  beforeAll(async () => {
-    const ids = await run(async (tx) => {
-      const [type] = await tx
-        .select()
-        .from(leaveTypes)
-        .where(and(eq(leaveTypes.workspaceId, WS_A), eq(leaveTypes.key, 'annual')))
-      const [person] = await tx
-        .insert(people)
-        .values({ workspaceId: WS_A, displayName: 'Carry Carol', hiredOn: '2020-01-01' })
-        .returning()
-      return { carol: person!.id, annualType: type!.id }
-    })
-    carol = ids.carol
-    annualType = ids.annualType
-
-    // Nine days standing at the end of 2025.
-    await run(async (tx) => {
-      await svcLedger.lockAndRead(tx, WS_A, carol, annualType, 2025)
-      return svcLedger.append(tx, WS_A, {
-        personId: carol,
-        leaveTypeId: annualType,
-        kind: 'grant',
-        amountMinutes: 9 * 8 * 60,
-        effectiveOn: '2025-01-01',
-        periodYear: 2025,
-      })
-    })
-  }, 60_000)
-
-  it('splits the balance into what lapsed and what carried, leaving both visible', async () => {
-    const CAP = 5 * 8 * 60
-    const balance = await run((tx) => svcLedger.lockAndRead(tx, WS_A, carol, annualType, 2025))
-    expect(balance).toBe(9 * 8 * 60)
-
-    const { carriedMinutes, expiredMinutes } = carryForward(balance, {
-      maxMinutes: CAP,
-      expiresAfterMonths: 3,
-    })
-    expect(carriedMinutes).toBe(CAP)
-    expect(expiredMinutes).toBe(4 * 8 * 60)
-
-    await run(async (tx) => {
-      await svcLedger.lockAndRead(tx, WS_A, carol, annualType, 2025)
-      await svcLedger.append(tx, WS_A, {
-        personId: carol,
-        leaveTypeId: annualType,
-        kind: 'expiry',
-        amountMinutes: -expiredMinutes,
-        effectiveOn: '2025-12-31',
-        periodYear: 2025,
-        reason: 'Above the 5 day carry-forward cap',
-      })
-      await svcLedger.append(tx, WS_A, {
-        personId: carol,
-        leaveTypeId: annualType,
-        kind: 'carry_out',
-        amountMinutes: -carriedMinutes,
-        effectiveOn: '2025-12-31',
-        periodYear: 2025,
-        reason: 'Carried into 2026',
-      })
-      await svcLedger.lockAndRead(tx, WS_A, carol, annualType, 2026)
-      await svcLedger.append(tx, WS_A, {
-        personId: carol,
-        leaveTypeId: annualType,
-        kind: 'carry_in',
-        amountMinutes: carriedMinutes,
-        effectiveOn: '2026-01-01',
-        periodYear: 2026,
-        reason: 'Carried from 2025',
-      })
-    })
-
-    // The closed year sums to nothing left: granted 9, expired 4, carried 5 out.
-    const y2025 = await run((tx) => svcLedger.balances(tx, WS_A, carol, 2025))
-    expect(y2025.find((b) => b.leaveTypeId === annualType)?.balanceMinutes).toBe(0)
-
-    // The new year opens with exactly what survived.
-    const y2026 = await run((tx) => svcLedger.balances(tx, WS_A, carol, 2026))
-    expect(y2026.find((b) => b.leaveTypeId === annualType)?.balance).toBe(5)
-  })
-
-  it('keeps every movement on the record, so the number can be argued with', async () => {
-    const entries = await run((tx) =>
-      tx
-        .select()
-        .from(leaveLedger)
-        .where(and(eq(leaveLedger.workspaceId, WS_A), eq(leaveLedger.personId, carol))),
-    )
-    const kinds = entries.map((e) => e.kind).sort()
-    expect(kinds).toEqual(['carry_in', 'carry_out', 'expiry', 'grant'])
-    // The expiry says why, rather than the balance simply being smaller than it was.
-    expect(entries.find((e) => e.kind === 'expiry')?.reason).toContain('carry-forward cap')
-  })
-})
-
-/**
  * The nightly reconcile, and the row it was not allowed to look at.
  *
  * `attendance_days.locked` is a cache of a question only a period can answer, and `recomputeDay`
@@ -2838,5 +2728,403 @@ describe('the nightly reconcile', () => {
     await reconcile()
     expect((await sheet(stuck, stuckOn))?.workedMinutes).toBe(360)
     expect((await sheet(filed, filedOn))?.workedMinutes).toBe(480)
+  })
+})
+
+/**
+ * The scheduled jobs, in each office's own calendar.
+ *
+ * The file they live in has said for months that they "fan out per office, deciding for each
+ * whether that office's local boundary has passed", and no handler read the offices table:
+ * `offices` and `todayIn` were imported, used nowhere, and re-exported at the bottom so the unused
+ * import would not fail lint. `accrue-leave` derived its period from `date_trunc('month', now())` —
+ * the database session's timezone — so a New York office was credited January's accrual at 21:00 on
+ * 31 January local, and `carry-forward` converted a cap in *days* at a hardcoded eight hours.
+ *
+ * None of that was ever asserted, because nothing had invoked either handler: the carry-forward
+ * tests called the pure function and hand-wrote the ledger entries they then read back. So this
+ * drives `hrJobs()` itself, against a real database and a clock this file moves, in a workspace with
+ * two offices eight hours apart. Every boundary below is checked twice — once at the instant only
+ * Istanbul has crossed it, and once at the instant New York has.
+ */
+describe("the jobs, in each office's own calendar", () => {
+  const WS_JOBS = randomUUID()
+  const IST = 'Europe/Istanbul'
+  const NY = 'America/New_York'
+  /** Seven and a half hours. The whole point: eight is an assumption, not a fact about a workday. */
+  const DAY = 450
+  const svcLedger = new LedgerService()
+  const inJobsWs = inWs(WS_JOBS)
+
+  let istanbul: string
+  let newYork: string
+  let annual: string
+  /** Istanbul: carries, accrues, and lets the carry lapse untouched. */
+  let sena: string
+  /** New York, the same in every respect except the eight hours between them. */
+  let dana: string
+  /** Istanbul, and spends part of the carry before the deadline. */
+  let spender: string
+  /** Istanbul until the end of June, New York from July. */
+  let moved: string
+
+  const runJob = (name: string) => {
+    const job = hrJobs().find((j) => j.name === name)
+    if (!job) throw new Error(`the ${name} job is gone`)
+    return job.handler({}, { kernel, id: 'test', attempt: 1 })
+  }
+  const clockReads = (instant: string) => vi.setSystemTime(new Date(instant))
+
+  const entries = (personId: string, periodYear: number) =>
+    inJobsWs((tx) =>
+      tx
+        .select()
+        .from(leaveLedger)
+        .where(
+          and(
+            eq(leaveLedger.workspaceId, WS_JOBS),
+            eq(leaveLedger.personId, personId),
+            eq(leaveLedger.periodYear, periodYear),
+          ),
+        ),
+    )
+
+  const minutes = async (personId: string, periodYear: number) =>
+    (await entries(personId, periodYear)).reduce((sum, e) => sum + e.amountMinutes, 0)
+
+  const kindsOf = async (personId: string, periodYear: number) =>
+    (await entries(personId, periodYear)).map((e) => e.kind).sort()
+
+  beforeAll(async () => {
+    const ids = await inJobsWs(async (tx) => {
+      const [ist] = await tx
+        .insert(offices)
+        .values({ workspaceId: WS_JOBS, name: 'Istanbul', country: 'TR', timezone: IST, isDefault: true })
+        .returning()
+      const [nyc] = await tx
+        .insert(offices)
+        .values({ workspaceId: WS_JOBS, name: 'New York', country: 'US', timezone: NY, isDefault: false })
+        .returning()
+      const [type] = await tx
+        .insert(leaveTypes)
+        .values({ workspaceId: WS_JOBS, key: 'annual', name: 'Annual leave', paid: true, unit: 'day' })
+        .returning()
+
+      const assign = async (
+        config: Record<string, unknown>,
+        kind: 'accrual' | 'carry_forward',
+        name: string,
+      ) => {
+        const [policy] = await tx
+          .insert(policies)
+          .values({
+            workspaceId: WS_JOBS,
+            kind,
+            name,
+            config,
+            effectiveFrom: '2020-01-01',
+            configHash: hashConfig(config),
+          })
+          .returning()
+        await tx.insert(policyAssignments).values({
+          workspaceId: WS_JOBS,
+          policyId: policy!.id,
+          subjectKind: 'workspace',
+          effectiveFrom: '2020-01-01',
+          priority: PolicyService.priorityFor('workspace'),
+        })
+      }
+
+      // The day length lives on the accrual policy and nowhere else, which is why carry-forward has
+      // to resolve it: `CarryForwardConfig` gives a cap in days and nothing to multiply it by.
+      await assign(
+        {
+          frequency: 'monthly',
+          daysPerYear: 24,
+          minutesPerDay: DAY,
+          seniorityTiers: [],
+          waitingPeriodMonths: 0,
+          calendar: 'gregorian',
+          roundToMinutes: 0,
+          leaveTypeKey: 'annual',
+        },
+        'accrual',
+        'Twenty-four days on a seven-and-a-half-hour day',
+      )
+      await assign(
+        { leaveTypeKey: 'annual', maxDays: 5, expiresAfterMonths: 3 },
+        'carry_forward',
+        'Five days, three months to use them',
+      )
+
+      const hire = async (displayName: string, officeId: string) => {
+        const [person] = await tx
+          .insert(people)
+          .values({ workspaceId: WS_JOBS, displayName, hiredOn: '2020-01-01', status: 'active' })
+          .returning()
+        await tx.insert(officeAssignments).values({
+          workspaceId: WS_JOBS,
+          personId: person!.id,
+          officeId,
+          isPrimary: true,
+          effectiveFrom: '2020-01-01',
+        })
+        await tx
+          .insert(employments)
+          .values({ workspaceId: WS_JOBS, personId: person!.id, effectiveFrom: '2020-01-01', fte: '1.000' })
+        return person!.id
+      }
+
+      const senaId = await hire('Sena in Istanbul', ist!.id)
+      const danaId = await hire('Dana in New York', nyc!.id)
+      const spenderId = await hire('Spender in Istanbul', ist!.id)
+
+      // Somebody who transferred. The office assignment ends; the punches it covered do not.
+      const [transferred] = await tx
+        .insert(people)
+        .values({ workspaceId: WS_JOBS, displayName: 'Moved in July', hiredOn: '2020-01-01' })
+        .returning()
+      await tx.insert(officeAssignments).values([
+        {
+          workspaceId: WS_JOBS,
+          personId: transferred!.id,
+          officeId: ist!.id,
+          isPrimary: true,
+          effectiveFrom: '2020-01-01',
+          effectiveTo: '2026-06-30',
+        },
+        {
+          workspaceId: WS_JOBS,
+          personId: transferred!.id,
+          officeId: nyc!.id,
+          isPrimary: true,
+          effectiveFrom: '2026-07-01',
+        },
+      ])
+      const [schedule] = await tx
+        .insert(schedules)
+        .values({ workspaceId: WS_JOBS, name: 'Ten hours and out', autoClockOutAfterMinutes: 600 })
+        .returning()
+      await tx.insert(scheduleAssignments).values({
+        workspaceId: WS_JOBS,
+        personId: transferred!.id,
+        scheduleId: schedule!.id,
+        effectiveFrom: '2020-01-01',
+      })
+
+      // Nine days standing at the end of 2025, for everybody the year turns under.
+      for (const personId of [senaId, danaId, spenderId]) {
+        await svcLedger.lockAndRead(tx, WS_JOBS, personId, type!.id, 2025)
+        await svcLedger.append(tx, WS_JOBS, {
+          personId,
+          leaveTypeId: type!.id,
+          kind: 'grant',
+          amountMinutes: 9 * DAY,
+          effectiveOn: '2025-01-01',
+          periodYear: 2025,
+        })
+      }
+
+      return {
+        istanbul: ist!.id,
+        newYork: nyc!.id,
+        annual: type!.id,
+        sena: senaId,
+        dana: danaId,
+        spender: spenderId,
+        moved: transferred!.id,
+      }
+    })
+    istanbul = ids.istanbul
+    newYork = ids.newYork
+    annual = ids.annual
+    sena = ids.sena
+    dana = ids.dana
+    spender = ids.spender
+    moved = ids.moved
+
+    // Faked only once the fixtures are in, so those rows are stamped by the real clock. `Date` and
+    // nothing else: the pg driver's own timeouts are real timers and must keep running.
+    vi.useFakeTimers({ toFake: ['Date'] })
+  }, 60_000)
+
+  afterAll(() => {
+    vi.useRealTimers()
+  })
+
+  describe('the turn of the entitlement year', () => {
+    it('carries for the office that has reached 2 January, and not for the one eight hours behind', async () => {
+      // 01:00 on the 2nd in Istanbul; still 17:00 on the 1st in New York.
+      clockReads('2026-01-01T22:00:00Z')
+      await runJob('carry-forward')
+
+      expect(await minutes(sena, 2025)).toBe(0)
+      expect(await kindsOf(sena, 2025)).toEqual(['carry_out', 'expiry', 'grant'])
+      // Dana's year has not ended yet, whatever UTC thinks.
+      expect(await minutes(dana, 2025)).toBe(9 * DAY)
+      expect(await kindsOf(dana, 2026)).toEqual([])
+    })
+
+    it('converts the five-day cap at the policy day length rather than at eight hours', async () => {
+      const carried = (await entries(sena, 2026)).find((e) => e.kind === 'carry_in')
+      // Five days of 450 minutes is 2250. At the hardcoded 8 × 60 the cap read as 2400 — more than
+      // the 2250 that could ever have been accrued on this policy, so it never bit at all.
+      expect(carried?.amountMinutes).toBe(5 * DAY)
+      const lapsed = (await entries(sena, 2025)).find((e) => e.kind === 'expiry')
+      expect(lapsed?.amountMinutes).toBe(-4 * DAY)
+      expect(lapsed?.reason).toContain('carry-forward cap')
+    })
+
+    it('says on the entry itself which day the carried leave has to be used by', async () => {
+      const carried = (await entries(sena, 2026)).find((e) => e.kind === 'carry_in')
+      // Three months from 1 January survives the whole of March. "Expires 1 April" is the same rule
+      // and reads as a different one, so the entry carries the last usable day.
+      expect(carried?.reason).toContain('use by 2026-03-31')
+    })
+
+    it('carries New York eight hours later, and does not carry Istanbul a second time', async () => {
+      clockReads('2026-01-02T06:00:00Z')
+      await runJob('carry-forward')
+
+      expect(await minutes(dana, 2025)).toBe(0)
+      expect(await minutes(dana, 2026)).toBe(5 * DAY)
+      // Istanbul is on the 2nd at this instant too, and has nothing left to carry.
+      expect((await entries(sena, 2026)).filter((e) => e.kind === 'carry_in')).toHaveLength(1)
+    })
+  })
+
+  describe('the month that just ended', () => {
+    it('accrues for the office whose month has turned, and only for it', async () => {
+      // 01:00 on 1 February in Istanbul; 17:00 on 31 January in New York.
+      clockReads('2026-01-31T22:00:00Z')
+      await runJob('accrue-leave')
+
+      const accrued = (await entries(sena, 2026)).filter((e) => e.kind === 'accrual')
+      expect(accrued).toHaveLength(1)
+      // A twelfth of twenty-four days of 450 minutes, stamped on the last day of the month it is for.
+      expect(accrued[0]?.amountMinutes).toBe((24 * DAY) / 12)
+      expect(accrued[0]?.effectiveOn).toBe('2026-01-31')
+      // `date_trunc('month', now())` credited December here, to both of them at once.
+      expect((await entries(dana, 2026)).filter((e) => e.kind === 'accrual')).toHaveLength(0)
+      expect(await entries(sena, 2025)).not.toContainEqual(
+        expect.objectContaining({ kind: 'accrual', effectiveOn: '2025-12-31' }),
+      )
+    })
+
+    it('accrues New York when its own month turns, and never twice for the same period', async () => {
+      clockReads('2026-02-01T06:00:00Z')
+      await runJob('accrue-leave')
+      await runJob('accrue-leave')
+
+      const accrued = (await entries(dana, 2026)).filter((e) => e.kind === 'accrual')
+      expect(accrued).toHaveLength(1)
+      expect(accrued[0]?.effectiveOn).toBe('2026-01-31')
+      expect((await entries(sena, 2026)).filter((e) => e.kind === 'accrual')).toHaveLength(1)
+    })
+  })
+
+  describe('the deadline on carried leave', () => {
+    beforeAll(async () => {
+      // The spender uses three of the five carried days before the deadline. Carried days are spent
+      // before the new year's own accrual, so only what is left of them can lapse.
+      await inJobsWs(async (tx) => {
+        await svcLedger.lockAndRead(tx, WS_JOBS, spender, annual, 2026)
+        await svcLedger.append(tx, WS_JOBS, {
+          personId: spender,
+          leaveTypeId: annual,
+          kind: 'consumption',
+          amountMinutes: -3 * DAY,
+          effectiveOn: '2026-02-10',
+          periodYear: 2026,
+        })
+      })
+    })
+
+    it('leaves it alone on the last day it can still be used', async () => {
+      // 01:00 on 31 March in Istanbul.
+      clockReads('2026-03-30T22:00:00Z')
+      await runJob('carry-forward')
+      expect(await kindsOf(sena, 2026)).toEqual(['accrual', 'carry_in'])
+    })
+
+    it('takes it away on the day it expires, for the office that has reached that day', async () => {
+      // 01:00 on 1 April in Istanbul; 18:00 on 31 March in New York.
+      clockReads('2026-03-31T22:00:00Z')
+      await runJob('carry-forward')
+
+      const lapsed = (await entries(sena, 2026)).find((e) => e.kind === 'expiry')
+      expect(lapsed?.amountMinutes).toBe(-5 * DAY)
+      expect(lapsed?.effectiveOn).toBe('2026-04-01')
+      expect(lapsed?.reason).toContain('not used by 2026-03-31')
+      // What survives is the year's own accrual, untouched.
+      expect(await minutes(sena, 2026)).toBe((24 * DAY) / 12)
+      // New York has not reached the 1st, so Dana still holds all five days.
+      expect((await entries(dana, 2026)).some((e) => e.kind === 'expiry')).toBe(false)
+    })
+
+    it('takes only what is left of the carry, because carried days are spent first', async () => {
+      const lapsed = (await entries(spender, 2026)).find((e) => e.kind === 'expiry')
+      // Five carried, three spent: two lapse, not five.
+      expect(lapsed?.amountMinutes).toBe(-2 * DAY)
+      expect(await minutes(spender, 2026)).toBe((24 * DAY) / 12)
+    })
+
+    it('running again takes nothing more', async () => {
+      await runJob('carry-forward')
+      expect((await entries(sena, 2026)).filter((e) => e.kind === 'expiry')).toHaveLength(1)
+      expect(await minutes(sena, 2026)).toBe((24 * DAY) / 12)
+    })
+
+    it('reaches New York eight hours later', async () => {
+      clockReads('2026-04-01T06:00:00Z')
+      await runJob('carry-forward')
+
+      const lapsed = (await entries(dana, 2026)).find((e) => e.kind === 'expiry')
+      expect(lapsed?.amountMinutes).toBe(-5 * DAY)
+      expect(await minutes(dana, 2026)).toBe((24 * DAY) / 12)
+    })
+  })
+
+  describe('a shift closed by the sweep', () => {
+    beforeAll(async () => {
+      await inJobsWs((tx) =>
+        tx.insert(punches).values({
+          workspaceId: WS_JOBS,
+          personId: moved,
+          direction: 'in',
+          at: new Date('2026-06-29T06:00:00Z'),
+          businessDate: '2026-06-29',
+          timezone: IST,
+        }),
+      )
+    })
+
+    it('is stamped with the zone of the office that day belonged to, not the one they moved to', async () => {
+      // Two days after the transfer: the ladder answers New York for today and Istanbul for the day
+      // the shift was worked. Resolving "as of now" is what wrote Amsterdam onto an Istanbul night.
+      clockReads('2026-07-01T12:00:00Z')
+      const now = await inJobsWs((tx) => new ResolveService().forPerson(tx, WS_JOBS, moved, '2026-07-01'))
+      expect(now.timezone).toBe(NY)
+
+      await runJob('auto-clock-out')
+
+      const rows = await inJobsWs((tx) =>
+        tx
+          .select()
+          .from(punches)
+          .where(and(eq(punches.workspaceId, WS_JOBS), eq(punches.personId, moved))),
+      )
+      const closed = rows.filter((r) => r.direction === 'out')
+      expect(closed).toHaveLength(1)
+      expect(closed[0]?.timezone).toBe(IST)
+      expect(closed[0]?.note).toBe('Closed automatically: no clock-out recorded')
+    })
+  })
+
+  it('leaves the offices it was given exactly as it found them', async () => {
+    const rows = await inJobsWs((tx) => tx.select().from(offices).where(eq(offices.workspaceId, WS_JOBS)))
+    expect(rows.map((r) => r.timezone).sort()).toEqual([NY, IST].sort())
+    expect(rows.filter((r) => r.isDefault)).toHaveLength(1)
+    expect([istanbul, newYork].every((id) => rows.some((r) => r.id === id))).toBe(true)
   })
 })

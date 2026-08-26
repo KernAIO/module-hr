@@ -5,10 +5,11 @@ import {
   type BadgeTone,
   Button,
   Card,
-  coreApi,
   EmptyState,
+  formatCount,
+  formatDate,
   Input,
-  keys,
+  messageLocale,
   navigation,
   Page,
   PageHeader,
@@ -20,17 +21,19 @@ import {
 } from '@kernhq/ui'
 import { createMutation, createQuery, useQueryClient } from '@tanstack/svelte-query'
 import { getHrApi } from '../api-instance.js'
+import DecisionDialog from '../components/DecisionDialog.svelte'
 import PersonFormDialog from '../components/PersonFormDialog.svelte'
 import PersonPanel from '../components/PersonPanel.svelte'
-import type { CoreApi } from '../core-api.js'
 import { t } from '../i18n.js'
+import type { ApprovalRequest } from '../index.js'
 import { canHr, HR_CAPABILITIES } from '../permissions.js'
 import { formatDays, hrKeys } from '../query.js'
+import { summarise } from '../summary.js'
 
 /**
  * The people view, laid out to DESIGN.md §3.12.
  *
- * Four stat tiles, then `minmax(0,1fr) 320px`: a real table on the left — name, role, office,
+ * A row of stat tiles, then `minmax(0,1fr) 320px`: a real table on the left — name, role, office,
  * started, status on one grid so the columns line up down the page — and the things that need a
  * decision on the right. A flat list of names would be a directory; this is the screen somebody
  * actually opens in the morning, which is why what is waiting on them sits beside it.
@@ -39,7 +42,6 @@ import { formatDays, hrKeys } from '../query.js'
  * one office is also the answer to "can I call them now".
  */
 const api = getHrApi()
-const core = coreApi<CoreApi>()
 const queryClient = useQueryClient()
 
 const workspaceSlug = $derived(navigation.workspaceSlug)
@@ -51,12 +53,21 @@ let officeTab = $state('all')
 const selected = $derived(navigation.search.person)
 const creating = $derived(navigation.search.new === '1')
 
-const modulesQuery = createQuery(() => ({
-  queryKey: keys.modules(workspaceId),
-  enabled: Boolean(workspaceId),
-  queryFn: () => core.workspaces.modules.list({ workspaceId }),
-}))
 const showOffices = $derived(session.hasCapability('hr', HR_CAPABILITIES.offices))
+/**
+ * Leave is a capability, and a workspace that never switched it on has no balance to show.
+ *
+ * Without this the main HR screen fired `leave.balance.get` on every load of a directory-only
+ * workspace and got a 404 back — the honest answer for a feature nobody enabled — leaving an
+ * "Available days" tile reading zero for ever beside three tiles that meant something.
+ */
+const showLeave = $derived(session.hasCapability('hr', HR_CAPABILITIES.leave))
+/**
+ * And the tile needs the permission as well as the capability: `leave.balance.get` is behind
+ * `hr.leave.view`, and a tile reading "0" because the request was refused is a worse answer than
+ * no tile.
+ */
+const showBalance = $derived(showLeave && canHr('leaveView'))
 
 /** Debounced: every keystroke would otherwise be a request, and the term is part of the cache key. */
 let debounced = $state('')
@@ -96,7 +107,7 @@ const tabs = $derived([
 
 const balancesQuery = createQuery(() => ({
   queryKey: hrKeys.leaveBalance(workspaceId, undefined),
-  enabled: Boolean(workspaceId),
+  enabled: Boolean(workspaceId) && showBalance,
   queryFn: () => api.leave.balance.get({ workspaceId }),
 }))
 
@@ -107,11 +118,91 @@ const inboxQuery = createQuery(() => ({
 }))
 const waiting = $derived(inboxQuery.data?.items ?? [])
 
+let deciding = $state<{ request: ApprovalRequest; decision: 'approve' | 'reject' } | null>(null)
+let decideError = $state<string | null>(null)
+
+/**
+ * `submitting` rather than `decide.isPending`: the disabled attribute only reaches the confirm
+ * button on the next render, so two quick clicks both fire and one request is decided twice. This
+ * is set in the same tick as the click.
+ */
+let submitting = $state(false)
+
+/**
+ * The decision refusals this module has its own sentence for, keyed by the `reason` the router
+ * sends beside the refusal. The same shape as `ClockControls.svelte`, and empty for the same reason
+ * the widget's is: `approvals.decide` refuses through `KernError.conflict`, whose reason argument
+ * stays on the server, so a refusal arrives today as the sentence the router wrote for a reader.
+ */
+const decideRefusalMessages: Record<string, string> = {}
+
+/**
+ * What a refused decision says to the person who made it.
+ *
+ * A decision is refused when the request is no longer theirs to decide — somebody else approved it,
+ * the requester cancelled it, a delegation moved the step — and that sentence is the only thing
+ * saying which. Everything else that can fail carries machine text in English, so it falls back to
+ * this module's own string. The test is the transport's `code`, never the sentence.
+ */
+function decideFailure(error: unknown): string {
+  const failure = error as { code?: unknown; message?: string; data?: { reason?: unknown } }
+  if (failure.code !== 'CONFLICT') return t('decide_error')
+  const reason = typeof failure.data?.reason === 'string' ? failure.data.reason : null
+  const key = reason ? decideRefusalMessages[reason] : undefined
+  // `t()` answers a key it has no string for with the key itself, so a reason nothing is written
+  // for lands on the router's sentence rather than putting `hr.decide_refused_…` in front of a
+  // person.
+  const translated = key ? t(key) : undefined
+  return (translated && translated !== key ? translated : failure.message) || t('decide_error')
+}
+
 const decide = createMutation(() => ({
-  mutationFn: (vars: { requestId: string; decision: 'approve' | 'reject' }) =>
-    api.approvals.decide({ workspaceId, ...vars }),
-  onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['hr'] }),
+  mutationFn: (vars: { requestId: string; decision: 'approve' | 'reject'; comment: string }) =>
+    api.approvals.decide({
+      workspaceId,
+      requestId: vars.requestId,
+      decision: vars.decision,
+      comment: vars.comment.trim() || null,
+    }),
+  onSuccess: () => {
+    deciding = null
+    decideError = null
+    // Deciding moves a balance and a day sheet as well as the inbox, so the whole module's cache is
+    // invalidated rather than guessing which keys moved.
+    void queryClient.invalidateQueries({ queryKey: ['hr'] })
+  },
+  onError: (error) => {
+    decideError = decideFailure(error)
+    // A refusal is the server saying its inbox is not the one on screen, so the row behind the
+    // dialog is stale as well as the decision. Re-read all of HR exactly as a decision that landed
+    // does — without this the same dead row sits here and every retry earns the same sentence.
+    void queryClient.invalidateQueries({ queryKey: ['hr'] })
+  },
+  onSettled: () => {
+    submitting = false
+  },
 }))
+
+const ask = (request: ApprovalRequest, decision: 'approve' | 'reject') => {
+  decideError = null
+  deciding = { request, decision }
+}
+
+const confirmDecision = (comment: string) => {
+  if (!deciding || submitting) return
+  submitting = true
+  decide.mutate({ requestId: deciding.request.id, decision: deciding.decision, comment })
+}
+
+/** The same map as the approvals inbox: a card labelled "Leave" over an overtime request lies. */
+const SUBJECT_LABELS: Record<string, () => string> = {
+  leave: () => t('leave_title'),
+  regularization: () => t('attendance_title'),
+  overtime: () => t('att_overtime'),
+  timesheet: () => t('approval_subject_timesheet'),
+  shift_swap: () => t('approval_subject_shift_swap'),
+}
+const subjectLabel = (subjectType: string) => SUBJECT_LABELS[subjectType]?.() ?? subjectType
 
 const stats = $derived({
   headcount: peopleQuery.data?.total ?? people.length,
@@ -152,11 +243,15 @@ $effect(() => {
   return () => clearInterval(handle)
 })
 
+/**
+ * `messageLocale()`, never the runtime default: a Persian reader gets Persian digits from `t()` in
+ * the same row, and a clock in Latin ones beside them is the one number nobody translated.
+ */
 function localTime(timezone: string | null, _tick: number): string | null {
   void _tick
   if (!timezone) return null
   try {
-    return new Intl.DateTimeFormat(undefined, {
+    return new Intl.DateTimeFormat(messageLocale(), {
       timeZone: timezone,
       hour: 'numeric',
       minute: '2-digit',
@@ -168,11 +263,10 @@ function localTime(timezone: string | null, _tick: number): string | null {
 }
 
 const started = (iso: string | null) =>
-  iso
-    ? new Intl.DateTimeFormat(undefined, { month: 'short', year: 'numeric' }).format(
-        new Date(`${iso}T00:00:00`),
-      )
-    : '—'
+  iso ? formatDate(`${iso}T00:00:00`, { month: 'short', year: 'numeric' }) : '—'
+
+/** `formatCount` caps at 99 for badges. A headcount is a real number and must not read "99+". */
+const count = (n: number) => formatCount(n, Number.MAX_SAFE_INTEGER)
 </script>
 
 <PageHeader
@@ -189,22 +283,30 @@ const started = (iso: string | null) =>
 
 <Page>
   <div class="tiles">
-    <StatTile size="md" label={t('widget_headcount_title')} value={new Intl.NumberFormat().format(stats.headcount)} />
+    <StatTile size="md" label={t('widget_headcount_title')} value={count(stats.headcount)} />
     <!--
       Only where the workspace has offices. It rendered unconditionally and read "Offices 0" on a
       single-site workspace — a tile counting a feature nobody switched on, sitting beside three
       that mean something. A capability that is off has no surface at all, tiles included.
     -->
     {#if showOffices}
-      <StatTile size="md" label={t('offices_title')} value={new Intl.NumberFormat().format(stats.offices)} />
+      <StatTile size="md" label={t('offices_title')} value={count(stats.offices)} />
     {/if}
-    <StatTile size="md" label={t('status_on_leave')} value={new Intl.NumberFormat().format(stats.away)} />
-    <StatTile size="md" label={t('available')} value={formatDays(stats.balance)} note={t('days', { count: stats.balance })} />
+    <StatTile size="md" label={t('status_on_leave')} value={count(stats.away)} />
+    <!-- Same rule for leave: the balance tile is the surface of a capability, so it goes with it. -->
+    {#if showBalance}
+      <StatTile
+        size="md"
+        label={t('available')}
+        value={formatDays(stats.balance, messageLocale())}
+        note={t('days', { count: stats.balance })}
+      />
+    {/if}
   </div>
 
   <div class="split">
     <section>
-      <SectionLabel label={t('title')} count={people.length} />
+      <SectionLabel label={t('title')} count={count(people.length)} />
 
       <div class="filters">
         {#if tabs.length > 1}
@@ -215,19 +317,17 @@ const started = (iso: string | null) =>
         </div>
       </div>
 
+      <!--
+        Held rows outrank the error. Every decision taken on this page invalidates all of `['hr']`,
+        so a failed background refetch leaves TanStack in `error` with the last good directory still
+        in `data` — an error branch above this one would blank a working table on a transient
+        failure. The error is the whole section only when there is nothing else to draw.
+      -->
       {#if peopleQuery.isLoading}
         <div class="rows">
           {#each [1, 2, 3, 4, 5] as n (n)}<Skeleton height="48px" />{/each}
         </div>
-      {:else if peopleQuery.isError}
-        <EmptyState icon="triangle-alert" title={t('people_error')}>
-          {#snippet actions()}
-            <Button variant="secondary" onclick={() => void peopleQuery.refetch()}>{t('common.retry')}</Button>
-          {/snippet}
-        </EmptyState>
-      {:else if people.length === 0}
-        <EmptyState icon="users" title={t('no_people')} description={t('no_people_desc')} />
-      {:else}
+      {:else if people.length > 0}
         <div class="table" role="table" aria-label={t('title')}>
           <div class="thead" role="row">
             <span role="columnheader">{t('title')}</span>
@@ -257,41 +357,51 @@ const started = (iso: string | null) =>
             </a>
           {/each}
         </div>
+      {:else if peopleQuery.isError}
+        <EmptyState icon="triangle-alert" title={t('people_error')}>
+          {#snippet actions()}
+            <Button variant="secondary" onclick={() => void peopleQuery.refetch()}>{t('retry')}</Button>
+          {/snippet}
+        </EmptyState>
+      {:else}
+        <EmptyState icon="users" title={t('no_people')} description={t('no_people_desc')} />
       {/if}
     </section>
 
     <aside>
-      <SectionLabel label={t('approvals_title')} count={waiting.length} />
+      <SectionLabel label={t('approvals_title')} count={formatCount(waiting.length)} />
+      <!-- Held cards outrank the error here too, and for the same reason: see the table above. -->
       {#if inboxQuery.isLoading}
         <Skeleton height="120px" />
-      {:else if waiting.length === 0}
-        <EmptyState bare compact icon="check-check" title={t('approvals_none')} />
-      {:else}
+      {:else if waiting.length > 0}
         <div class="cards">
           {#each waiting as item (item.id)}
             <Card>
               <div class="cardhead">
-                <Badge tone="upcoming">{t('leave_title')}</Badge>
+                <Badge tone="grey">{subjectLabel(item.subjectType)}</Badge>
               </div>
-              <p class="summary">{item.summary}</p>
+              <p class="summary">{summarise(item)}</p>
               <div class="cardactions">
-                <Button
-                  size="sm"
-                  disabled={decide.isPending}
-                  onclick={() => decide.mutate({ requestId: item.id, decision: 'approve' })}
-                  >{t('approve')}</Button
-                >
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  disabled={decide.isPending}
-                  onclick={() => decide.mutate({ requestId: item.id, decision: 'reject' })}
-                  >{t('reject')}</Button
-                >
+                <Button size="sm" variant="secondary" onclick={() => ask(item, 'reject')}>{t('reject')}</Button>
+                <Button size="sm" onclick={() => ask(item, 'approve')}>{t('approve')}</Button>
               </div>
             </Card>
           {/each}
         </div>
+      {:else if inboxQuery.isError}
+        <!--
+          Without this the empty state below told somebody "Nothing waiting on you" when their inbox
+          had simply failed to load — the one sentence on this page nobody would think to check.
+        -->
+        <EmptyState bare compact icon="triangle-alert" title={t('approvals_error')}>
+          {#snippet actions()}
+            <Button size="sm" variant="secondary" onclick={() => void inboxQuery.refetch()}>
+              {t('retry')}
+            </Button>
+          {/snippet}
+        </EmptyState>
+      {:else}
+        <EmptyState bare compact icon="check-check" title={t('approvals_none')} />
       {/if}
     </aside>
   </div>
@@ -300,6 +410,23 @@ const started = (iso: string | null) =>
 {#if selected}
   <PersonPanel personId={selected} {workspaceId} {workspaceSlug} />
 {/if}
+
+<!--
+  The same dialog the approvals inbox uses. Rejecting somebody's leave is irreversible from the
+  interface and notifies them, so it is never one click from a sidebar card — and the confirmation
+  says what the decision does, per subject type and per position in the chain.
+-->
+<DecisionDialog
+  request={deciding?.request ?? null}
+  decision={deciding?.decision ?? 'approve'}
+  pending={submitting}
+  error={decideError}
+  onConfirm={confirmDecision}
+  onCancel={() => {
+    deciding = null
+    decideError = null
+  }}
+/>
 
 <PersonFormDialog
   open={creating}

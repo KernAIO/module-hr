@@ -4,6 +4,8 @@ import {
   type BadgeTone,
   Button,
   EmptyState,
+  formatCount,
+  messageLocale,
   navigation,
   Page,
   PageHeader,
@@ -61,7 +63,10 @@ $effect(() => {
 function localTime(timezone: string, _tick: number): string {
   void _tick
   try {
-    return new Intl.DateTimeFormat(undefined, {
+    // The office's zone, the reader's locale: `localTime` from @kernhq/ui cannot help here because
+    // it formats in the reader's own zone, and the whole point of this column is somebody else's.
+    // `messageLocale()` is what stops the clocks reading in Latin digits on a Persian screen.
+    return new Intl.DateTimeFormat(messageLocale(), {
       timeZone: timezone,
       hour: 'numeric',
       minute: '2-digit',
@@ -75,7 +80,7 @@ function localTime(timezone: string, _tick: number): string {
 /** The country's own name, rather than a two-letter code nobody reads. */
 function countryName(code: string): string {
   try {
-    return new Intl.DisplayNames(undefined, { type: 'region' }).of(code) ?? code
+    return new Intl.DisplayNames(messageLocale(), { type: 'region' }).of(code) ?? code
   } catch {
     return code
   }
@@ -121,13 +126,13 @@ const kindTone = (kind: string): BadgeTone => (kind === 'remote' ? 'info' : 'gre
     <StatTile
       size="md"
       label={t('offices_countries')}
-      value={new Intl.NumberFormat().format(stats.countries)}
+      value={formatCount(stats.countries, Number.MAX_SAFE_INTEGER)}
     />
-    <StatTile size="md" label={t('office_people')} value={new Intl.NumberFormat().format(stats.people)} />
+    <StatTile size="md" label={t('office_people')} value={formatCount(stats.people, Number.MAX_SAFE_INTEGER)} />
     <StatTile
       size="md"
       label={t('offices_timezones')}
-      value={new Intl.NumberFormat().format(stats.timezones)}
+      value={formatCount(stats.timezones, Number.MAX_SAFE_INTEGER)}
     />
   </div>
 
@@ -167,7 +172,7 @@ const kindTone = (kind: string): BadgeTone => (kind === 'remote' ? 'info' : 'gre
           </span>
           <span class="cell" role="cell"><Badge tone={kindTone(office.kind)}>{kindLabel(office.kind)}</Badge></span>
           <span class="cell muted" role="cell">{countryName(office.country)}</span>
-          <span class="cell num" role="cell">{new Intl.NumberFormat().format(office.headcount)}</span>
+          <span class="cell num" role="cell">{formatCount(office.headcount, Number.MAX_SAFE_INTEGER)}</span>
           <span class="cell num" role="cell" title={office.timezone}>{localTime(office.timezone, tick)}</span>
         </a>
       {/each}

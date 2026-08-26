@@ -1,5 +1,5 @@
 <script lang="ts">
-import { Button, Skeleton, toast } from '@kernhq/ui'
+import { Button, localTime, Skeleton, toast } from '@kernhq/ui'
 import { createMutation, createQuery, useQueryClient } from '@tanstack/svelte-query'
 import { getHrApi } from '../api-instance.js'
 import { t } from '../i18n.js'
@@ -118,11 +118,7 @@ const punch = (action: Punch) => {
   act.mutate(action)
 }
 
-const since = $derived(
-  clock?.since
-    ? new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(new Date(clock.since))
-    : null,
-)
+const since = $derived(clock?.since ? localTime(new Date(clock.since)) : null)
 </script>
 
 <!--

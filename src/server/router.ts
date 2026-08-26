@@ -2585,8 +2585,14 @@ export function implement_(kernel: Kernel) {
           .handler(async ({ input, context }) => {
             const row = await db.withWorkspace(input.workspaceId, async (tx) => {
               const request = await loadRequest(tx, input.workspaceId, input.requestId)
-              if (request.status === 'cancelled' || request.status === 'withdrawn')
-                throw KernError.conflict('That request is already cancelled')
+              // A reason beside the sentence, because the sentence is English and the reason is what
+              // a client can translate. Two states, not one: "withdrawn" is the requester taking it
+              // back and "cancelled" is somebody else doing so, and telling a person their own
+              // withdrawal was "already cancelled" is a small lie about who did what.
+              if (request.status === 'cancelled')
+                throw KernError.conflict('That request is already cancelled.', 'hr.leave.already_cancelled')
+              if (request.status === 'withdrawn')
+                throw KernError.conflict('That request was already withdrawn.', 'hr.leave.already_withdrawn')
 
               const year = yearOf(request.startsOn)
               await ledger.lockAndRead(tx, input.workspaceId, request.personId, request.leaveTypeId, year)

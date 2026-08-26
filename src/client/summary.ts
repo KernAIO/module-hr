@@ -1,3 +1,4 @@
+import { formatDate, formatDateRange } from '@kernhq/ui'
 import type { ApprovalRequest } from '../contract/index.js'
 import { t } from './i18n.js'
 
@@ -28,11 +29,15 @@ export function summarise(request: ApprovalRequest): string {
   return request.summary
 }
 
-export const day = (iso: string) =>
-  new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).format(new Date(iso))
+/**
+ * `formatDate`, not a bare `Intl.DateTimeFormat(undefined, …)`.
+ *
+ * `undefined` means the browser's locale, which is not the one the reader chose — so the date half
+ * of a sentence came out in Latin digits while `t()` rendered the word half in Persian ones, in the
+ * same line. The shared helper passes `messageLocale()`, and it is the same call underneath.
+ * This matters wherever it is used, and `summarise()` is what all three approvals surfaces render.
+ */
+export const day = (iso: string) => formatDate(iso)
 
 /** One range, not two dates and a dash — the separator is the locale's, and RTL needs its own. */
-export const dateRange = (from: string, to: string) =>
-  from === to
-    ? day(from)
-    : new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).formatRange(new Date(from), new Date(to))
+export const dateRange = (from: string, to: string) => (from === to ? day(from) : formatDateRange(from, to))

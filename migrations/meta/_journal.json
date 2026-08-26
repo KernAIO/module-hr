@@ -57,6 +57,13 @@
       "when": 1787848170496,
       "tag": "0007_hot_path_indexes",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1787759372069,
+      "tag": "0009_beyond_cap_minutes",
+      "breakpoints": true
     }
   ]
 }
