@@ -22,7 +22,6 @@ import {
 } from '../contract/policies.js'
 import { accrueForPeriod } from '../policy/accrual.js'
 import { countWorkingDays, workingDays } from '../policy/calendar.js'
-import { attributeToShift } from '../policy/working-time.js'
 import { COUNTRY_PACKS, packDays, packFor } from './packs/index.js'
 import {
   approvalChains,
@@ -1903,14 +1902,17 @@ export function implement_(kernel: Kernel) {
         .handler(({ input, context }) =>
           db.withWorkspace(input.workspaceId, async (tx) => {
             const personId = await personFor(tx, input.workspaceId, context, input.personId)
-            const { timezone, businessDate, schedule } = await clockContext(tx, input.workspaceId, personId)
-            const rows = await attendance.punchesOn(tx, input.workspaceId, personId, businessDate)
+            // The same attribution the next punch will be judged against, so what a person is shown
+            // and what they are then allowed to do cannot disagree. Somebody who forgot to clock out
+            // last night is told they are still on last night's shift, which is both true and the
+            // thing they need to know before pressing anything.
+            const { timezone, at, attribution } = await clockNow(tx, input.workspaceId, personId)
 
             let open: Date | null = null
             let onBreak = false
             let workedMs = 0
             let breakOpen: Date | null = null
-            for (const r of rows) {
+            for (const r of attribution.punches) {
               if (r.direction === 'in') open = r.at
               else if (r.direction === 'out' && open) {
                 workedMs += r.at.getTime() - open.getTime()
@@ -1925,14 +1927,14 @@ export function implement_(kernel: Kernel) {
               }
             }
             // An open span counts up to now, so the widget shows time accruing rather than freezing
-            // at the last completed pair.
-            if (open) workedMs += Date.now() - open.getTime()
-            if (breakOpen) workedMs -= Date.now() - breakOpen.getTime()
-            void schedule
+            // at the last completed pair. `at` rather than a fresh `Date.now()`: one instant per
+            // request, the one the attribution was made from.
+            if (open) workedMs += at.getTime() - open.getTime()
+            if (breakOpen) workedMs -= at.getTime() - breakOpen.getTime()
 
             return {
               personId,
-              businessDate,
+              businessDate: attribution.businessDate,
               clockedIn: open !== null,
               onBreak,
               since: (open ?? breakOpen)?.toISOString() ?? null,
@@ -1997,7 +1999,7 @@ export function implement_(kernel: Kernel) {
                 me?.id ?? null,
               )
               // The day is derived, so voiding a punch means the sheet is stale until it is rebuilt.
-              const { timezone, schedule } = await clockContext(tx, input.workspaceId, original.personId)
+              const { timezone, schedule } = await personContext(tx, input.workspaceId, original.personId)
               await attendance.recomputeDay(
                 tx,
                 input.workspaceId,
@@ -2069,7 +2071,7 @@ export function implement_(kernel: Kernel) {
           .handler(({ input, context }) =>
             db.withWorkspace(input.workspaceId, async (tx) => {
               const personId = await personFor(tx, input.workspaceId, context, input.personId)
-              const { timezone, schedule } = await clockContext(tx, input.workspaceId, personId)
+              const { timezone, schedule } = await personContext(tx, input.workspaceId, personId)
               const dates = await attendance.datesWithPunches(
                 tx,
                 input.workspaceId,
@@ -2495,7 +2497,12 @@ export function implement_(kernel: Kernel) {
 
               const sim = await simulate(tx, input.workspaceId, personId, input)
               if (sim.blockers.length)
-                throw KernError.conflict(sim.blockers[0]!.message, `hr.leave.${sim.blockers[0]!.code}`)
+                // `details`, for the reason `refusePunch` gives: `KernError.conflict`'s second
+                // argument is kept on the error object and never serialised, so the blocker code
+                // this line has always meant to send was reaching nobody.
+                throw new KernError('CONFLICT', sim.blockers[0]!.message, {
+                  reason: `hr.leave.${sim.blockers[0]!.code}`,
+                })
 
               const [request] = await tx
                 .insert(leaveRequests)
@@ -3591,7 +3598,7 @@ export function implement_(kernel: Kernel) {
   }
 
   /**
-   * Everything a punch needs: the person's zone, today's business date, and their schedule.
+   * Everything a punch needs about a person: their zone, and the schedule that shapes their day.
    *
    * The zone comes from the resolution ladder — their primary office unless they have an override —
    * so a punch made on a business trip still counts towards the month they are employed in.
@@ -3602,15 +3609,53 @@ export function implement_(kernel: Kernel) {
    * transferred entity had a filed month recomputed against the one they are in now. `recomputeDay`
    * asks that question of the day it is rebuilding.
    */
-  async function clockContext(tx: Tx, workspaceId: string, personId: string) {
+  async function personContext(tx: Tx, workspaceId: string, personId: string) {
     const today = todayIso()
     const resolution = await resolve.forPerson(tx, workspaceId, personId, today)
     const schedule = await attendance.scheduleFor(tx, workspaceId, personId, today)
-    // Their zone decides the date, and a night shift's tail belongs to the day it started — the
-    // same attribution `attendance.record` makes, because a clock-out that reads the day one way
-    // while the punch reads it the other is refused as "you are not clocked in".
-    const { businessDate } = attributeToShift(Date.now(), resolution.timezone, (d) => schedule.shiftFor(d))
-    return { timezone: resolution.timezone, businessDate, schedule, resolution }
+    return { timezone: resolution.timezone, schedule, resolution }
+  }
+
+  /**
+   * The same, plus the one decision every clock procedure has to agree about: which shift *this
+   * instant* belongs to, and what is already filed on it.
+   *
+   * The instant is taken once, here, and travels with its answer — so the guard, the row that is
+   * written and the figures the widget shows all come out of a single attribution. They used to be
+   * three: `clockContext` attributed `Date.now()`, the guard re-read the punches of whatever date
+   * that produced, and `record` attributed its own `new Date()` again on the way to the insert.
+   * Every version of the night-shift bug is those answers disagreeing, and a person being told they
+   * are not clocked in at the end of a shift they have just worked.
+   */
+  async function clockNow(tx: Tx, workspaceId: string, personId: string) {
+    const context = await personContext(tx, workspaceId, personId)
+    const at = new Date()
+    const attribution = await attendance.attribute(
+      tx,
+      workspaceId,
+      personId,
+      at.getTime(),
+      context.timezone,
+      context.schedule,
+    )
+    return { ...context, at, attribution }
+  }
+
+  /**
+   * A refused punch: the sentence for the reader, and a stable reason for the screen.
+   *
+   * The reason travels in `details`, not in `KernError.conflict`'s `reason` argument. Only
+   * `details` is on the wire — `kernErrorToORPC` maps it to the oRPC error's `data` and drops
+   * everything else — so a reason passed as `conflict(message, reason)` never leaves this process.
+   * Reasons are dotted and namespaced like `hr.leave.*` above, and are API: renaming one silently
+   * puts the English sentence back in front of every non-English reader.
+   *
+   * A `function`, like every other helper down here: these sit after the router's `return`, so a
+   * `const` is never initialised and the first refusal throws a ReferenceError instead of a
+   * conflict. `noUnreachable` is what catches that — nothing else does until a person punches.
+   */
+  function refusePunch(reason: string, message: string) {
+    return new KernError('CONFLICT', message, { reason })
   }
 
   /**
@@ -3635,7 +3680,7 @@ export function implement_(kernel: Kernel) {
   ) {
     const row = await db.withWorkspace(input.workspaceId, async (tx) => {
       const personId = await personFor(tx, input.workspaceId, context, input.personId)
-      const { timezone, businessDate, schedule, resolution } = await clockContext(
+      const { timezone, schedule, resolution, at, attribution } = await clockNow(
         tx,
         input.workspaceId,
         personId,
@@ -3643,31 +3688,41 @@ export function implement_(kernel: Kernel) {
 
       // Refuse the transitions that make no sense, with a sentence rather than a constraint error:
       // clocking in twice, or out when never in, is somebody double-tapping a button.
-      const existing = await attendance.punchesOn(tx, input.workspaceId, personId, businessDate)
-      const open = openState(existing)
-      if (direction === 'in' && open.clockedIn) throw KernError.conflict('You are already clocked in.')
-      if (direction === 'out' && !open.clockedIn) throw KernError.conflict('You are not clocked in.')
+      //
+      // The sentence is written for a person, and it is written in English — a router has no locale.
+      // So every refusal also carries a *reason*, which is what the clock widget translates; the
+      // sentence is what it falls back to for a reason it has no string for, so a sixth refusal
+      // added here reaches the reader in English rather than not at all.
+      //
+      // What it is judged against comes out of the attribution rather than being fetched again.
+      // Re-reading `punchesOn(businessDate)` here is what made the guard circular: it could only
+      // ever confirm the date the attribution had already chosen, so a wrong choice arrived as
+      // "You are not clocked in." at the end of a shift somebody had just worked.
+      const open = attribution.open
+      if (direction === 'in' && open.clockedIn)
+        throw refusePunch('hr.clock.already_clocked_in', 'You are already clocked in.')
+      if (direction === 'out' && !open.clockedIn)
+        throw refusePunch('hr.clock.not_clocked_in', 'You are not clocked in.')
       if (direction === 'break_start' && !open.clockedIn)
-        throw KernError.conflict('Clock in before starting a break.')
-      if (direction === 'break_start' && open.onBreak) throw KernError.conflict('You are already on a break.')
-      if (direction === 'break_end' && !open.onBreak) throw KernError.conflict('You are not on a break.')
+        throw refusePunch('hr.clock.break_before_clock_in', 'Clock in before starting a break.')
+      if (direction === 'break_start' && open.onBreak)
+        throw refusePunch('hr.clock.already_on_break', 'You are already on a break.')
+      if (direction === 'break_end' && !open.onBreak)
+        throw refusePunch('hr.clock.not_on_break', 'You are not on a break.')
 
-      const punchRow = await attendance.record(
-        tx,
-        input.workspaceId,
-        {
-          personId,
-          direction,
-          timezone,
-          method: input.method ?? 'web',
-          clientReportedAt: input.clientReportedAt ?? null,
-          officeId: resolution.primaryOfficeId,
-          geo: input.geo ?? null,
-          note: input.note ?? null,
-          idempotencyKey: input.idempotencyKey ?? null,
-        },
-        schedule,
-      )
+      const punchRow = await attendance.record(tx, input.workspaceId, {
+        personId,
+        direction,
+        at,
+        businessDate: attribution.businessDate,
+        timezone,
+        method: input.method ?? 'web',
+        clientReportedAt: input.clientReportedAt ?? null,
+        officeId: resolution.primaryOfficeId,
+        geo: input.geo ?? null,
+        note: input.note ?? null,
+        idempotencyKey: input.idempotencyKey ?? null,
+      })
 
       // A punch inside a closed month is still recorded — it is a fact about somebody's day, and
       // refusing it because payroll has been filed loses the fact to protect the report. What must
@@ -3698,21 +3753,6 @@ export function implement_(kernel: Kernel) {
     return toPunch(row)
   }
 
-  /** Whether a person is currently clocked in or on a break, from their punches so far. */
-  function openState(rows: Array<{ direction: string }>) {
-    let clockedIn = false
-    let onBreak = false
-    for (const r of rows) {
-      if (r.direction === 'in') clockedIn = true
-      else if (r.direction === 'out') {
-        clockedIn = false
-        onBreak = false
-      } else if (r.direction === 'break_start') onBreak = true
-      else if (r.direction === 'break_end') onBreak = false
-    }
-    return { clockedIn, onBreak }
-  }
-
   /**
    * Apply an approved correction: write the proposed punches, void what they replace, rebuild.
    *
@@ -3730,7 +3770,7 @@ export function implement_(kernel: Kernel) {
 
     if (row.punchId) await attendance.voidPunch(tx, workspaceId, row.punchId, 'Regularized', null)
 
-    const { timezone, schedule } = await clockContext(tx, workspaceId, row.personId)
+    const { timezone, schedule } = await personContext(tx, workspaceId, row.personId)
     for (const proposal of row.proposed as Array<{ direction: string; at: string }>)
       await tx.insert(punches).values({
         id: uuidv7(),

@@ -95,6 +95,12 @@ export const offices = schema.table(
   (t) => [
     index('hr_offices_ws_idx').on(t.workspaceId, t.archivedAt),
     index('hr_offices_ws_country_idx').on(t.workspaceId, t.country),
+    /**
+     * One default office per workspace — the invariant `isDefault` above describes, created by
+     * 0001. Declared here rather than left to the migration alone because a snapshot that does not
+     * know about an index is what lets a later `db:generate` propose creating it a second time.
+     */
+    uniqueIndex('hr_offices_one_default_per_ws').on(t.workspaceId).where(sql`is_default`),
   ],
 )
 
@@ -137,7 +143,13 @@ export const orgUnits = schema.table(
     createdAt: created(),
     updatedAt: updated(),
   },
-  (t) => [index('hr_org_units_ws_idx').on(t.workspaceId, t.archivedAt)],
+  (t) => [
+    index('hr_org_units_ws_idx').on(t.workspaceId, t.archivedAt),
+    /** Two departments at one path would make a subtree query return one of them arbitrarily. */
+    uniqueIndex('hr_org_units_ws_path_uq').on(t.workspaceId, t.path),
+    /** The `<@` lookup the comment on `path` is about. A btree cannot answer it. */
+    index('hr_org_units_path_gist').using('gist', t.path),
+  ],
 )
 
 export const positions = schema.table(
@@ -526,6 +538,16 @@ export const leaveRequestDays = schema.table(
   (t) => [
     index('hr_leave_days_person_idx').on(t.workspaceId, t.personId, t.date),
     index('hr_leave_days_request_idx').on(t.requestId),
+    /**
+     * No person holds two live requests covering one date. The balance cursor serialises the
+     * spend; this refuses the overlap, whatever the application layer believes.
+     *
+     * Partial on purpose: a cancelled or rejected request must not block rebooking the same day,
+     * and an uncounted weekend inside a range conflicts with nothing.
+     */
+    uniqueIndex('hr_leave_days_no_double_booking')
+      .on(t.workspaceId, t.personId, t.date)
+      .where(sql`counted and status in ('pending', 'approved')`),
   ],
 )
 
@@ -596,6 +618,11 @@ export const approvalRequests = schema.table(
   (t) => [
     index('hr_approval_requests_subject_idx').on(t.workspaceId, t.subjectType, t.subjectId),
     index('hr_approval_requests_status_idx').on(t.workspaceId, t.status),
+    /**
+     * "Everything Ayşe has asked for", which the person page reads. The inbox itself lists by
+     * approver and only then names the requester, so that query does not use this.
+     */
+    index('hr_approval_requests_requester_idx').on(t.workspaceId, t.requesterPersonId, t.requestedAt.desc()),
   ],
 )
 
@@ -743,6 +770,13 @@ export const punches = schema.table(
   },
   (t) => [
     index('hr_punches_person_idx').on(t.workspaceId, t.personId, t.businessDate),
+    /**
+     * A retried punch is the same punch. `business_date` is in the key because it is the partition
+     * column, and a partitioned table refuses a unique index that does not contain one.
+     */
+    uniqueIndex('hr_punches_idem_uq')
+      .on(t.workspaceId, t.idempotencyKey, t.businessDate)
+      .where(sql`"idempotency_key" is not null`),
     /**
      * The hourly auto-clock-out sweep. It asks for open `in` punches older than a cutoff, and until
      * this index not one of the four columns it filters on was indexed — half a million rows a

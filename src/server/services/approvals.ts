@@ -1,5 +1,5 @@
 import { KernError, type Kernel, type Tx, uuidv7 } from '@kernhq/kernel'
-import { and, desc, eq, inArray, isNull, lte, or, sql } from 'drizzle-orm'
+import { and, arrayOverlaps, desc, eq, inArray, isNull, lte, or, sql } from 'drizzle-orm'
 import type { ApprovalChainSpec, ApprovalStepSpec, ApproverSubject } from '../../contract/index.js'
 import {
   approvalChains,
@@ -419,14 +419,20 @@ export class ApprovalService {
       )
     const actingFor = [personId, ...delegated.map((d) => d.fromPersonId)]
 
+    // The overlap goes through `arrayOverlaps`, which binds the ids as one `uuid[]` parameter. The
+    // hand-built `ARRAY['…','…']::uuid[]` it replaces pasted values straight into the statement —
+    // they come from this module's own rows, so nothing could be injected through it, but a query
+    // that concatenates identifiers is one refactor away from one that does.
+    //
+    // `approver_ids && …` is the whole point of the GIN index on that column: no btree can answer
+    // an array overlap, so this — the query every manager triggers on every page load — was a
+    // sequential scan over a table that only ever grows. Only `requestId` is read, so only
+    // `requestId` is selected; the rest of the step is fetched by the detail view.
     const steps = await tx
-      .select()
+      .select({ requestId: approvalSteps.requestId })
       .from(approvalSteps)
       .where(
-        and(
-          eq(approvalSteps.workspaceId, workspaceId),
-          sql`${approvalSteps.approverIds} && ${sql.raw(`ARRAY[${actingFor.map((i) => `'${i}'`).join(',')}]::uuid[]`)}`,
-        ),
+        and(eq(approvalSteps.workspaceId, workspaceId), arrayOverlaps(approvalSteps.approverIds, actingFor)),
       )
     if (!steps.length) return []
 

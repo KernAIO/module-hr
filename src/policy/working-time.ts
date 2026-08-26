@@ -73,28 +73,137 @@ const toMinutes = (wall: string): number => {
 }
 
 /**
- * Which business day a punch belongs to.
+ * Whether a shift is already running, by business date — the fact a clock reading cannot supply.
  *
- * For a day shift, the local date. For a night shift, **the date the shift started**: somebody
- * clocking out at 06:00 on Tuesday finished Monday's shift, and putting those minutes on Tuesday
- * leaves Monday short and Tuesday long — which is how a month's total comes out right while every
- * individual day is wrong.
- *
- * The zone is the person's, from their primary office. A punch on a business trip records the zone
- * it happened in for audit but is still attributed here, or a week abroad splits somebody's month
- * across two calendars.
+ * Both are read from punches already filed: a clock-in with no clock-out after it. Gathering them is
+ * the caller's job and deciding what they mean is this file's, the same split `computeDay` already
+ * makes with the punches themselves.
  */
-export function businessDateFor(instantMs: number, timeZone: string, shift: ShiftSpec | null): IsoDate {
-  const localDate = dateIn(instantMs, timeZone)
-  if (!shift || !crossesMidnight(shift)) return localDate
+export interface OpenShifts {
+  /** A shift left open on the punch's own local date. */
+  onLocalDate: boolean
+  /** A shift left open on the date before it — the night that may still be running. */
+  onPreviousDate: boolean
+  /**
+   * The previous date already holds punches, open or closed.
+   *
+   * Distinct from `onPreviousDate`, and the difference is a day sheet nobody can explain. A night
+   * worked 22:00–05:30 and clocked out of is *closed*, so it is not open — but it is also not
+   * waiting for anybody, and an arrival at 05:50 that joined it rewrote a finished Friday from
+   * 450 minutes to 1060, with four punches and nine hours of overtime, from somebody turning up
+   * early for Saturday.
+   */
+  workedPreviousDate: boolean
+}
 
-  const minutes = minutesOfDayIn(instantMs, timeZone)
-  const startMin = toMinutes(shift.start)
-  const endMin = toMinutes(shift.end)
-  // Anything in the small hours up to a margin past the shift's end belongs to the previous day, so
-  // a late clock-out is still attributed to the shift it actually finished.
-  const tail = Math.min(startMin, endMin + 240)
-  return minutes < tail ? previousDate(localDate) : localDate
+/** Nobody is mid-shift and nothing was worked yesterday, so every punch is an arrival. */
+export const NOTHING_OPEN: OpenShifts = {
+  onLocalDate: false,
+  onPreviousDate: false,
+  workedPreviousDate: false,
+}
+
+/**
+ * What one business date's punches say about whether a shift, and a break, are still running.
+ *
+ * One reduction behind three questions that must never disagree: which shift the next punch joins,
+ * whether the transition it asks for is possible, and what the clock widget tells the person before
+ * they press anything. Rows have to arrive sorted by instant. `out` closes a break as well as a
+ * shift, because somebody who clocks out without ending their break has still stopped working.
+ */
+export function openState(punches: Array<{ direction: string }>): {
+  clockedIn: boolean
+  onBreak: boolean
+} {
+  let clockedIn = false
+  let onBreak = false
+  for (const punch of punches) {
+    if (punch.direction === 'in') clockedIn = true
+    else if (punch.direction === 'out') {
+      clockedIn = false
+      onBreak = false
+    } else if (punch.direction === 'break_start') onBreak = true
+    else if (punch.direction === 'break_end') onBreak = false
+  }
+  return { clockedIn, onBreak }
+}
+
+/**
+ * Which shift a punch belongs to, and the business date that follows from it.
+ *
+ * A punch in the morning between a night shift and a day shift has two readings and **the clock
+ * cannot separate them**: at 06:59 on a Saturday, somebody who worked the 22:00–06:00 night is
+ * leaving it, and somebody who did not is arriving early for the 08:00 morning. Three versions of
+ * this function drew a line through that window — at the night's scheduled end, at the morning's
+ * start, at the midpoint of the gap widened by `graceInMinutes` — and every one of them filed one of
+ * those two people on the wrong day, one minute either side of wherever the line had moved to. There
+ * is no line to draw. What separates the two readings is not in the instant.
+ *
+ * It is in the punches. A shift is **open** when a clock-in has been filed on a business date with
+ * nothing closing it, and at most one shift is open at a time, because a person is in one place. So:
+ *
+ * 1. **A departure belongs to the shift it is leaving.** Where a shift is open the punch joins it,
+ *    however far past the scheduled end it is made, because nothing else can close it. The most
+ *    recent open one wins: that is the shift they are actually on.
+ * 2. **Everything else is an arrival**, and it opens the shift the clock says is running — the
+ *    previous night while that night is still scheduled to run and the day's own shift has not
+ *    started yet, otherwise the day it happened on.
+ *
+ * An open shift is a fact in the database rather than a guess about an instant, which is why this
+ * degrades correctly at both ends where a boundary could not: somebody who never clocked in last
+ * night has nothing open, so their early arrival is an arrival at any hour, and somebody who worked
+ * the night has something open, so their late departure is a departure however long they overran.
+ * No constant appears in either rule, so there is no minute left to get wrong.
+ *
+ * Rule (1) reaches exactly one calendar day back, and that is what stops a shift nobody ever closed
+ * claiming punches for ever: a day later the date in between holds no punches, nothing is open, and
+ * arrivals resume. Until then the person is *told* they are still clocked in, because
+ * `attendance.state` reads this same attribution from the same rows — so the action offered to them
+ * is the one that closes it, and no refusal arrives that the screen did not predict.
+ *
+ * One thing stays undecided, and it costs a date rather than a refusal. Where the night was NEVER
+ * WORKED — nothing open and nothing filed — a punch inside its scheduled span reads as a late
+ * arrival for it: at 05:59 that files a two-hour-early arrival for the morning on the night's date.
+ * Both ends of that shift still land together, since the clock-out follows the shift the clock-in
+ * opened, so nobody is turned away. The sheet is wrong about which day, and says somebody was very
+ * late for a shift they were in fact early for.
+ *
+ * It is left because nothing available at that instant settles it: at 05:59 a person with a night
+ * scheduled and nothing filed is either eleven minutes from the end of a shift they never started
+ * or two hours early for the next one, and only the clock-out — which has not happened — tells them
+ * apart. Deciding it on how much of the night is left would be a fourth constant, and three have
+ * been tried. A night already worked is a different question and is answered above.
+ */
+export function attributeToShift(
+  instantMs: number,
+  timeZone: string,
+  shiftFor: (date: IsoDate) => ShiftSpec | null,
+  open: OpenShifts,
+): { businessDate: IsoDate; shift: ShiftSpec | null } {
+  const local = dateIn(instantMs, timeZone)
+  const yesterday = previousDate(local)
+
+  // (1) A departure. Deliberately before anything reads the clock: an open shift outranks every
+  // schedule, including one that says this punch is hours past when the night should have ended.
+  if (open.onLocalDate) return { businessDate: local, shift: shiftFor(local) }
+  if (open.onPreviousDate) return { businessDate: yesterday, shift: shiftFor(yesterday) }
+
+  // (2) An arrival. The previous night still holds the small hours — somebody clocking in at 02:00
+  // is late for last night's shift, not early for tonight's — but only while it is scheduled to be
+  // running and only until the day's own shift starts, so overlapping schedules go to the one that
+  // began most recently.
+  const own = shiftFor(local)
+  const overnight = shiftFor(yesterday)
+  // A night already worked is not waiting for anybody. `open` is false either way once it is
+  // clocked out of, so without this an early arrival for the morning joined a finished night and
+  // rewrote its sheet — the one thing this function's own comment promised could not happen.
+  if (overnight && crossesMidnight(overnight) && !open.workedPreviousDate) {
+    const minute = minutesOfDayIn(instantMs, timeZone)
+    const dayStart = own ? toMinutes(own.start) : Number.POSITIVE_INFINITY
+    if (minute < toMinutes(overnight.end) && minute < dayStart)
+      return { businessDate: yesterday, shift: overnight }
+  }
+  return { businessDate: local, shift: own }
 }
 
 /**

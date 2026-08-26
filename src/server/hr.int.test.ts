@@ -1,14 +1,15 @@
 import { randomUUID } from 'node:crypto'
 import type { Principal } from '@kernhq/contracts'
-import { createKernel, type Kernel, type Tx } from '@kernhq/kernel'
-import { and, eq } from 'drizzle-orm'
+import { CAPABILITIES_KEY, createKernel, type Kernel, type RequestContext, type Tx } from '@kernhq/kernel'
+import { call } from '@orpc/server'
+import { and, eq, inArray, isNull } from 'drizzle-orm'
 import pg from 'pg'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { carryForward } from '../policy/accrual.js'
-import { weekdayOf } from '../policy/calendar.js'
 import { zonedToInstant } from '../policy/time.js'
 import { hrModule } from './index.js'
 import { hrJobs } from './jobs.js'
+import { implement_ } from './router.js'
 import {
   approvalDecisions,
   approvalRequests,
@@ -36,7 +37,7 @@ import {
   TENANT_TABLES,
 } from './schema.js'
 import { ApprovalService } from './services/approvals.js'
-import { AttendanceService, NO_SCHEDULE, type ResolvedSchedule } from './services/attendance.js'
+import { AttendanceService, NO_SCHEDULE } from './services/attendance.js'
 import { todayIn } from './services/db.js'
 import { LedgerService } from './services/ledger.js'
 import { PeopleService } from './services/people.js'
@@ -59,6 +60,7 @@ const DB_NAME = `kern_hr_test_${Date.now().toString(36)}`
 const RLS_ROLE = `kern_hr_rls_${Date.now().toString(36)}`
 
 let kernel: Kernel
+let hr: ReturnType<typeof implement_>
 let admin: pg.Client
 let databaseUrl: string
 
@@ -98,10 +100,28 @@ function registerCoreStubs(k: Kernel) {
     'users.principal': { handler: async (i: { userId: string }) => principal(i.userId, WS_A) },
     'authz.customRolePermissions': { handler: async () => [] },
     'authz.bindings': { handler: async () => [] },
-    'settings.getModule': { handler: async () => ({}) },
+    // `attendance` is a capability, and it is off by default — every attendance procedure answers
+    // 404 until a workspace switches it on. The stub says it is on, because the tests below call
+    // those procedures the way a workspace that bought the feature does.
+    'settings.getModule': { handler: async () => ({ [CAPABILITIES_KEY]: { attendance: true } }) },
     'settings.setModule': { handler: async () => ({ ok: true }) },
   })
 }
+
+/**
+ * A request context, as the HTTP layer would build one.
+ *
+ * The router is the only place three things live: `workspaceScoped`, the capability gate, and the
+ * punch guard that answers "You are not clocked in." Nothing below the router can reach them, which
+ * is why the attendance tests construct it rather than calling `AttendanceService` directly.
+ */
+const asUser = (userId: string, workspaceId = WS_A): RequestContext => ({
+  kernel,
+  principal: principal(userId, workspaceId),
+  requestId: randomUUID(),
+  ip: '127.0.0.1',
+  headers: {},
+})
 
 beforeAll(async () => {
   admin = new pg.Client({ connectionString: BASE_URL })
@@ -125,6 +145,7 @@ beforeAll(async () => {
   })
   registerCoreStubs(kernel)
   await kernel.start()
+  hr = implement_(kernel)
 }, 180_000)
 
 afterAll(async () => {
@@ -1409,18 +1430,15 @@ describe('a person who transfers between legal entities', () => {
         status: 'locked',
         lockedAt: new Date(),
       })
-      await attendanceSvc.record(
-        tx,
-        WS_A,
-        {
-          personId: emre,
-          direction: 'in',
-          timezone: IST,
-          method: 'manual',
-          claimedAt: new Date(zonedToInstant('2026-03-20', '09:00', IST)),
-        },
-        NO_SCHEDULE,
-      )
+      await attendanceSvc.record(tx, WS_A, {
+        personId: emre,
+        direction: 'in',
+        at: new Date(zonedToInstant('2026-03-20', '09:00', IST)),
+        businessDate: '2026-03-20',
+        timezone: IST,
+        method: 'manual',
+        claimed: true,
+      })
     })
   }, 60_000)
 
@@ -1554,18 +1572,15 @@ describe('a day flagged locked with no period behind it', () => {
         ['09:00', 'in'],
         ['15:00', 'out'],
       ] as const)
-        await attendanceSvc.record(
-          tx,
-          WS_A,
-          {
-            personId: lale,
-            direction,
-            timezone: IST,
-            method: 'manual',
-            claimedAt: new Date(zonedToInstant('2026-06-05', wall, IST)),
-          },
-          NO_SCHEDULE,
-        )
+        await attendanceSvc.record(tx, WS_A, {
+          personId: lale,
+          direction,
+          at: new Date(zonedToInstant('2026-06-05', wall, IST)),
+          businessDate: '2026-06-05',
+          timezone: IST,
+          method: 'manual',
+          claimed: true,
+        })
       await tx.insert(attendanceDays).values({
         workspaceId: WS_A,
         personId: lale,
@@ -1727,20 +1742,28 @@ describe('a punch inside a closed month', () => {
     )
 
   it('is recorded, and writes no sheet where the lock had nothing to stamp', async () => {
-    const punch = await run((tx) =>
-      attendanceSvc.record(
+    const punch = await run(async (tx) => {
+      // Attributed rather than asserted into place: `record` no longer works out the business date
+      // for itself, so the date it stores is only right if `attribute` is the thing that chose it.
+      const at = new Date(Date.UTC(2026, 6, 15, 6, 0))
+      const { businessDate } = await attendanceSvc.attribute(
         tx,
         WS_A,
-        {
-          personId: mert,
-          direction: 'in',
-          timezone: 'Europe/Istanbul',
-          method: 'manual',
-          claimedAt: new Date(Date.UTC(2026, 6, 15, 6, 0)),
-        },
+        mert,
+        at.getTime(),
+        'Europe/Istanbul',
         NO_SCHEDULE,
-      ),
-    )
+      )
+      return attendanceSvc.record(tx, WS_A, {
+        personId: mert,
+        direction: 'in',
+        at,
+        businessDate,
+        timezone: 'Europe/Istanbul',
+        method: 'manual',
+        claimed: true,
+      })
+    })
     expect(punch.businessDate).toBe('2026-07-15')
 
     const result = await run((tx) =>
@@ -1773,153 +1796,561 @@ describe('a punch inside a closed month', () => {
 })
 
 /**
- * The night shift, where the punch and the day sheet used to disagree.
+ * The rotating week, clocked through the real procedures.
  *
- * A 22:00–06:00 Monday-to-Friday shift is clocked out of at 06:00 on Saturday. The punch path read
- * the shift off the punch's **UTC** date, so it asked the week for Saturday, got nothing — Saturday
- * schedules no shift — and never consulted `crossesMidnight`. Friday's sheet lost eight hours and
- * Saturday grew an orphan clock-out: the exact split `businessDateFor` exists to prevent.
+ * Nights 22:00–06:00 Monday to Friday and 08:00–16:00 on Saturday, in New York, on a real
+ * `schedules` row read back through `AttendanceService.scheduleFor` and a real
+ * `schedule_assignments` row. Everything here goes through `attendance.clockIn`, `clockOut` and
+ * `state`, because the three things this bug has broken twice are the three things nothing below
+ * the router can reach:
+ *
+ * - `clockContext`, which attributes **the current instant** and has to agree with what `record`
+ *   then does with it — when the two disagree, the punches of one shift land on two sheets;
+ * - the guard that answers `You are not clocked in.`, which is what that disagreement actually
+ *   costs somebody at the end of their day;
+ * - `attendance.state`, which is the only thing the clock widget asks and therefore the only place
+ *   a person sees the answer before it bites them.
+ *
+ * The clock is faked rather than claimed. `record`'s `claimedAt` is a parameter no production
+ * caller passes, so a test that sets it drives a path a user cannot reach — and it goes round
+ * `clockContext`, which is exactly where both failures lived.
  */
-describe('a shift that runs from Friday night into Saturday', () => {
+describe('a rotating week, clocked through the router', () => {
   const attendanceSvc = new AttendanceService()
   const NY = 'America/New_York'
-  const nights: ResolvedSchedule = {
-    scheduleId: null,
-    rounding: { stepMinutes: 0, direction: 'nearest' },
-    autoClockOutAfterMinutes: null,
-    shiftFor: (date) => {
-      const day = weekdayOf(date)
-      if (day === 'sat' || day === 'sun') return null
-      return { start: '22:00', end: '06:00', breakMinutes: 0, graceInMinutes: 5, graceOutMinutes: 5 }
-    },
+  const NIGHT = { start: '22:00', end: '06:00', breakMinutes: 0 }
+  const MORNING = { start: '08:00', end: '16:00', breakMinutes: 0 }
+  const FRIDAY = '2026-06-19'
+  const SATURDAY = '2026-06-20'
+
+  /** Somebody on the rotating schedule, with their own zone and a real assignment to it. */
+  const hire = async (displayName: string) => {
+    const personId = randomUUID()
+    const userId = randomUUID()
+    await run(async (tx) => {
+      const [schedule] = await tx
+        .insert(schedules)
+        .values({
+          workspaceId: WS_A,
+          name: `Rotating (${displayName})`,
+          kind: 'shift',
+          week: { mon: NIGHT, tue: NIGHT, wed: NIGHT, thu: NIGHT, fri: NIGHT, sat: MORNING, sun: null },
+          graceInMinutes: 5,
+          graceOutMinutes: 5,
+        })
+        .returning()
+      await tx.insert(people).values({
+        id: personId,
+        workspaceId: WS_A,
+        userId,
+        displayName,
+        // Their own zone rather than the workspace's Istanbul office: this is a New York roster, and
+        // the resolution ladder prefers a person's override over their office.
+        timezone: NY,
+      })
+      await tx.insert(scheduleAssignments).values({
+        workspaceId: WS_A,
+        personId,
+        scheduleId: schedule!.id,
+        effectiveFrom: '2020-01-01',
+      })
+    })
+    return { personId, userId }
   }
-  let deniz: string
 
-  beforeAll(async () => {
-    deniz = randomUUID()
-    await run((tx) => tx.insert(people).values({ id: deniz, workspaceId: WS_A, displayName: 'Deniz' }))
-  }, 60_000)
+  /** Move the server's clock. Everything the router reads — `Date.now()` included — follows it. */
+  const clockReads = (date: string, wall: string) =>
+    vi.setSystemTime(new Date(zonedToInstant(date, wall, NY)))
 
-  const punchAt = (date: string, wall: string, direction: 'in' | 'out') =>
-    run((tx) =>
-      attendanceSvc.record(
-        tx,
-        WS_A,
-        {
-          personId: deniz,
-          direction,
+  const clockIn = (userId: string) =>
+    call(hr.attendance.clockIn, { workspaceId: WS_A }, { context: asUser(userId) })
+  const clockOut = (userId: string) =>
+    call(hr.attendance.clockOut, { workspaceId: WS_A }, { context: asUser(userId) })
+  const state = (userId: string) =>
+    call(hr.attendance.state, { workspaceId: WS_A }, { context: asUser(userId) })
+
+  const sheet = (personId: string, businessDate: string) =>
+    run(async (tx) => {
+      const [row] = await tx
+        .select()
+        .from(attendanceDays)
+        .where(
+          and(
+            eq(attendanceDays.workspaceId, WS_A),
+            eq(attendanceDays.personId, personId),
+            eq(attendanceDays.businessDate, businessDate),
+          ),
+        )
+      return row
+    })
+
+  /**
+   * The same schedule and the same zone for as many people as a sweep needs, in one transaction.
+   *
+   * `hire` is fine for two people and is twelve hundred round trips for four hundred, which is long
+   * enough that somebody would trim the sweep instead.
+   */
+  const hireMany = async (names: string[]) => {
+    const cast = names.map((displayName) => ({
+      personId: randomUUID(),
+      userId: randomUUID(),
+      displayName,
+    }))
+    await run(async (tx) => {
+      const [schedule] = await tx
+        .insert(schedules)
+        .values({
+          workspaceId: WS_A,
+          name: `Rotating (${cast[0]?.displayName ?? 'cast'})`,
+          kind: 'shift',
+          week: { mon: NIGHT, tue: NIGHT, wed: NIGHT, thu: NIGHT, fri: NIGHT, sat: MORNING, sun: null },
+          graceInMinutes: 5,
+          graceOutMinutes: 5,
+        })
+        .returning()
+      await tx.insert(people).values(
+        cast.map((c) => ({
+          id: c.personId,
+          workspaceId: WS_A,
+          userId: c.userId,
+          displayName: c.displayName,
           timezone: NY,
-          method: 'manual',
-          claimedAt: new Date(zonedToInstant(date, wall, NY)),
-        },
-        nights,
-      ),
-    )
+        })),
+      )
+      await tx.insert(scheduleAssignments).values(
+        cast.map((c) => ({
+          workspaceId: WS_A,
+          personId: c.personId,
+          scheduleId: schedule!.id,
+          effectiveFrom: '2020-01-01',
+        })),
+      )
+    })
+    return cast.map((c) => ({ personId: c.personId, userId: c.userId }))
+  }
 
-  it('attributes both ends of the night to Friday', async () => {
-    expect((await punchAt('2026-06-19', '22:00', 'in')).businessDate).toBe('2026-06-19')
-    expect((await punchAt('2026-06-20', '06:00', 'out')).businessDate).toBe('2026-06-19')
-  })
-
-  it('leaves Friday’s sheet holding the whole eight hours', async () => {
-    await run((tx) => attendanceSvc.recomputeDay(tx, WS_A, deniz, '2026-06-19', NY, nights))
-    const [day] = await run((tx) =>
+  /** Every sheet this cast has, keyed `personId|businessDate`. One query rather than one per row. */
+  const sheetsFor = async (personIds: string[]) => {
+    const rows = await run((tx) =>
       tx
         .select()
         .from(attendanceDays)
-        .where(and(eq(attendanceDays.workspaceId, WS_A), eq(attendanceDays.personId, deniz))),
+        .where(and(eq(attendanceDays.workspaceId, WS_A), inArray(attendanceDays.personId, personIds))),
     )
-    expect(day?.businessDate).toBe('2026-06-19')
-    expect(day?.workedMinutes).toBe(480)
-    expect(day?.scheduledMinutes).toBe(480)
-    expect(day?.anomalies).toEqual([])
-  })
-})
-
-/**
- * The morning shift the day after a night week — the case that made the night-shift fix expensive.
- *
- * A rotating week: 22:00–06:00 Monday to Friday, then 08:00–16:00 on Saturday. 08:00 falls inside
- * the tail the night shift is allowed to reach into, so preferring the previous day unconditionally
- * filed Saturday's clock-in on **Friday** while its 16:00 clock-out stayed on Saturday. Two ends of
- * one shift on two sheets is the visible half; the invisible half is worse. `clockContext` makes the
- * same attribution, so at 16:00 Saturday's punch list was empty, the widget said "not clocked in",
- * and the guard threw `You are not clocked in.` — somebody on a morning shift after a night week
- * could never clock out.
- */
-describe('a morning shift the day after a night week', () => {
-  const attendanceSvc = new AttendanceService()
-  const NY = 'America/New_York'
-  const rotating: ResolvedSchedule = {
-    scheduleId: null,
-    rounding: { stepMinutes: 0, direction: 'nearest' },
-    autoClockOutAfterMinutes: null,
-    shiftFor: (date) => {
-      const day = weekdayOf(date)
-      if (day === 'sun') return null
-      return day === 'sat'
-        ? { start: '08:00', end: '16:00', breakMinutes: 0, graceInMinutes: 5, graceOutMinutes: 5 }
-        : { start: '22:00', end: '06:00', breakMinutes: 0, graceInMinutes: 5, graceOutMinutes: 5 }
-    },
+    return new Map(rows.map((r) => [`${r.personId}|${r.businessDate}`, r]))
   }
-  let sena: string
+
+  /** How many live punches each of them has on one business date. */
+  const punchCountsOn = async (personIds: string[], businessDate: string) => {
+    const rows = await run((tx) =>
+      tx
+        .select({ personId: punches.personId })
+        .from(punches)
+        .where(
+          and(
+            eq(punches.workspaceId, WS_A),
+            inArray(punches.personId, personIds),
+            eq(punches.businessDate, businessDate),
+            isNull(punches.voidedByPunchId),
+          ),
+        ),
+    )
+    const counts = new Map<string, number>()
+    for (const row of rows) counts.set(row.personId, (counts.get(row.personId) ?? 0) + 1)
+    return counts
+  }
+
+  const wallMinutes = (wall: string) => {
+    const [hour, minute] = wall.split(':').map(Number) as [number, number]
+    return hour * 60 + minute
+  }
+
+  let early: { personId: string; userId: string }
+  let late: { personId: string; userId: string }
 
   beforeAll(async () => {
-    sena = randomUUID()
-    await run((tx) => tx.insert(people).values({ id: sena, workspaceId: WS_A, displayName: 'Sena' }))
+    early = await hire('Early Sena')
+    late = await hire('Late Deniz')
+    // Faked only once the fixtures are in, so those rows are stamped by the real clock. `Date` and
+    // nothing else: the pg driver's own timeouts are real timers and must keep running.
+    vi.useFakeTimers({ toFake: ['Date'] })
   }, 60_000)
 
-  const punchAt = (date: string, wall: string, direction: 'in' | 'out') =>
-    run((tx) =>
-      attendanceSvc.record(
-        tx,
-        WS_A,
-        {
-          personId: sena,
-          direction,
-          timezone: NY,
-          method: 'manual',
-          claimedAt: new Date(zonedToInstant(date, wall, NY)),
-        },
-        rotating,
-      ),
-    )
-
-  const punchesOn = (date: string) => run((tx) => attendanceSvc.punchesOn(tx, WS_A, sena, date))
-
-  it('files Friday night on Friday and Saturday morning on Saturday', async () => {
-    expect((await punchAt('2026-06-19', '22:00', 'in')).businessDate).toBe('2026-06-19')
-    expect((await punchAt('2026-06-20', '06:00', 'out')).businessDate).toBe('2026-06-19')
-    expect((await punchAt('2026-06-20', '08:00', 'in')).businessDate).toBe('2026-06-20')
-    expect((await punchAt('2026-06-20', '16:00', 'out')).businessDate).toBe('2026-06-20')
+  afterAll(() => {
+    vi.useRealTimers()
   })
 
-  it('leaves the morning’s clock-in where the clock-out will look for it', async () => {
-    // This list is what the punch guard reads. With the clock-in filed on Friday it is empty at
-    // 16:00, the open state says "not clocked in", and the clock-out is refused outright.
-    expect((await punchesOn('2026-06-20')).map((p) => p.direction)).toEqual(['in', 'out'])
-    expect((await punchesOn('2026-06-19')).map((p) => p.direction)).toEqual(['in', 'out'])
+  describe('arriving eight minutes early for the Saturday morning', () => {
+    it('files Friday night on Friday, both ends of it', async () => {
+      clockReads(FRIDAY, '22:00')
+      expect((await clockIn(early.userId)).businessDate).toBe(FRIDAY)
+      clockReads(SATURDAY, '06:00')
+      expect((await clockOut(early.userId)).businessDate).toBe(FRIDAY)
+
+      const friday = await sheet(early.personId, FRIDAY)
+      expect(friday?.workedMinutes).toBe(480)
+      expect(friday?.status).toBe('present')
+      expect(friday?.anomalies).toEqual([])
+    })
+
+    it('files a 07:52 clock-in on Saturday, not on the night that has just ended', async () => {
+      // The reported defect. 07:52 is inside the tail of Friday's night, and cutting the tail at
+      // Saturday's start exactly — 08:00:00, to the second — sent this punch to Friday.
+      clockReads(SATURDAY, '07:52')
+      expect((await clockIn(early.userId)).businessDate).toBe(SATURDAY)
+    })
+
+    it('shows the clock running on Saturday when the widget asks at 09:00', async () => {
+      clockReads(SATURDAY, '09:00')
+      const now = await state(early.userId)
+      expect(now.businessDate).toBe(SATURDAY)
+      expect(now.clockedIn).toBe(true)
+      // Sixty-eight minutes since 07:52, counted up to the moment of asking.
+      expect(now.workedMinutesToday).toBe(68)
+    })
+
+    it('lets them clock out at 16:00 instead of refusing it', async () => {
+      // This is what the split actually cost: `punchesOn(Saturday)` was empty, so the guard threw
+      // `You are not clocked in.` and a morning shift after a night week could not be ended.
+      clockReads(SATURDAY, '16:00')
+      expect((await clockOut(early.userId)).businessDate).toBe(SATURDAY)
+
+      const saturday = await sheet(early.personId, SATURDAY)
+      expect(saturday?.workedMinutes).toBe(488)
+      expect(saturday?.status).toBe('present')
+      expect(saturday?.anomalies).toEqual([])
+      expect(saturday?.lateMinutes).toBe(0)
+    })
+
+    it('leaves the finished night exactly as it was', async () => {
+      // The other half of the damage: the early punch landed on Friday as a third punch, so a night
+      // that had been closed correctly went back to `pending` with a missing clock-out against it.
+      const friday = await sheet(early.personId, FRIDAY)
+      expect(friday?.workedMinutes).toBe(480)
+      expect(friday?.status).toBe('present')
+      expect(friday?.anomalies).toEqual([])
+      expect((await run((tx) => attendanceSvc.punchesOn(tx, WS_A, early.personId, FRIDAY))).length).toBe(2)
+    })
   })
 
-  it('gives each day its own eight hours instead of piling both on Friday', async () => {
-    for (const date of ['2026-06-19', '2026-06-20'])
-      await run((tx) => attendanceSvc.recomputeDay(tx, WS_A, sena, date, NY, rotating))
+  /**
+   * The case adjacent to the reported one: the mirror of arriving early is leaving late.
+   *
+   * Moving the boundary earlier to let an early arrival through takes those minutes away from the
+   * night's overtime, so the same test has to be run from the other end. Forty-five minutes past a
+   * 06:00 finish is still the night's — and the morning that follows it still has to work.
+   */
+  describe('leaving forty-five minutes late off the Friday night', () => {
+    it('keeps both ends of the overtime on Friday', async () => {
+      clockReads(FRIDAY, '22:00')
+      expect((await clockIn(late.userId)).businessDate).toBe(FRIDAY)
+      clockReads(SATURDAY, '06:45')
+      expect((await clockOut(late.userId)).businessDate).toBe(FRIDAY)
 
-    const days = await run((tx) =>
-      tx
-        .select()
-        .from(attendanceDays)
-        .where(and(eq(attendanceDays.workspaceId, WS_A), eq(attendanceDays.personId, sena))),
-    )
-    const friday = days.find((d) => d.businessDate === '2026-06-19')
-    const saturday = days.find((d) => d.businessDate === '2026-06-20')
-    expect(friday?.workedMinutes).toBe(480)
-    expect(friday?.scheduledMinutes).toBe(480)
-    expect(friday?.anomalies).toEqual([])
-    expect(saturday?.workedMinutes).toBe(480)
-    expect(saturday?.scheduledMinutes).toBe(480)
-    expect(saturday?.anomalies).toEqual([])
-    expect(saturday?.lateMinutes).toBe(0)
+      const friday = await sheet(late.personId, FRIDAY)
+      expect(friday?.workedMinutes).toBe(525)
+      expect(friday?.overtimeMinutes).toBe(45)
+      expect(friday?.status).toBe('present')
+      expect(friday?.anomalies).toEqual([])
+    })
+
+    it('still lets the Saturday morning be clocked, start to finish', async () => {
+      clockReads(SATURDAY, '08:00')
+      expect((await clockIn(late.userId)).businessDate).toBe(SATURDAY)
+      clockReads(SATURDAY, '16:00')
+      expect((await clockOut(late.userId)).businessDate).toBe(SATURDAY)
+
+      const saturday = await sheet(late.personId, SATURDAY)
+      expect(saturday?.workedMinutes).toBe(480)
+      expect(saturday?.anomalies).toEqual([])
+    })
+
+    it('never had Saturday holding a punch that belonged to the night', async () => {
+      const rows = await run((tx) => attendanceSvc.punchesOn(tx, WS_A, late.personId, SATURDAY))
+      expect(rows.map((r) => r.direction)).toEqual(['in', 'out'])
+    })
+  })
+
+  /**
+   * Every minute of the contested morning, through the real router, read three ways.
+   *
+   * The three rounds before this one each shipped with tests that checked chosen instants — 07:52,
+   * then 07:00 — and each time a skeptic found the failure one minute away from whichever instant
+   * had been chosen. So this does not choose. It walks 06:00 to 08:15 a minute at a time and puts
+   * three different people through each one:
+   *
+   * - **overran** clocked in at 22:00 and never clocked out, so their punch is a departure;
+   * - **arrived** did not work the night at all, so their punch is an arrival;
+   * - **finished** worked the night and closed it at 06:00, so their punch is an arrival too — and
+   *   the night they already filed must read exactly as it did before they made it.
+   *
+   * Nothing here asserts a boundary, because there is no longer one to assert. What is asserted is
+   * that both ends of every shift land on the same day and that no punch is refused — which is what
+   * the defect actually costs somebody, and what no single-instant test can see.
+   */
+  describe('every minute from 06:00 to 08:15', () => {
+    const window: string[] = []
+    for (let minute = 6 * 60; minute <= 8 * 60 + 15; minute++)
+      window.push(
+        `${String(Math.floor(minute / 60)).padStart(2, '0')}:${String(minute % 60).padStart(2, '0')}`,
+      )
+
+    /** One person's punches through one minute of the window: what each was filed on, in order. */
+    interface Run {
+      wall: string
+      personId: string
+      filed: Array<string | null>
+    }
+
+    /** A refusal is collected, never thrown: one bad minute must not hide the other hundred. */
+    const refusals: string[] = []
+    const overran: Run[] = []
+    const arrived: Run[] = []
+    const finished: Run[] = []
+
+    const tryPunch = async (label: string, punch: () => Promise<{ businessDate: string }>) => {
+      try {
+        return (await punch()).businessDate
+      } catch (error) {
+        refusals.push(`${label} — ${(error as Error).message}`)
+        return null
+      }
+    }
+
+    beforeAll(async () => {
+      // One schedule and one transaction for the whole cast: 408 people hired one at a time is
+      // several hundred round trips before the first assertion.
+      const cast = await hireMany(
+        window.flatMap((wall) => [`overran ${wall}`, `arrived ${wall}`, `finished ${wall}`]),
+      )
+
+      for (const [index, wall] of window.entries()) {
+        const a = cast[index * 3]!
+        const b = cast[index * 3 + 1]!
+        const c = cast[index * 3 + 2]!
+        const runA: Run = { wall, personId: a.personId, filed: [] }
+        const runB: Run = { wall, personId: b.personId, filed: [] }
+        const runC: Run = { wall, personId: c.personId, filed: [] }
+
+        clockReads(FRIDAY, '22:00')
+        runA.filed.push(await tryPunch(`overran ${wall}: in`, () => clockIn(a.userId)))
+        runC.filed.push(await tryPunch(`finished ${wall}: in`, () => clockIn(c.userId)))
+
+        clockReads(SATURDAY, '06:00')
+        runC.filed.push(await tryPunch(`finished ${wall}: out`, () => clockOut(c.userId)))
+
+        clockReads(SATURDAY, wall)
+        runA.filed.push(await tryPunch(`overran ${wall}: out`, () => clockOut(a.userId)))
+        runB.filed.push(await tryPunch(`arrived ${wall}: in`, () => clockIn(b.userId)))
+        // At 06:00 exactly this would be the same instant as the clock-out above, and two punches
+        // sharing an instant have no order — a different question, and one nothing user-facing can
+        // reach. Their arrival starts a minute later.
+        if (wall !== '06:00')
+          runC.filed.push(await tryPunch(`finished ${wall}: in again`, () => clockIn(c.userId)))
+
+        // The night is closed now, so the person who overran it still has a morning to work.
+        clockReads(SATURDAY, '08:30')
+        runA.filed.push(await tryPunch(`overran ${wall}: in again`, () => clockIn(a.userId)))
+
+        clockReads(SATURDAY, '16:00')
+        runA.filed.push(await tryPunch(`overran ${wall}: out again`, () => clockOut(a.userId)))
+        runB.filed.push(await tryPunch(`arrived ${wall}: out`, () => clockOut(b.userId)))
+        if (wall !== '06:00')
+          runC.filed.push(await tryPunch(`finished ${wall}: out again`, () => clockOut(c.userId)))
+
+        overran.push(runA)
+        arrived.push(runB)
+        finished.push(runC)
+      }
+    }, 600_000)
+
+    /**
+     * The case the sweep cannot reach, because its finished night closes at 06:00.
+     *
+     * A night worked 22:00–05:30 and clocked out of is *closed*, so nothing is open — and the rule
+     * that hands the small hours to the previous night fired anyway. Somebody arriving at 05:50 for
+     * the Saturday morning joined a Friday that had already finished: four punches on it, 1060
+     * worked minutes where there had been 450, and nine hours of overtime nobody worked. A skeptic
+     * measured it through the router; the doc comment above `attributeToShift` had promised a
+     * finished day could not be disturbed.
+     */
+    it('leaves a night that finished early exactly as it was when somebody arrives before its end', async () => {
+      const [worker] = await hireMany(['closed early, arrives at 05:50'])
+      const filed: Array<string | null> = []
+
+      clockReads(FRIDAY, '22:00')
+      filed.push(await tryPunch('closed-early: in', () => clockIn(worker!.userId)))
+      clockReads(SATURDAY, '05:30')
+      filed.push(await tryPunch('closed-early: out', () => clockOut(worker!.userId)))
+
+      const before = await run((tx) =>
+        tx
+          .select()
+          .from(attendanceDays)
+          .where(and(eq(attendanceDays.personId, worker!.personId), eq(attendanceDays.businessDate, FRIDAY))),
+      )
+      expect(before[0]?.workedMinutes, 'the night as worked').toBe(450)
+
+      // Two hours and ten minutes early for the 08:00 morning, and inside the night's own span.
+      clockReads(SATURDAY, '05:50')
+      filed.push(await tryPunch('closed-early: in again', () => clockIn(worker!.userId)))
+      clockReads(SATURDAY, '16:00')
+      filed.push(await tryPunch('closed-early: out again', () => clockOut(worker!.userId)))
+
+      expect(filed).toEqual([FRIDAY, FRIDAY, SATURDAY, SATURDAY])
+
+      const after = await run((tx) =>
+        tx
+          .select()
+          .from(attendanceDays)
+          .where(and(eq(attendanceDays.personId, worker!.personId), eq(attendanceDays.businessDate, FRIDAY))),
+      )
+      expect(after[0]?.workedMinutes, 'the finished night is untouched').toBe(450)
+      expect(after[0]?.status).toBe('present')
+      expect(after[0]?.anomalies).toEqual([])
+    }, 60_000)
+
+    it('sweeps the whole window rather than a handful of chosen minutes', () => {
+      expect(window).toHaveLength(136)
+      expect(window[0]).toBe('06:00')
+      expect(window.at(-1)).toBe('08:15')
+      expect(overran).toHaveLength(136)
+      expect(arrived).toHaveLength(136)
+      expect(finished).toHaveLength(136)
+    })
+
+    it('refuses nothing, at any minute, in any of the three readings', () => {
+      // Round three refused a night worker's 07:05 clock-out outright and left them no way to
+      // record it. Every refusal in the window is listed here rather than only the first.
+      expect(refusals).toEqual([])
+    })
+
+    it('files a night somebody overran on the night, and the morning after it on the morning', () => {
+      for (const run of overran)
+        expect(run.filed, `overran ${run.wall}`).toEqual([FRIDAY, FRIDAY, SATURDAY, SATURDAY])
+    })
+
+    it('files an arrival by somebody who never worked the night entirely on the morning', () => {
+      for (const run of arrived) expect(run.filed, `arrived ${run.wall}`).toEqual([SATURDAY, SATURDAY])
+    })
+
+    it('files an arrival after a finished night on the morning, both ends of it', () => {
+      for (const run of finished)
+        expect(run.filed, `finished ${run.wall}`).toEqual(
+          run.wall === '06:00' ? [FRIDAY, FRIDAY] : [FRIDAY, FRIDAY, SATURDAY, SATURDAY],
+        )
+    })
+
+    /**
+     * The sheets, read in two queries rather than 816.
+     *
+     * Landing on the right date is only half of it: the figures have to be the ones somebody would
+     * be paid on, and the night that was already finished has to be untouched by whatever happened
+     * the next morning.
+     */
+    it('adds the overrun to the night and leaves the morning a normal shift', async () => {
+      const days = await sheetsFor(overran.map((r) => r.personId))
+      for (const run of overran) {
+        const minute = wallMinutes(run.wall)
+        const night = days.get(`${run.personId}|${FRIDAY}`)
+        expect(night?.workedMinutes, `overran ${run.wall} night`).toBe(480 + (minute - 6 * 60))
+        expect(night?.status, `overran ${run.wall} night`).toBe('present')
+        expect(night?.anomalies, `overran ${run.wall} night`).toEqual([])
+        expect(night?.overtimeMinutes, `overran ${run.wall} night`).toBe(minute - 6 * 60)
+
+        const morning = days.get(`${run.personId}|${SATURDAY}`)
+        // 08:30 to 16:00, thirty minutes late against an 08:00 start with five minutes of grace.
+        expect(morning?.workedMinutes, `overran ${run.wall} morning`).toBe(450)
+        expect(morning?.status, `overran ${run.wall} morning`).toBe('present')
+        expect(morning?.anomalies, `overran ${run.wall} morning`).toEqual([])
+        expect(morning?.lateMinutes, `overran ${run.wall} morning`).toBe(25)
+      }
+    })
+
+    it('puts an early arrival on the morning it is early for, and nothing on the night', async () => {
+      const days = await sheetsFor(arrived.map((r) => r.personId))
+      for (const run of arrived) {
+        const minute = wallMinutes(run.wall)
+        expect(days.get(`${run.personId}|${FRIDAY}`), `arrived ${run.wall} night`).toBeUndefined()
+        const morning = days.get(`${run.personId}|${SATURDAY}`)
+        expect(morning?.workedMinutes, `arrived ${run.wall}`).toBe(16 * 60 - minute)
+        expect(morning?.status, `arrived ${run.wall}`).toBe('present')
+        expect(morning?.anomalies, `arrived ${run.wall}`).toEqual([])
+      }
+    })
+
+    it('leaves a night that already read 480/present/[] reading exactly that', async () => {
+      const days = await sheetsFor(finished.map((r) => r.personId))
+      const punchCounts = await punchCountsOn(
+        finished.map((r) => r.personId),
+        FRIDAY,
+      )
+      for (const run of finished) {
+        const night = days.get(`${run.personId}|${FRIDAY}`)
+        expect(night?.workedMinutes, `finished ${run.wall}`).toBe(480)
+        expect(night?.status, `finished ${run.wall}`).toBe('present')
+        expect(night?.anomalies, `finished ${run.wall}`).toEqual([])
+        // Two punches, not three: the arrival that follows must not land on the night's sheet, which
+        // is how a closed night went back to `pending` in round two.
+        expect(punchCounts.get(run.personId) ?? 0, `finished ${run.wall}`).toBe(2)
+
+        if (run.wall === '06:00') continue
+        const morning = days.get(`${run.personId}|${SATURDAY}`)
+        expect(morning?.workedMinutes, `finished ${run.wall} morning`).toBe(16 * 60 - wallMinutes(run.wall))
+        expect(morning?.anomalies, `finished ${run.wall} morning`).toEqual([])
+      }
+    })
+  })
+
+  /**
+   * Somebody who forgot to clock out, on a schedule with no auto clock-out to rescue them.
+   *
+   * An open shift claims the next punch, so this is the one way the rule could stand somebody up:
+   * arrive on Saturday, be told the punch belongs to Friday, and have no way forward. It does not,
+   * because `attendance.state` reads the same attribution the guard does — the widget says they are
+   * still on Friday night, the action it offers is the one the guard accepts, and the punch after it
+   * is an ordinary arrival.
+   */
+  describe('a night nobody clocked out of, and the morning after it', () => {
+    let forgetful: { personId: string; userId: string }
+
+    beforeAll(async () => {
+      const [person] = await hireMany(['Forgetful Kaan'])
+      forgetful = person!
+      clockReads(FRIDAY, '22:00')
+      await clockIn(forgetful.userId)
+    }, 60_000)
+
+    it('tells them at 09:00 on Saturday that they are still on Friday night', async () => {
+      clockReads(SATURDAY, '09:00')
+      const now = await state(forgetful.userId)
+      expect(now.businessDate).toBe(FRIDAY)
+      expect(now.clockedIn).toBe(true)
+      // Eleven hours, counted from 22:00 — visibly wrong to a person, which is the point of showing
+      // it rather than silently starting a fresh day underneath them.
+      expect(now.workedMinutesToday).toBe(11 * 60)
+    })
+
+    it('refuses a second clock-in, because the first one is still open', async () => {
+      clockReads(SATURDAY, '09:00')
+      await expect(clockIn(forgetful.userId)).rejects.toThrow('You are already clocked in.')
+    })
+
+    it('lets the clock-out they are offered close Friday, and the next punch open Saturday', async () => {
+      clockReads(SATURDAY, '09:00')
+      expect((await clockOut(forgetful.userId)).businessDate).toBe(FRIDAY)
+      expect((await state(forgetful.userId)).clockedIn).toBe(false)
+      clockReads(SATURDAY, '09:01')
+      expect((await clockIn(forgetful.userId)).businessDate).toBe(SATURDAY)
+      clockReads(SATURDAY, '16:00')
+      expect((await clockOut(forgetful.userId)).businessDate).toBe(SATURDAY)
+
+      const night = await sheet(forgetful.personId, FRIDAY)
+      expect(night?.workedMinutes).toBe(11 * 60)
+      expect(night?.anomalies).toEqual([])
+      const morning = await sheet(forgetful.personId, SATURDAY)
+      expect(morning?.workedMinutes).toBe(419)
+    })
   })
 })
 
@@ -2276,5 +2707,136 @@ describe('carry-forward', () => {
     expect(kinds).toEqual(['carry_in', 'carry_out', 'expiry', 'grant'])
     // The expiry says why, rather than the balance simply being smaller than it was.
     expect(entries.find((e) => e.kind === 'expiry')?.reason).toContain('carry-forward cap')
+  })
+})
+
+/**
+ * The nightly reconcile, and the row it was not allowed to look at.
+ *
+ * `attendance_days.locked` is a cache of a question only a period can answer, and `recomputeDay`
+ * repairs it in both directions. But the sweep that is supposed to run `recomputeDay` over recent
+ * days selected `locked = false` — so the one row class the downward repair exists for was the one
+ * class the query excluded, and a day frozen with nothing behind it stayed frozen for ever. A repair
+ * nothing running can reach is not a repair; it survived two rounds because the test that proved it
+ * called the service method directly. This one drives `hrJobs()`'s handler, which is what a running
+ * instance actually executes.
+ */
+describe('the nightly reconcile', () => {
+  const IST = 'Europe/Istanbul'
+  /** The sweep looks back fourteen days, so these dates have to be relative to the real clock. */
+  const daysAgo = (n: number) => new Date(Date.now() - n * 86_400_000).toISOString().slice(0, 10)
+  const stuckOn = daysAgo(3)
+  const filedOn = daysAgo(5)
+  let stuck: string
+  let filed: string
+
+  const reconcile = () => {
+    const job = hrJobs().find((j) => j.name === 'reconcile-days')
+    if (!job) throw new Error('reconcile-days job is gone')
+    return job.handler({}, { kernel, id: 'test', attempt: 1 })
+  }
+
+  const sheet = (personId: string, businessDate: string) =>
+    run(async (tx) => {
+      const [row] = await tx
+        .select()
+        .from(attendanceDays)
+        .where(
+          and(
+            eq(attendanceDays.workspaceId, WS_A),
+            eq(attendanceDays.personId, personId),
+            eq(attendanceDays.businessDate, businessDate),
+          ),
+        )
+      return row
+    })
+
+  beforeAll(async () => {
+    stuck = randomUUID()
+    filed = randomUUID()
+    await run(async (tx) => {
+      await tx.insert(people).values([
+        { id: stuck, workspaceId: WS_A, displayName: 'Stuck', timezone: IST },
+        { id: filed, workspaceId: WS_A, displayName: 'Filed', timezone: IST },
+      ])
+      // Six hours actually worked, on both days.
+      for (const [personId, date] of [
+        [stuck, stuckOn],
+        [filed, filedOn],
+      ] as const)
+        await tx.insert(punches).values([
+          {
+            workspaceId: WS_A,
+            personId,
+            direction: 'in',
+            at: new Date(zonedToInstant(date, '09:00', IST)),
+            businessDate: date,
+            timezone: IST,
+          },
+          {
+            workspaceId: WS_A,
+            personId,
+            direction: 'out',
+            at: new Date(zonedToInstant(date, '15:00', IST)),
+            businessDate: date,
+            timezone: IST,
+          },
+        ])
+      // Both sheets carry `locked` and a figure that never came from those punches. Only one of them
+      // has a period behind it.
+      await tx.insert(attendanceDays).values([
+        {
+          workspaceId: WS_A,
+          personId: stuck,
+          businessDate: stuckOn,
+          status: 'present',
+          workedMinutes: 480,
+          locked: true,
+        },
+        {
+          workspaceId: WS_A,
+          personId: filed,
+          businessDate: filedOn,
+          status: 'present',
+          workedMinutes: 480,
+          locked: true,
+        },
+      ])
+      // `kind: 'attendance'` rather than `payroll` on purpose: the exclusion constraint keys on the
+      // kind, and every other period in this file is a `payroll` one on a fixed 2026 date. These
+      // dates move with the calendar, so a fixture on the same kind would collide with one of them
+      // whenever the suite happened to run inside that month.
+      await tx.insert(periods).values({
+        workspaceId: WS_A,
+        kind: 'attendance',
+        startsOn: filedOn,
+        endsOn: filedOn,
+        status: 'locked',
+        lockedAt: new Date(),
+      })
+    })
+  }, 60_000)
+
+  it('visits a day flagged locked with no period behind it, and rebuilds it', async () => {
+    await reconcile()
+    const day = await sheet(stuck, stuckOn)
+    // Six hours from the punches, not the 480 the frozen row was carrying.
+    expect(day?.workedMinutes).toBe(360)
+    expect(day?.locked).toBe(false)
+  })
+
+  it('still leaves a day a period really does close exactly where it was', async () => {
+    // The case adjacent to the one above, and the reason the flag was filtered on in the first
+    // place. Offering every row to `recomputeDay` must not mean rewriting a filed month: the period
+    // is asked, and it says no.
+    const day = await sheet(filed, filedOn)
+    expect(day?.workedMinutes).toBe(480)
+    expect(day?.locked).toBe(true)
+  })
+
+  it('is idempotent, so a second night changes nothing', async () => {
+    await reconcile()
+    expect((await sheet(stuck, stuckOn))?.workedMinutes).toBe(360)
+    expect((await sheet(filed, filedOn))?.workedMinutes).toBe(480)
   })
 })

@@ -1,5 +1,6 @@
 import type { JobDef, Kernel } from '@kernhq/kernel'
-import { and, eq, inArray, isNull, lte, sql } from 'drizzle-orm'
+import { and, eq, gt, gte, inArray, isNull, lte, notExists, sql } from 'drizzle-orm'
+import { alias } from 'drizzle-orm/pg-core'
 import { accrueForPeriod, carryForward } from '../policy/accrual.js'
 import {
   attendanceDays,
@@ -16,6 +17,14 @@ import { todayIn } from './services/db.js'
 import { LedgerService } from './services/ledger.js'
 import { PolicyService } from './services/policies.js'
 import { ResolveService } from './services/resolve.js'
+
+/**
+ * How far back the auto clock-out sweep looks.
+ *
+ * Comfortably longer than any `auto_clock_out_after_minutes` a schedule configures, and long enough
+ * that the job having been down over a weekend still closes what it missed.
+ */
+const AUTO_CLOCK_OUT_LOOKBACK_DAYS = 3
 
 /**
  * HR's scheduled work.
@@ -305,6 +314,32 @@ export function hrJobs(): JobDef[] {
             // Anyone with an `in` and no matching `out`, older than the longest configured window.
             const longest = Math.max(...withAuto.map((s) => s.after ?? 0))
             const cutoff = new Date(Date.now() - longest * 60_000)
+            // `at <= cutoff` with no lower bound asks for every `in` punch the instance has ever
+            // recorded. Measured on 150,000 punches over five months: a sequential scan of every
+            // populated partition, 100,000 rows and 2,462 buffers, with the index in place and
+            // unused. With the two lower bounds it is a bitmap index scan of the one partition the
+            // lookback covers — 2,000 rows, 1,041 buffers — because `at` is what the index can
+            // answer and `business_date` is what prunes the partitions. The date bound is a day
+            // earlier than the instant one: a night shift's punches carry the date the shift
+            // *started*, which is the day before the morning they were made on.
+            //
+            // The cost of the bound is real and worth stating: a shift left open for longer than
+            // the lookback is never closed automatically. That is close to true already — the
+            // window a schedule configures is hours, not days — and three days leaves slack for the
+            // job itself having been down.
+            const since = new Date(cutoff.getTime() - AUTO_CLOCK_OUT_LOOKBACK_DAYS * 86_400_000)
+            const sinceDate = new Date(since.getTime() - 86_400_000).toISOString().slice(0, 10)
+
+            // "Still open" is a question about the punches of one person-day, and it used to be
+            // answered here — a query per candidate row, before anything was known about the person
+            // it belonged to. As an anti-join it costs nothing extra and the loop below only ever
+            // sees shifts that really are open.
+            //
+            // The three predicates above it are the ones `hr_punches_open_idx` is built from and
+            // must not move: `voided_by_punch_id is null` is the index's partial predicate because
+            // drizzle emits `is null` literally and the planner can prove the implication, while
+            // `direction` arrives as a bind parameter, which a predicate's constant cannot match.
+            const closing = alias(punches, 'closing')
             const open = await tx
               .select({
                 personId: punches.personId,
@@ -318,18 +353,48 @@ export function hrJobs(): JobDef[] {
                   eq(punches.direction, 'in'),
                   isNull(punches.voidedByPunchId),
                   lte(punches.at, cutoff),
+                  gte(punches.at, since),
+                  gte(punches.businessDate, sinceDate),
+                  notExists(
+                    tx
+                      .select({ closed: sql`1` })
+                      .from(closing)
+                      .where(
+                        and(
+                          eq(closing.workspaceId, workspaceId),
+                          eq(closing.personId, punches.personId),
+                          eq(closing.businessDate, punches.businessDate),
+                          eq(closing.direction, 'out'),
+                          isNull(closing.voidedByPunchId),
+                          gt(closing.at, punches.at),
+                          // Implied by the equality above, and stated anyway: without it nothing
+                          // bounds the date on this side, and the planner then drives the anti-join
+                          // from here — reading every populated partition for `out` punches to
+                          // find the handful that close anything. Measured at 2,949 buffers
+                          // against 865 with the bounds, on the same rows.
+                          gte(closing.businessDate, sinceDate),
+                          gte(closing.at, since),
+                        ),
+                      ),
+                  ),
                 ),
               )
 
+            // One shift per person-day, not one per `in` punch. Somebody who clocked in twice and
+            // never out has one open shift, and closing it twice would write two clock-outs for a
+            // day that had one. Deduping here rather than with `distinct on` keeps the statement's
+            // plan on the index above instead of on whatever answers the ordering cheapest.
+            const shifts = new Map<string, (typeof open)[number]>()
             for (const row of open) {
-              const rows = await attendance.punchesOn(tx, workspaceId, row.personId, row.businessDate)
-              const stillOpen = rows.reduce(
-                (acc, r) => (r.direction === 'in' ? true : r.direction === 'out' ? false : acc),
-                false,
-              )
-              if (!stillOpen) continue
+              const key = `${row.personId}:${row.businessDate}`
+              const seen = shifts.get(key)
+              if (!seen || row.at > seen.at) shifts.set(key, row)
+            }
 
-              const resolution = await resolve.forPerson(tx, workspaceId, row.personId)
+            for (const row of shifts.values()) {
+              // As of the day being closed, not as of now: the shift this closes may have started
+              // yesterday, and the zone written onto the punch is the one they worked in.
+              const resolution = await resolve.forPerson(tx, workspaceId, row.personId, row.businessDate)
               const schedule = await attendance.scheduleFor(tx, workspaceId, row.personId, row.businessDate)
               if (!schedule.autoClockOutAfterMinutes) continue
               if (Date.now() - row.at.getTime() < schedule.autoClockOutAfterMinutes * 60_000) continue
@@ -364,15 +429,16 @@ export function hrJobs(): JobDef[] {
 
     {
       /**
-       * Rebuild recent unlocked days.
+       * Rebuild every recent day a period does not close.
        *
        * Punches recompute their own day inline, so this exists for what that path cannot see: a
        * calendar edited after the fact, a schedule changed retroactively, an enqueue that never
        * ran. Anything it finds and changes is a bug worth knowing about rather than routine
        * maintenance — which is why it logs a count instead of running silently.
        *
-       * Locked days are never touched: a closed month must not move underneath a payroll already
-       * filed.
+       * A day a period really does close is still never touched — a filed payroll must not move
+       * underneath itself — but that is `recomputeDay`'s answer to give, not this query's. `touched`
+       * counts the days it actually rebuilt, so a window full of a closed month still logs nothing.
        */
       name: 'reconcile-days',
       cron: '30 2 * * *',
@@ -394,7 +460,6 @@ export function hrJobs(): JobDef[] {
               .where(
                 and(
                   eq(attendanceDays.workspaceId, workspaceId),
-                  eq(attendanceDays.locked, false),
                   sql`${attendanceDays.businessDate} >= ${since}`,
                 ),
               )
@@ -403,6 +468,13 @@ export function hrJobs(): JobDef[] {
             for (const day of days) {
               const resolution = await resolve.forPerson(tx, workspaceId, day.personId, day.businessDate)
               const schedule = await attendance.scheduleFor(tx, workspaceId, day.personId, day.businessDate)
+              // Every row in the window is offered, whatever its flag says. `locked` is a cache of
+              // an answer only the period holds, and `recomputeDay` is the one place entitled to
+              // read it — in both directions, since a flag repaired only upwards is a trapdoor
+              // rather than a cache. Selecting `locked = false` here excluded exactly the rows the
+              // downward repair exists for: a day stamped by a lock that has since been reopened,
+              // or by somebody's employment being corrected underneath one, could never be visited
+              // by anything a running instance does. A repair nothing reaches is not a repair.
               const r = await attendance.recomputeDay(
                 tx,
                 workspaceId,

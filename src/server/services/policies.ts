@@ -169,6 +169,12 @@ export class PolicyService {
    * The one question every recomputation asks before writing. A locked month must not move
    * underneath a payroll that has already been filed, so anything affecting it becomes an
    * adjustment in the open period instead.
+   *
+   * `attendance_days.locked` is a cache of this answer and defers to it in both directions — the
+   * flag is never believed ahead of the period, in either state. `on` and `legalEntityId` have to
+   * describe the same moment: the entity is the one that employed the person **on that date**, not
+   * the one they are in today, or a month filed under an entity somebody has since left reads as
+   * open.
    */
   async isLocked(
     tx: Tx,
