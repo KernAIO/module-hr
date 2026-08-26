@@ -32,7 +32,7 @@ import type {
   ResolvedCalendarDay,
   WorkingWeek,
 } from '../contract/models.js'
-import type { Period } from '../contract/policies.js'
+import type { Period, Policy, PolicyAssignment, PolicySubjectKind } from '../contract/policies.js'
 
 /**
  * A refusal the client cannot tell from the server's.
@@ -254,6 +254,7 @@ export function createMockHrApi() {
     {
       id: id('d001'),
       displayName: 'Ayşe Yılmaz',
+      hiredOn: day(-400),
       workEmail: 'ayse@example.test',
       status: 'active',
       timezone: 'Europe/Istanbul',
@@ -262,6 +263,7 @@ export function createMockHrApi() {
     {
       id: id('d002'),
       displayName: 'Sanne de Vries',
+      hiredOn: day(-300),
       workEmail: 'sanne@example.test',
       status: 'active',
       timezone: 'Europe/Amsterdam',
@@ -270,6 +272,7 @@ export function createMockHrApi() {
     {
       id: id('d003'),
       displayName: 'Mehmet Kaya',
+      hiredOn: day(-2000),
       workEmail: 'mehmet@example.test',
       status: 'on_leave',
       timezone: 'Europe/Istanbul',
@@ -278,6 +281,7 @@ export function createMockHrApi() {
     {
       id: id('d004'),
       displayName: 'Jonas Weber',
+      hiredOn: day(-80),
       workEmail: 'jonas@example.test',
       status: 'active',
       timezone: 'Europe/Berlin',
@@ -369,7 +373,6 @@ export function createMockHrApi() {
     personalEmail: null,
     phone: null,
     photoFileId: null,
-    hiredOn: day(-400),
     terminatedOn: null,
     custom: {},
     createdAt: iso(400 * 86_400_000),
@@ -1149,6 +1152,270 @@ export function createMockHrApi() {
       return weekday !== 'sat' && weekday !== 'sun' && date <= day(0)
     }).length
 
+  // ---------------------------------------------------------------- accrual policies
+
+  /** The ladder made explicit, straight from `SUBJECT_PRIORITY` in the contract. */
+  const PRIORITY: Record<PolicySubjectKind, number> = {
+    person: 100,
+    office: 80,
+    legal_entity: 60,
+    org_unit: 40,
+    position: 30,
+    workspace: 0,
+  }
+
+  /**
+   * Two policies that differ in more than their name.
+   *
+   * A list whose column reads the same sentence twice demonstrates nothing — these take different
+   * branches of the evaluator: one accrues monthly with a waiting period for joiners, the other on
+   * the employee's own anniversary with seniority tiers.
+   */
+  const policies: Row<Policy>[] = [
+    {
+      id: id('b011'),
+      kind: 'accrual',
+      name: 'Monthly accrual',
+      config: {
+        frequency: 'monthly',
+        daysPerYear: 20,
+        minutesPerDay: 480,
+        seniorityTiers: [],
+        waitingPeriodMonths: 3,
+        calendar: 'gregorian',
+        roundToMinutes: 30,
+        leaveTypeKey: 'annual',
+      },
+      effectiveFrom: `${YEAR}-01-01`,
+      effectiveTo: null,
+      source: 'custom',
+      packKey: null,
+      configHash: 'a1b2c3d4',
+      archivedAt: null,
+    },
+    {
+      id: id('b012'),
+      kind: 'accrual',
+      name: 'Anniversary accrual, with seniority',
+      config: {
+        frequency: 'anniversary',
+        daysPerYear: 22,
+        minutesPerDay: 480,
+        seniorityTiers: [
+          { afterYears: 5, daysPerYear: 26 },
+          { afterYears: 10, daysPerYear: 30 },
+        ],
+        waitingPeriodMonths: 0,
+        calendar: 'gregorian',
+        roundToMinutes: 0,
+        leaveTypeKey: 'annual',
+      },
+      effectiveFrom: `${YEAR}-01-01`,
+      effectiveTo: null,
+      source: 'custom',
+      packKey: null,
+      configHash: 'e5f6a7b8',
+      archivedAt: null,
+    },
+  ]
+
+  /**
+   * Two rungs, on purpose.
+   *
+   * The screen's copy says the nearest subject wins; with everything assigned at one rung nothing on
+   * screen tests that claim. The workspace-wide monthly policy is what most people get, and Sanne
+   * has the anniversary one at the `person` rung — which must visibly beat the office below it.
+   */
+  const policyAssignments: Row<PolicyAssignment>[] = [
+    {
+      id: id('b0a1'),
+      policyId: id('b011'),
+      subjectKind: 'workspace',
+      subjectId: null,
+      effectiveFrom: `${YEAR}-01-01`,
+      effectiveTo: null,
+      priority: PRIORITY.workspace,
+    },
+    {
+      id: id('b0a2'),
+      policyId: id('b012'),
+      subjectKind: 'office',
+      subjectId: id('e002'),
+      effectiveFrom: `${YEAR}-01-01`,
+      effectiveTo: null,
+      priority: PRIORITY.office,
+    },
+    // Mehmet has been here five years, so the tier above `afterYears: 5` is the one that answers
+    // for him — without somebody long-serving the seniority branch of the evaluator never fires and
+    // the second policy's whole reason for existing goes untested.
+    {
+      id: id('b0a4'),
+      policyId: id('b012'),
+      subjectKind: 'person',
+      subjectId: people[2]!.id,
+      effectiveFrom: `${YEAR}-01-01`,
+      effectiveTo: null,
+      priority: PRIORITY.person,
+    },
+    {
+      id: id('b0a3'),
+      policyId: id('b012'),
+      subjectKind: 'person',
+      subjectId: people[1]!.id,
+      effectiveFrom: `${YEAR}-01-01`,
+      effectiveTo: null,
+      priority: PRIORITY.person,
+    },
+  ]
+
+  const assignmentsOf = (policyId: string) => policyAssignments.filter((a) => a.policyId === policyId)
+
+  /**
+   * Which policy applies to somebody, and which rung answered.
+   *
+   * Nearest wins, by the priority the contract publishes — so a policy given to one person beats the
+   * one on their office, which beats their legal entity, their department, their position, and
+   * finally the whole workspace. This is the claim the screen's copy makes, so it has to be the
+   * claim the fixture keeps.
+   */
+  function resolvePolicyFor(personId: string) {
+    const officeId = primaryOfficeId(personId)
+    const job = employments.find((e) => e.personId === personId && e.effectiveTo === null)
+    const matches = (a: Row<PolicyAssignment>) => {
+      switch (a.subjectKind) {
+        case 'person':
+          return a.subjectId === personId
+        case 'office':
+          return a.subjectId === officeId
+        case 'legal_entity':
+          return a.subjectId === job?.legalEntityId
+        case 'org_unit':
+          return a.subjectId === job?.orgUnitId
+        case 'position':
+          return a.subjectId === job?.positionId
+        default:
+          return true
+      }
+    }
+    const best = policyAssignments
+      .filter((a) => {
+        if (a.effectiveTo !== null) return false
+        const policy = policies.find((x) => x.id === a.policyId)
+        return Boolean(policy && policy.archivedAt === null) && matches(a)
+      })
+      .sort((a, b) => b.priority - a.priority)[0]
+    const policy = best ? policies.find((x) => x.id === best.policyId) : undefined
+    return best && policy ? { assignment: best, policy } : null
+  }
+
+  const wholeMonthsBetween = (from: string, to: string) => {
+    const a = new Date(`${from}T00:00:00Z`)
+    const b = new Date(`${to}T00:00:00Z`)
+    let months = (b.getUTCFullYear() - a.getUTCFullYear()) * 12 + (b.getUTCMonth() - a.getUTCMonth())
+    if (b.getUTCDate() < a.getUTCDate()) months -= 1
+    return months
+  }
+
+  /**
+   * What a run would credit — computed, never written.
+   *
+   * `preview` and `run` share this function for the reason the contract gives: a preview computed
+   * differently from the thing it previews is a preview that eventually lies. Only `run` writes,
+   * and it writes from these rows.
+   */
+  function accrualRows(from: string, to: string, onlyPersonId?: string) {
+    const rows: Array<{
+      personId: string
+      displayName: string
+      leaveTypeId: string
+      leaveTypeName: string
+      minutes: number
+      days: number
+      reason: string
+      alreadyAccrued: boolean
+    }> = []
+    const skipped: Array<{ personId: string; displayName: string; reason: string }> = []
+
+    for (const who of people) {
+      if (onlyPersonId && who.id !== onlyPersonId) continue
+      const skip = (reason: string) =>
+        skipped.push({ personId: who.id, displayName: who.displayName, reason })
+
+      if (who.status === 'terminated') {
+        skip('No longer employed')
+        continue
+      }
+      const applicable = resolvePolicyFor(who.id)
+      if (!applicable) {
+        skip('No accrual policy applies')
+        continue
+      }
+      const config = applicable.policy.config as {
+        frequency: string
+        daysPerYear: number
+        minutesPerDay: number
+        seniorityTiers: Array<{ afterYears: number; daysPerYear: number }>
+        waitingPeriodMonths: number
+        roundToMinutes: number
+        leaveTypeKey: string
+      }
+      const served = wholeMonthsBetween(who.hiredOn, from)
+      if (served < config.waitingPeriodMonths) {
+        skip(`Within the ${config.waitingPeriodMonths}-month waiting period — ${served} served`)
+        continue
+      }
+      const leaveType = leaveTypes.find((lt) => lt.key === config.leaveTypeKey && lt.archivedAt === null)
+      if (!leaveType) {
+        skip(`No leave type keyed "${config.leaveTypeKey}"`)
+        continue
+      }
+
+      // Most senior tier reached wins, whatever order they are written in.
+      const years = Math.floor(served / 12)
+      const tier = [...(config.seniorityTiers ?? [])]
+        .filter((t) => years >= t.afterYears)
+        .sort((a, b) => b.afterYears - a.afterYears)[0]
+      const perYear = tier?.daysPerYear ?? config.daysPerYear
+
+      let minutes = Math.round((perYear * config.minutesPerDay) / 12)
+      if (config.roundToMinutes > 0) {
+        minutes = Math.round(minutes / config.roundToMinutes) * config.roundToMinutes
+      }
+      const alreadyAccrued = ledger.some(
+        (e) =>
+          e.personId === who.id &&
+          e.leaveTypeId === leaveType.id &&
+          e.kind === 'accrual' &&
+          e.effectiveOn >= from &&
+          e.effectiveOn <= to,
+      )
+      const basis = tier
+        ? `${perYear} days a year after ${tier.afterYears} years' service`
+        : `${perYear} days a year`
+      rows.push({
+        personId: who.id,
+        displayName: who.displayName,
+        leaveTypeId: leaveType.id,
+        leaveTypeName: leaveType.name,
+        minutes,
+        days: Math.round((minutes / config.minutesPerDay) * 100) / 100,
+        reason: alreadyAccrued
+          ? `${basis}, ${config.frequency} — already credited for this period`
+          : `${basis}, ${config.frequency}`,
+        alreadyAccrued,
+      })
+    }
+
+    return {
+      periodFrom: from,
+      periodTo: to,
+      rows,
+      // What the run would actually add: a row already credited contributes nothing to it.
+      totalMinutes: rows.filter((r) => !r.alreadyAccrued).reduce((sum, r) => sum + r.minutes, 0),
+      skipped,
+    }
+  }
+
   // ---------------------------------------------------------------- approval chains
 
   const chains: Row<ApprovalChain>[] = [
@@ -1477,6 +1744,7 @@ export function createMockHrApi() {
           workEmail: input.workEmail ?? '',
           status: 'active' as const,
           timezone: 'Europe/Istanbul',
+          hiredOn: input.hiredOn ?? day(0),
           employeeNo: input.employeeNo ?? `E-${people.length + 1}`,
         }
         people.push(added)
@@ -3034,6 +3302,203 @@ export function createMockHrApi() {
             .filter((a) => a.personId === input.personId)
             .map((a) => ({ ...a, workspaceId: input.workspaceId }))
         },
+      },
+    },
+
+    policies: {
+      list: async ({
+        workspaceId,
+        kind,
+        includeArchived = false,
+      }: {
+        workspaceId: string
+        kind?: string
+        includeArchived?: boolean
+      }) =>
+        policies
+          .filter((row) => (!kind || row.kind === kind) && (includeArchived || row.archivedAt === null))
+          .map((row) => ({
+            ...row,
+            workspaceId,
+            assignments: assignmentsOf(row.id).map((a) => ({ ...a, workspaceId })),
+          })),
+
+      get: async ({ workspaceId, policyId }: { workspaceId: string; policyId: string }) => {
+        const found = policies.find((row) => row.id === policyId)
+        if (!found) refuse('NOT_FOUND', 'Policy not found')
+        return {
+          ...found,
+          workspaceId,
+          assignments: assignmentsOf(found.id).map((a) => ({ ...a, workspaceId })),
+        }
+      },
+
+      create: async (input: {
+        workspaceId: string
+        kind: Policy['kind']
+        name: string
+        config: Record<string, unknown>
+        effectiveFrom: string
+        effectiveTo?: string | null
+      }) => {
+        const created: Row<Policy> = {
+          id: crypto.randomUUID(),
+          kind: input.kind,
+          name: input.name,
+          config: clone(input.config),
+          effectiveFrom: input.effectiveFrom,
+          effectiveTo: input.effectiveTo ?? null,
+          source: 'custom',
+          packKey: null,
+          // A hash of the config, because that is what a derived row records — a literal would make
+          // every policy look identical to a recomputation deciding whether a figure is stale.
+          configHash: Math.abs(
+            [...JSON.stringify(input.config)].reduce((h, c) => (h * 31 + c.charCodeAt(0)) | 0, 7),
+          )
+            .toString(16)
+            .padStart(8, '0'),
+          archivedAt: null,
+        }
+        policies.push(created)
+        return { ...created, workspaceId: input.workspaceId }
+      },
+
+      update: async (input: {
+        workspaceId: string
+        policyId: string
+        name?: string
+        config?: Record<string, unknown>
+        effectiveTo?: string | null
+      }) => {
+        const found = policies.find((row) => row.id === input.policyId)
+        if (!found) refuse('NOT_FOUND', 'Policy not found')
+        if (input.name !== undefined) found.name = input.name
+        if (input.config !== undefined) found.config = clone(input.config)
+        if (input.effectiveTo !== undefined) found.effectiveTo = input.effectiveTo
+        return { ...found, workspaceId: input.workspaceId }
+      },
+
+      /**
+       * Archived, never deleted, and **the assignments are left where they are**.
+       *
+       * The router neither refuses nor cascades — a ledger entry names the policy that produced it,
+       * so a movement whose policy had vanished would be a number nobody can explain. That means an
+       * archived policy with live assignments is a state an administrator genuinely reaches, and the
+       * fixture can reach it too rather than only in theory.
+       */
+      archive: async ({ policyId }: { workspaceId: string; policyId: string }) => {
+        const found = policies.find((row) => row.id === policyId)
+        if (!found) refuse('NOT_FOUND', 'Policy not found')
+        found.archivedAt = iso()
+        return { ok: true as const }
+      },
+
+      assign: async (input: {
+        workspaceId: string
+        policyId: string
+        subjectKind: PolicySubjectKind
+        subjectId?: string | null
+        effectiveFrom: string
+        effectiveTo?: string | null
+      }) => {
+        const created: Row<PolicyAssignment> = {
+          id: crypto.randomUUID(),
+          policyId: input.policyId,
+          subjectKind: input.subjectKind,
+          // `workspace` needs no id, and storing one would make the rung look narrower than it is.
+          subjectId: input.subjectKind === 'workspace' ? null : (input.subjectId ?? null),
+          effectiveFrom: input.effectiveFrom,
+          effectiveTo: input.effectiveTo ?? null,
+          priority: PRIORITY[input.subjectKind],
+        }
+        policyAssignments.push(created)
+        return { ...created, workspaceId: input.workspaceId }
+      },
+
+      unassign: async ({ assignmentId }: { workspaceId: string; assignmentId: string }) => {
+        const at = policyAssignments.findIndex((a) => a.id === assignmentId)
+        if (at < 0) refuse('NOT_FOUND', 'Policy assignment not found')
+        policyAssignments.splice(at, 1)
+        return { ok: true as const }
+      },
+
+      resolveFor: async ({ workspaceId, personId }: { workspaceId: string; personId: string }) => {
+        const applicable = resolvePolicyFor(personId)
+        void workspaceId
+        return applicable
+          ? [
+              {
+                kind: 'accrual' as const,
+                policyId: applicable.policy.id,
+                policyName: applicable.policy.name,
+                config: applicable.policy.config,
+                from: applicable.assignment.subjectKind,
+                subjectId: applicable.assignment.subjectId,
+              },
+            ]
+          : []
+      },
+    },
+
+    accrual: {
+      /**
+       * A query, and it **writes nothing**.
+       *
+       * The contract makes it a query for exactly this reason: a preview that filed ledger entries
+       * would credit everybody the moment somebody looked at the screen meant to tell them what a
+       * run *would* do. It returns the same rows `run` credits from, so the two cannot disagree.
+       */
+      preview: async ({
+        workspaceId,
+        from,
+        to,
+        personId,
+      }: {
+        workspaceId: string
+        from: string
+        to: string
+        personId?: string
+      }) => {
+        void workspaceId
+        return accrualRows(from, to, personId)
+      },
+
+      /**
+       * Credits the ledger, and is idempotent per person, per leave type, per period.
+       *
+       * A second run over the same window credits nothing, because every row it would write is
+       * already `alreadyAccrued` — an accrual job that double-credits when somebody clicks twice is
+       * worse than one that never ran.
+       */
+      run: async ({
+        workspaceId,
+        from,
+        to,
+        personId,
+      }: {
+        workspaceId: string
+        from: string
+        to: string
+        personId?: string
+      }) => {
+        void workspaceId
+        const preview = accrualRows(from, to, personId)
+        let credited = 0
+        let totalMinutes = 0
+        for (const row of preview.rows) {
+          if (row.alreadyAccrued) continue
+          ledger.push(
+            entry(row.personId, row.leaveTypeId, 'accrual', row.minutes, to, { reason: row.reason }),
+          )
+          credited += 1
+          totalMinutes += row.minutes
+        }
+        return {
+          credited,
+          // Everything the run passed over: those already credited, and those it never reached.
+          skipped: preview.skipped.length + preview.rows.filter((r) => r.alreadyAccrued).length,
+          totalMinutes,
+        }
       },
     },
 
