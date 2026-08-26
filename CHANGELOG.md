@@ -1,5 +1,11 @@
 # @kernhq/module-hr
 
+## 0.10.4
+
+### Patch Changes
+
+- fix(hr): make every migration survive being applied twice
+
 ## 0.10.3
 
 ### Patch Changes
