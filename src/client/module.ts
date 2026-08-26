@@ -307,6 +307,20 @@ export const hrClientModule = defineClientModule({
       component: () => import('./settings/SchedulesSettings.svelte'),
     },
     {
+      // Between leave and schedules, because accrual is how a balance comes to exist and the leave
+      // types it credits are the page above it.
+      id: 'accrual',
+      get label() {
+        return t('settings_accrual')
+      },
+      icon: 'gauge',
+      scope: 'workspace',
+      permission: HR_PERMISSIONS.policyManage,
+      capability: HR_CAPABILITIES.leaveAccrual,
+      order: 35,
+      component: () => import('./settings/AccrualSettings.svelte'),
+    },
+    {
       id: 'approvals',
       get label() {
         return t('settings_approvals')
