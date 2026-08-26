@@ -1,5 +1,5 @@
 <script lang="ts">
-import { Avatar, EmptyState, Skeleton, type WidgetProps } from '@kernhq/ui'
+import { Avatar, Button, EmptyState, formatDateRange, Skeleton, type WidgetProps } from '@kernhq/ui'
 import { createQuery } from '@tanstack/svelte-query'
 import { getHrApi } from '../api-instance.js'
 import { t } from '../i18n.js'
@@ -25,18 +25,26 @@ const outQuery = createQuery(() => ({
 }))
 const away = $derived(outQuery.data ?? [])
 
+/**
+ * `formatDateRange` rather than `Intl` here: it formats in the reader's *interface* language, which
+ * `undefined` does not — that is the browser's language, so a Persian interface printed "6 Aug".
+ * `T00:00:00` stays on both ends: a bare `YYYY-MM-DD` is parsed as UTC midnight, which prints the
+ * day before west of Greenwich.
+ */
 const range = (a: string, b: string) =>
-  new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'short' }).formatRange(
-    new Date(`${a}T00:00:00`),
-    new Date(`${b}T00:00:00`),
-  )
+  formatDateRange(`${a}T00:00:00`, `${b}T00:00:00`, { day: 'numeric', month: 'short' })
 </script>
 
+<!--
+  Held rows outrank the error. `invalidateQueries({ queryKey: ['hr'] })` fires on every punch and
+  every approval decision anywhere in the module, so a failed background refetch leaves TanStack in
+  `error` while `data` is still the last good calendar — an error branch above this one would blank
+  a working card on a transient failure. The error is only the whole card when there is nothing
+  else to draw.
+-->
 {#if outQuery.isLoading}
   <Skeleton height="96px" />
-{:else if away.length === 0}
-  <EmptyState bare compact icon="calendar-days" title={t('leave_none')} />
-{:else}
+{:else if away.length > 0}
   <ul>
     {#each away as person (person.requestId)}
       <li>
@@ -46,6 +54,23 @@ const range = (a: string, b: string) =>
       </li>
     {/each}
   </ul>
+{:else if outQuery.isError}
+  <!--
+    One row, not an `EmptyState`, for the same reason as the rest of this module's cards: a compact
+    `EmptyState` is 82px before it is given an action, which is twice the 43px body a widget has at
+    size `s`. This card starts at `m` and has the room, but a person reading two failed HR cards
+    side by side should not be shown two different shapes of failure.
+
+    Without this branch the empty state below said "No time off booked" — read on a card headed
+    "Who's out" as *nobody is away*, which is the precise opposite of what is actually unknown, and
+    the one answer somebody schedules a week of work around.
+  -->
+  <div class="failed" role="alert">
+    <span class="msg">{t('whos_out_error')}</span>
+    <Button size="xs" variant="ghost" onclick={() => void outQuery.refetch()}>{t('retry')}</Button>
+  </div>
+{:else}
+  <EmptyState bare compact icon="calendar-days" title={t('leave_none')} />
 {/if}
 
 <style>
@@ -71,5 +96,19 @@ li {
 .meta {
   color: var(--kern-ink-500);
   font-size: 12px;
+}
+.failed {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-block: 8px;
+  padding-inline: 14px;
+}
+/* Muted with a colour, never opacity: 9.86:1 on the card in light, 8.96:1 in dark. */
+.msg {
+  min-width: 0;
+  font-size: 12.5px;
+  color: var(--kern-ink-600);
 }
 </style>

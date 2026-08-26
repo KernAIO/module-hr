@@ -13,6 +13,7 @@
  * Types come from the contract rather than being retyped here. A mock that answers a shape core
  * does not is how a screen works in `dev:mock` and breaks against the real API.
  */
+import { ORPCError } from '@orpc/contract'
 import type { Schedule, ScheduleAssignment } from '../contract/attendance.js'
 import type { LeaveType } from '../contract/leave.js'
 import type {
@@ -25,6 +26,23 @@ import type {
   ResolvedCalendarDay,
   WorkingWeek,
 } from '../contract/models.js'
+
+/**
+ * A refusal the client cannot tell from the server's.
+ *
+ * `kernErrorToORPC` turns every `KernError` the router throws into exactly this — same code, same
+ * status, same sentence — and the oRPC link hands the browser one back. A bare `Error` would carry
+ * the message and *not* the code, so a screen branching on `CONFLICT` takes one path against the
+ * mock and another against core, which is the difference the mock exists to erase.
+ *
+ * Every sentence below is copied from `src/server/router.ts`, because the widget renders the
+ * server's own words rather than a translated string.
+ */
+function refuse(code: 'CONFLICT' | 'NOT_FOUND' | 'BAD_REQUEST', message: string): never {
+  // A declaration, not a `const` arrow: TypeScript only narrows on a `never` return for one of
+  // those, so an arrow would leave every caller believing the row after the guard is still optional.
+  throw new ORPCError(code, { message })
+}
 
 /** Stored without the tenant, which every call stamps back on. */
 type Row<T> = Omit<T, 'workspaceId'>
@@ -88,9 +106,11 @@ type PackDay = { monthDay: string; name: string; kind: CalendarDayKind; workingF
  * two it never had — because a `pack.preview` that returns nothing proves nothing about the dialog
  * it feeds, and the promise that dialog makes is that an upgrade cannot eat a company's own days.
  */
-const PACKS: Record<string, { version: string; days: PackDay[] }> = {
-  tr: {
-    version: '2.0',
+const PACKS: Record<string, { name: string; days: PackDay[] }> = {
+  // Keyed by the uppercase ISO code, and looked up exactly, because `COUNTRY_PACKS` on the server
+  // is. A tolerant mock here would hide the fact that a lowercase key finds nothing there.
+  TR: {
+    name: 'Türkiye',
     days: [
       { monthDay: '01-01', name: "New Year's Day", kind: 'public_holiday', workingFraction: 0 },
       { monthDay: '03-19', name: 'Ramazan Bayramı Arifesi', kind: 'half_day', workingFraction: 0.5 },
@@ -119,8 +139,8 @@ const PACKS: Record<string, { version: string; days: PackDay[] }> = {
       { monthDay: '10-29', name: 'Republic Day', kind: 'public_holiday', workingFraction: 0 },
     ],
   },
-  nl: {
-    version: '2.0',
+  NL: {
+    name: 'Nederland',
     days: [
       { monthDay: '01-01', name: 'Nieuwjaarsdag', kind: 'public_holiday', workingFraction: 0 },
       { monthDay: '04-27', name: 'Koningsdag', kind: 'public_holiday', workingFraction: 0 },
@@ -319,7 +339,14 @@ export function createMockHrApi() {
     activeAssignments(personId).find((a) => a.isPrimary)?.officeId ?? null
   const officeName = (officeId: string | null) => offices.find((o) => o.id === officeId)?.name ?? null
   const liveOffices = () => offices.filter((o) => o.archivedAt === null)
-  /** Primary only: a headcount that counted presence would sum to more people than the company has. */
+  /**
+   * Primary assignments only.
+   *
+   * Somebody can hold several offices, so counting presence would make the headcounts sum to more
+   * people than the company has — and the offices screen adds them up into a "People" tile. The
+   * roster is the other half of the same decision: it lists everyone and labels which kind each
+   * row is, because presence is worth seeing and is not worth counting.
+   */
   const headcount = (officeId: string) =>
     assignments.filter((a) => a.officeId === officeId && a.effectiveTo === null && a.isPrimary).length
 
@@ -348,8 +375,8 @@ export function createMockHrApi() {
       region: null,
       workingWeek: { ...DEFAULT_WEEK },
       source: 'pack',
-      packKey: 'tr',
-      packVersion: '1.0',
+      packKey: 'TR',
+      packVersion: String(YEAR),
       archivedAt: null,
     },
     {
@@ -485,7 +512,7 @@ export function createMockHrApi() {
 
   const resolveDay = (calendarId: string, workspaceId: string, date: string): ResolvedDay => {
     const found = composeDays(calendarId, workspaceId).get(date)
-    if (!found) throw new Error('Calendar day not found')
+    if (!found) refuse('NOT_FOUND', 'Calendar day not found')
     return found
   }
 
@@ -880,7 +907,7 @@ export function createMockHrApi() {
 
       get: async ({ workspaceId, officeId }: { workspaceId: string; officeId: string }) => {
         const found = offices.find((o) => o.id === officeId)
-        if (!found) throw new Error('Office not found')
+        if (!found) refuse('NOT_FOUND', 'Office not found')
         return { ...found, workspaceId }
       },
 
@@ -918,34 +945,54 @@ export function createMockHrApi() {
         }
         // The pack is copied as a *base* the office's calendar extends, never inlined — so seeding
         // makes a calendar rather than a heap of days.
-        if (input.seedCalendarFromPack !== false && PACKS[input.country.toLowerCase()]) {
-          const key = input.country.toLowerCase()
-          const seeded: Row<Calendar> = {
+        // The office's own calendar *extends* the country pack rather than copying it, so a pack
+        // refresh reaches this office without reconciling a copy. It is made even when no pack
+        // exists for the country — an office with no calendar at all has no working week to resolve,
+        // and the router does not leave one in that state.
+        if (input.seedCalendarFromPack !== false) {
+          const key = input.country
+          let base = calendars.find((c) => c.source === 'pack' && c.packKey === key)
+          if (!base && PACKS[key]) {
+            base = {
+              id: crypto.randomUUID(),
+              name: PACKS[key]!.name,
+              extendsId: null,
+              country: input.country,
+              region: null,
+              workingWeek: { ...DEFAULT_WEEK },
+              source: 'pack',
+              packKey: key,
+              packVersion: String(YEAR),
+              archivedAt: null,
+            }
+            calendars.push(base)
+            for (const packDay of PACKS[key]!.days) {
+              calendarDays.push(
+                calDay(
+                  base.id,
+                  packDay.monthDay,
+                  packDay.name,
+                  packDay.kind,
+                  packDay.workingFraction,
+                  'pack',
+                ),
+              )
+            }
+          }
+          const own: Row<Calendar> = {
             id: crypto.randomUUID(),
             name: input.name,
-            extendsId: null,
+            extendsId: base?.id ?? null,
             country: input.country,
             region: input.region ?? null,
-            workingWeek: { ...DEFAULT_WEEK },
-            source: 'pack',
-            packKey: key,
-            packVersion: PACKS[key]!.version,
+            workingWeek: base ? { ...base.workingWeek } : { ...DEFAULT_WEEK },
+            source: 'custom',
+            packKey: null,
+            packVersion: null,
             archivedAt: null,
           }
-          calendars.push(seeded)
-          for (const packDay of PACKS[key]!.days) {
-            calendarDays.push(
-              calDay(
-                seeded.id,
-                packDay.monthDay,
-                packDay.name,
-                packDay.kind,
-                packDay.workingFraction,
-                'pack',
-              ),
-            )
-          }
-          created.calendarId = seeded.id
+          calendars.push(own)
+          created.calendarId = own.id
         }
         offices.push(created)
         return { ...created, workspaceId: input.workspaceId }
@@ -966,7 +1013,7 @@ export function createMockHrApi() {
         code?: string | null
       }) => {
         const found = offices.find((o) => o.id === input.officeId)
-        if (!found) throw new Error('Office not found')
+        if (!found) refuse('NOT_FOUND', 'Office not found')
         if (input.name !== undefined) found.name = input.name
         if (input.kind !== undefined) found.kind = input.kind
         if (input.country !== undefined) found.country = input.country
@@ -982,9 +1029,19 @@ export function createMockHrApi() {
 
       archive: async ({ officeId }: { workspaceId: string; officeId: string }) => {
         const found = offices.find((o) => o.id === officeId)
-        if (!found) throw new Error('Office not found')
-        // Every new person lands in the default office, so the workspace has to keep having one.
-        if (found.isDefault) throw new Error('Move the default to another office first')
+        if (!found) refuse('NOT_FOUND', 'Office not found')
+        // The default office is where everyone without an assignment lands and where the resolution
+        // ladder bottoms out, so it has to be handed over before it can go.
+        if (found.isDefault) {
+          refuse(
+            'CONFLICT',
+            'This is the default office. Make another office the default before archiving it.',
+          )
+        }
+        // Presence counts here, not only primaries: archiving an office out from under somebody who
+        // still appears in its directory is the same problem either way.
+        const held = assignments.filter((a) => a.officeId === officeId && a.effectiveTo === null).length
+        if (held > 0) refuse('CONFLICT', `${held} people still work here. Move them first.`)
         found.archivedAt = iso()
         return { ok: true as const }
       },
@@ -992,7 +1049,7 @@ export function createMockHrApi() {
       /** Moves the flag rather than adding a second one: exactly one office is ever the default. */
       setDefault: async ({ workspaceId, officeId }: { workspaceId: string; officeId: string }) => {
         const found = offices.find((o) => o.id === officeId)
-        if (!found) throw new Error('Office not found')
+        if (!found) refuse('NOT_FOUND', 'Office not found')
         for (const office of offices) office.isDefault = office.id === officeId
         return { ...found, workspaceId }
       },
@@ -1063,11 +1120,13 @@ export function createMockHrApi() {
         effectiveTo: string
       }) => {
         const found = activeAssignments(personId).find((a) => a.officeId === officeId)
-        if (!found) throw new Error('That person is not assigned to this office')
+        if (!found) refuse('NOT_FOUND', 'Office assignment not found')
+        // The router will not let the primary go rather than picking a replacement on somebody's
+        // behalf: which office decides their holidays is a decision, not a fallback.
+        if (found.isPrimary) {
+          refuse('CONFLICT', 'This is their primary office. Assign another office as primary first.')
+        }
         found.effectiveTo = effectiveTo
-        // Leaving somebody with offices and no primary would leave their holidays undecided.
-        const rest = activeAssignments(personId)
-        if (found.isPrimary && rest.length > 0 && !rest.some((a) => a.isPrimary)) rest[0]!.isPrimary = true
         return { ok: true as const }
       },
 
@@ -1133,7 +1192,7 @@ export function createMockHrApi() {
 
       get: async ({ workspaceId, calendarId }: { workspaceId: string; calendarId: string }) => {
         const found = calendars.find((c) => c.id === calendarId)
-        if (!found) throw new Error('Calendar not found')
+        if (!found) refuse('NOT_FOUND', 'Calendar not found')
         return { ...found, workspaceId }
       },
 
@@ -1169,11 +1228,12 @@ export function createMockHrApi() {
         extendsId?: string | null
       }) => {
         const found = calendars.find((c) => c.id === input.calendarId)
-        if (!found) throw new Error('Calendar not found')
+        if (!found) refuse('NOT_FOUND', 'Calendar not found')
         if (input.name !== undefined) found.name = input.name
         if (input.workingWeek !== undefined) found.workingWeek = clone(input.workingWeek)
-        // A calendar that extends itself would compose forever.
-        if (input.extendsId !== undefined && input.extendsId !== found.id) {
+        if (input.extendsId !== undefined) {
+          // Composing would never terminate, so this is refused rather than quietly ignored.
+          if (input.extendsId === found.id) refuse('BAD_REQUEST', 'A calendar cannot extend itself.')
           found.extendsId = input.extendsId
         }
         return { ...found, workspaceId: input.workspaceId }
@@ -1181,9 +1241,10 @@ export function createMockHrApi() {
 
       archive: async ({ calendarId }: { workspaceId: string; calendarId: string }) => {
         const found = calendars.find((c) => c.id === calendarId)
-        if (!found) throw new Error('Calendar not found')
-        if (liveOffices().some((o) => o.calendarId === calendarId)) {
-          throw new Error('An office still resolves its holidays through this calendar')
+        if (!found) refuse('NOT_FOUND', 'Calendar not found')
+        const used = liveOffices().filter((o) => o.calendarId === calendarId).length
+        if (used > 0) {
+          refuse('CONFLICT', `${used} offices use this calendar. Point them at another one first.`)
         }
         found.archivedAt = iso()
         return { ok: true as const }
@@ -1247,7 +1308,7 @@ export function createMockHrApi() {
           note?: string | null
         }) => {
           const target = calendarDays.find((r) => r.id === input.dayId)
-          if (!target) throw new Error('Calendar day not found')
+          if (!target) refuse('NOT_FOUND', 'Calendar day not found')
           const merged = {
             name: input.name ?? target.name,
             kind: input.kind ?? target.kind,
@@ -1286,7 +1347,7 @@ export function createMockHrApi() {
          */
         remove: async ({ calendarId, dayId }: { workspaceId: string; calendarId: string; dayId: string }) => {
           const target = calendarDays.find((r) => r.id === dayId)
-          if (!target) throw new Error('Calendar day not found')
+          if (!target) refuse('NOT_FOUND', 'Calendar day not found')
           if (target.source === 'custom' && target.calendarId === calendarId) {
             calendarDays.splice(calendarDays.indexOf(target), 1)
             return { ok: true as const, suppressed: false }
@@ -1317,18 +1378,18 @@ export function createMockHrApi() {
           packKey: string
           year: number
         }) => {
-          const pack = PACKS[packKey.toLowerCase()]
-          // A pack key that does not exist is a typo, and saying so beats an empty diff that reads
-          // as "nothing would change".
-          if (!pack) throw new Error(`There is no holiday pack named "${packKey}"`)
-          const wanted = new Map(pack.days.map((d) => [`${year}-${d.monthDay}`, d]))
+          // An unknown key is an empty incoming set rather than an error, because that is what
+          // `packDays` returns on the server — so the diff then proposes dropping every pack day
+          // the calendar has. See the note in the report: that is the server's behaviour, not a
+          // kindness the mock invents, and it is worth somebody looking at.
+          const wanted = new Map((PACKS[packKey]?.days ?? []).map((d) => [`${year}-${d.monthDay}`, d]))
           const installed = calendarDays.filter(
             (r) => r.calendarId === calendarId && r.source === 'pack' && r.date.startsWith(`${year}-`),
           )
           const byDate = new Map(installed.map((r) => [r.date, r]))
           return {
-            packKey: packKey.toLowerCase(),
-            packVersion: pack.version,
+            packKey,
+            packVersion: String(year),
             added: [...wanted.entries()]
               .filter(([date]) => !byDate.has(date))
               .map(([date, d]) => ({ date, name: d.name })),
@@ -1358,9 +1419,7 @@ export function createMockHrApi() {
           packKey: string
           year: number
         }) => {
-          const pack = PACKS[packKey.toLowerCase()]
-          if (!pack) throw new Error(`There is no holiday pack named "${packKey}"`)
-          const wanted = new Map(pack.days.map((d) => [`${year}-${d.monthDay}`, d]))
+          const wanted = new Map((PACKS[packKey]?.days ?? []).map((d) => [`${year}-${d.monthDay}`, d]))
           let added = 0
           let changed = 0
           let removed = 0
@@ -1402,8 +1461,8 @@ export function createMockHrApi() {
           }
           const calendar = calendars.find((c) => c.id === calendarId)
           if (calendar) {
-            calendar.packKey = packKey.toLowerCase()
-            calendar.packVersion = pack.version
+            calendar.packKey = packKey
+            calendar.packVersion = String(year)
           }
           return { ok: true as const, added, changed, removed }
         },
@@ -1509,7 +1568,7 @@ export function createMockHrApi() {
           order?: number
         }) => {
           const found = leaveTypes.find((lt) => lt.id === input.leaveTypeId)
-          if (!found) throw new Error('Leave type not found')
+          if (!found) refuse('NOT_FOUND', 'Leave type not found')
           if (input.name !== undefined) found.name = input.name
           if (input.paid !== undefined) found.paid = input.paid
           if (input.color !== undefined) found.color = input.color
@@ -1528,7 +1587,7 @@ export function createMockHrApi() {
 
         archive: async ({ leaveTypeId }: { workspaceId: string; leaveTypeId: string }) => {
           const found = leaveTypes.find((lt) => lt.id === leaveTypeId)
-          if (!found) throw new Error('Leave type not found')
+          if (!found) refuse('NOT_FOUND', 'Leave type not found')
           found.archivedAt = iso()
           return { ok: true as const }
         },
@@ -1649,20 +1708,33 @@ export function createMockHrApi() {
           timezone: 'Europe/Istanbul',
         }
       },
+      /**
+       * The transitions the router refuses, refused here too, in its order and its words.
+       *
+       * `punch()` answers a double-tapped button with a CONFLICT carrying a sentence rather than a
+       * constraint error, and the widget renders that sentence. A mock that accepts all four
+       * leaves a probe edited into a component as the only way to reach that branch — which is
+       * exactly what happened, in a file nobody meant to ship.
+       */
       clockIn: async () => {
+        if (clockedInAt !== null) refuse('CONFLICT', 'You are already clocked in.')
         clockedInAt = Date.now()
         return mockPunch('in')
       },
       clockOut: async () => {
+        if (clockedInAt === null) refuse('CONFLICT', 'You are not clocked in.')
         clockedInAt = null
         onBreak = false
         return mockPunch('out')
       },
       breakStart: async () => {
+        if (clockedInAt === null) refuse('CONFLICT', 'Clock in before starting a break.')
+        if (onBreak) refuse('CONFLICT', 'You are already on a break.')
         onBreak = true
         return mockPunch('break_start')
       },
       breakEnd: async () => {
+        if (!onBreak) refuse('CONFLICT', 'You are not on a break.')
         onBreak = false
         return mockPunch('break_end')
       },
@@ -1747,7 +1819,7 @@ export function createMockHrApi() {
           autoClockOutAfterMinutes?: number | null
         }) => {
           const found = schedules.find((s) => s.id === input.scheduleId)
-          if (!found) throw new Error('Schedule not found')
+          if (!found) refuse('NOT_FOUND', 'Schedule not found')
           if (input.name !== undefined) found.name = input.name
           if (input.week !== undefined) found.week = clone(input.week)
           if (input.graceInMinutes !== undefined) found.graceInMinutes = input.graceInMinutes
@@ -1764,7 +1836,7 @@ export function createMockHrApi() {
 
         archive: async ({ scheduleId }: { workspaceId: string; scheduleId: string }) => {
           const found = schedules.find((s) => s.id === scheduleId)
-          if (!found) throw new Error('Schedule not found')
+          if (!found) refuse('NOT_FOUND', 'Schedule not found')
           found.archivedAt = iso()
           return { ok: true as const }
         },
@@ -1816,7 +1888,7 @@ export function createMockHrApi() {
 
       get: async ({ workspaceId, requestId }: { workspaceId: string; requestId: string }) => {
         const found = approvalRequests.find((r) => r.id === requestId)
-        if (!found) throw new Error('Approval request not found')
+        if (!found) refuse('NOT_FOUND', 'Approval request not found')
         return { ...found, workspaceId }
       },
 
@@ -1830,7 +1902,7 @@ export function createMockHrApi() {
         decision: 'approve' | 'reject'
       }) => {
         const found = approvalRequests.find((r) => r.id === requestId)
-        if (!found) throw new Error('Approval request not found')
+        if (!found) refuse('NOT_FOUND', 'Approval request not found')
         // A middle step advances rather than settling: the inbox has to be able to show that.
         const last = found.currentStep >= Math.max(found.steps.length - 1, 0)
         if (decision === 'reject' || last) found.status = decision === 'approve' ? 'approved' : 'rejected'
