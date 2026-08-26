@@ -5,9 +5,6 @@
  * nothing throws. Lucide also renames icons between versions (`alert-triangle` became
  * `triangle-alert`), so a name that was right once quietly stops being right.
  *
- * A module ships its own screens, so it needs this as much as the app does: `icon="user-round"`
- * type-checked, linted and rendered nothing until somebody looked at the button.
- *
  *   node scripts/check-icons.mjs
  */
 import { readFileSync } from 'node:fs'
@@ -55,6 +52,32 @@ if (known.size < 20) {
 const USES = [/icon="([a-z0-9-]+)"/g, /icon:\s*'([a-z0-9-]+)'/g, /<Icon\s+name="([a-z0-9-]+)"/g]
 
 /**
+ * A name chosen inside an expression — `icon={ok ? 'check' : 'triangle-alert'}` — reaches `<Icon>`
+ * without matching any pattern above, because the attribute value is a brace and not a quote.
+ * `+error.svelte` picked its 404 icon that way and named one that does not exist, so the app's own
+ * not-found screen drew a blank square for as long as the check has existed. Read every quoted
+ * word inside an `icon={...}` and treat each as a candidate name.
+ */
+const ICON_EXPR = /icon=\{([^}]*)\}/g
+
+/**
+ * The quoted words in an `icon={...}` that are actually icon names.
+ *
+ * `icon={node.kind === 'live' ? 'square-pen' : 'file-text'}` holds three quoted words and only two
+ * of them are icons — the first is what the condition compares against. Taking all three reports a
+ * missing icon called "live", and a check that cries wolf gets switched off. So a quoted word
+ * directly after a comparison operator is a value being tested, not a name being drawn.
+ */
+function iconNamesIn(body) {
+  const names = []
+  for (const match of body.matchAll(/([=!]==?)?\s*'([a-z0-9-]+)'/g)) {
+    if (match[1]) continue
+    names.push(match[2])
+  }
+  return names
+}
+
+/**
  * A list of names offered as a choice — `const ICONS = ['bug', 'flag', …]` — reaches `<Icon>` too,
  * through a variable, so none of the patterns above see it. A picker built from such a list is
  * exactly where an unregistered name hides: it renders as one blank square among eleven good ones.
@@ -80,6 +103,9 @@ for await (const file of files(join(root, 'src'))) {
       if (!known.has(name)) problems.push(`${file.slice(root.length + 1)}: ${name}`)
   for (const [, body] of source.matchAll(ICON_LISTS))
     for (const [, name] of body.matchAll(QUOTED))
+      if (!known.has(name)) problems.push(`${file.slice(root.length + 1)}: ${name}`)
+  for (const [, body] of source.matchAll(ICON_EXPR))
+    for (const name of iconNamesIn(body))
       if (!known.has(name)) problems.push(`${file.slice(root.length + 1)}: ${name}`)
 }
 

@@ -130,9 +130,9 @@ const canSubmit = $derived(
         </p>
       {:else}
         <p class="cost">
-          {t('leave_would_cost', { days: formatDays(sim.workingDays) })}
+          {t('leave_would_cost', { count: sim.workingDays })}
           ·
-          {t('leave_after', { days: formatDays(sim.balanceAfterMinutes / 480) })}
+          {t('leave_after', { count: sim.balanceAfterMinutes / 480 })}
         </p>
       {/if}
     {/if}

@@ -43,9 +43,10 @@ const officesQuery = createQuery(() => ({
 const offices = $derived(officesQuery.data ?? [])
 
 const stats = $derived({
-  offices: offices.length,
   countries: new Set(offices.map((o) => o.country)).size,
   people: offices.reduce((sum, o) => sum + o.headcount, 0),
+  /** Two offices in one zone is one clock to think about; two zones is a scheduling problem. */
+  timezones: new Set(offices.map((o) => o.timezone)).size,
 })
 
 /** Re-renders the clocks once a minute; an office list showing a stale time is worse than none. */
@@ -102,20 +103,32 @@ const kindTone = (kind: string): BadgeTone => (kind === 'remote' ? 'info' : 'gre
 >
   {#snippet actions()}
     {#if canHr('officeManage')}
-      <Button size="sm" href={`/${workspaceSlug}/settings/hr/offices`}>{t('settings_offices')}</Button>
+      <Button size="sm" variant="secondary" icon="settings" href={`/${workspaceSlug}/settings/hr/offices`}>
+        {t('offices_manage')}
+      </Button>
     {/if}
   {/snippet}
 </PageHeader>
 
 <Page>
+  <!--
+    No "Offices" tile. It said the same word and the same number as the section label directly
+    below it, so the page opened with "Offices / Offices / Offices 2 / OFFICES 2" down the left
+    edge. A tile has to add a fact the list does not already state: how many countries the company
+    operates in, how many people those offices hold, and how many clocks you are working across.
+  -->
   <div class="tiles">
-    <StatTile size="md" label={t('offices_total')} value={new Intl.NumberFormat().format(stats.offices)} />
     <StatTile
       size="md"
       label={t('offices_countries')}
       value={new Intl.NumberFormat().format(stats.countries)}
     />
     <StatTile size="md" label={t('office_people')} value={new Intl.NumberFormat().format(stats.people)} />
+    <StatTile
+      size="md"
+      label={t('offices_timezones')}
+      value={new Intl.NumberFormat().format(stats.timezones)}
+    />
   </div>
 
   <SectionLabel label={t('offices_title')} count={offices.length} />

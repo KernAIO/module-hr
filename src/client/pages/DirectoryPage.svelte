@@ -190,9 +190,16 @@ const started = (iso: string | null) =>
 <Page>
   <div class="tiles">
     <StatTile size="md" label={t('widget_headcount_title')} value={new Intl.NumberFormat().format(stats.headcount)} />
-    <StatTile size="md" label={t('offices_title')} value={new Intl.NumberFormat().format(stats.offices)} />
+    <!--
+      Only where the workspace has offices. It rendered unconditionally and read "Offices 0" on a
+      single-site workspace — a tile counting a feature nobody switched on, sitting beside three
+      that mean something. A capability that is off has no surface at all, tiles included.
+    -->
+    {#if showOffices}
+      <StatTile size="md" label={t('offices_title')} value={new Intl.NumberFormat().format(stats.offices)} />
+    {/if}
     <StatTile size="md" label={t('status_on_leave')} value={new Intl.NumberFormat().format(stats.away)} />
-    <StatTile size="md" label={t('available')} value={formatDays(stats.balance)} note={t('days')} />
+    <StatTile size="md" label={t('available')} value={formatDays(stats.balance)} note={t('days', { count: stats.balance })} />
   </div>
 
   <div class="split">
@@ -303,10 +310,13 @@ const started = (iso: string | null) =>
 />
 
 <style>
-/* §3.12: four stat tiles, then a 1fr / 320px split, gap 20. */
+/* §3.12: a row of stat tiles, then a 1fr / 320px split, gap 20. */
 .tiles {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  /* Not `repeat(4, …)`: the offices tile is only there when the capability is on, and a fixed
+     four-column track left a hole in the row where it used to be. */
+  grid-template-columns: repeat(auto-fit, minmax(0, 1fr));
+  grid-auto-flow: column;
   gap: 12px;
   margin-block-end: 20px;
 }

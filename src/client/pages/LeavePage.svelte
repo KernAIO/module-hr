@@ -108,7 +108,7 @@ const canCancel = (status: string) => canHr('leaveRequest') && (status === 'pend
         <StatTile
           label={balance.leaveTypeName}
           value={formatDays(balance.available)}
-          note={`${t('available')} · ${t('days')}`}
+          note={`${t('available')} · ${t('days', { count: balance.available })}`}
         />
       {/each}
     </div>
@@ -126,7 +126,7 @@ const canCancel = (status: string) => canHr('leaveRequest') && (status === 'pend
           <Card>
             <div class="row">
               <span class="dates">{range(request.startsOn, request.endsOn)}</span>
-              <span class="meta">{formatDays(request.workingDays)} {t('days')}</span>
+              <span class="meta">{formatDays(request.workingDays)} {t('days', { count: request.workingDays })}</span>
               <Badge tone={statusTone(request.status)}>{statusLabel(request.status)}</Badge>
               {#if canCancel(request.status)}
                 <Button

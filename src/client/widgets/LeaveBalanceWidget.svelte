@@ -31,7 +31,7 @@ const balances = $derived(balanceQuery.data ?? [])
     {#each balances as b (b.leaveTypeId)}
       <li>
         <span class="name">{b.leaveTypeName}</span>
-        <span class="value">{formatDays(b.available)} <span class="unit">{t('days')}</span></span>
+        <span class="value">{formatDays(b.available)} <span class="unit">{t('days', { count: b.available })}</span></span>
       </li>
     {/each}
   </ul>

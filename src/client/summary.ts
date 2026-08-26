@@ -16,7 +16,9 @@ export function summarise(request: ApprovalRequest): string {
   if (!p) return request.summary
   if (request.subjectType === 'leave' && p.from && p.to)
     return t('approval_summary_leave', {
-      days: String(p.days ?? ''),
+      // A number, not a string: `count` is what selects the plural form, and passing it as text
+      // rendered "1 days" and left the digits Latin on a Persian screen. `t()` formats it.
+      count: Number(p.days ?? 0),
       range: dateRange(String(p.from), String(p.to)),
     })
   if (request.subjectType === 'regularization' && p.date)
