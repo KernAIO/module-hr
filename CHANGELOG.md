@@ -1,5 +1,11 @@
 # @kernhq/module-hr
 
+## 0.12.0
+
+### Minor Changes
+
+- feat(hr): answer the accrual procedures in the mock, with a fixture that tests
+
 ## 0.11.0
 
 ### Minor Changes
