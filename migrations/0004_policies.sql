@@ -1,4 +1,4 @@
-CREATE TABLE "mod_hr"."periods" (
+CREATE TABLE IF NOT EXISTS "mod_hr"."periods" (
 	"id" uuid PRIMARY KEY DEFAULT uuidv7() NOT NULL,
 	"workspace_id" uuid NOT NULL,
 	"kind" text DEFAULT 'payroll' NOT NULL,
@@ -12,7 +12,7 @@ CREATE TABLE "mod_hr"."periods" (
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-CREATE TABLE "mod_hr"."policies" (
+CREATE TABLE IF NOT EXISTS "mod_hr"."policies" (
 	"id" uuid PRIMARY KEY DEFAULT uuidv7() NOT NULL,
 	"workspace_id" uuid NOT NULL,
 	"kind" text NOT NULL,
@@ -28,7 +28,7 @@ CREATE TABLE "mod_hr"."policies" (
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-CREATE TABLE "mod_hr"."policy_assignments" (
+CREATE TABLE IF NOT EXISTS "mod_hr"."policy_assignments" (
 	"id" uuid PRIMARY KEY DEFAULT uuidv7() NOT NULL,
 	"workspace_id" uuid NOT NULL,
 	"policy_id" uuid NOT NULL,
@@ -40,25 +40,31 @@ CREATE TABLE "mod_hr"."policy_assignments" (
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-CREATE INDEX "hr_periods_idx" ON "mod_hr"."periods" USING btree ("workspace_id","kind","starts_on");--> statement-breakpoint
-CREATE INDEX "hr_policies_ws_kind_idx" ON "mod_hr"."policies" USING btree ("workspace_id","kind","effective_from");--> statement-breakpoint
-CREATE INDEX "hr_policy_assign_idx" ON "mod_hr"."policy_assignments" USING btree ("workspace_id","subject_kind","subject_id");--> statement-breakpoint
-CREATE INDEX "hr_policy_assign_policy_idx" ON "mod_hr"."policy_assignments" USING btree ("workspace_id","policy_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "hr_periods_idx" ON "mod_hr"."periods" USING btree ("workspace_id","kind","starts_on");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "hr_policies_ws_kind_idx" ON "mod_hr"."policies" USING btree ("workspace_id","kind","effective_from");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "hr_policy_assign_idx" ON "mod_hr"."policy_assignments" USING btree ("workspace_id","subject_kind","subject_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "hr_policy_assign_policy_idx" ON "mod_hr"."policy_assignments" USING btree ("workspace_id","policy_id");--> statement-breakpoint
 -- Row-level security on the policy and period tables.
 alter table "mod_hr"."policies" enable row level security;--> statement-breakpoint
 alter table "mod_hr"."policies" force row level security;--> statement-breakpoint
+drop policy if exists "policies_ws_isolation" on "mod_hr"."policies";
+--> statement-breakpoint
 create policy "policies_ws_isolation" on "mod_hr"."policies"
   using (workspace_id::text = current_setting('app.workspace_id', true))
   with check (workspace_id::text = current_setting('app.workspace_id', true));--> statement-breakpoint
 
 alter table "mod_hr"."policy_assignments" enable row level security;--> statement-breakpoint
 alter table "mod_hr"."policy_assignments" force row level security;--> statement-breakpoint
+drop policy if exists "policy_assignments_ws_isolation" on "mod_hr"."policy_assignments";
+--> statement-breakpoint
 create policy "policy_assignments_ws_isolation" on "mod_hr"."policy_assignments"
   using (workspace_id::text = current_setting('app.workspace_id', true))
   with check (workspace_id::text = current_setting('app.workspace_id', true));--> statement-breakpoint
 
 alter table "mod_hr"."periods" enable row level security;--> statement-breakpoint
 alter table "mod_hr"."periods" force row level security;--> statement-breakpoint
+drop policy if exists "periods_ws_isolation" on "mod_hr"."periods";
+--> statement-breakpoint
 create policy "periods_ws_isolation" on "mod_hr"."periods"
   using (workspace_id::text = current_setting('app.workspace_id', true))
   with check (workspace_id::text = current_setting('app.workspace_id', true));--> statement-breakpoint
@@ -68,6 +74,8 @@ create policy "periods_ws_isolation" on "mod_hr"."periods"
 -- Without this, two overlapping assignments at the same priority resolve arbitrarily: the ladder
 -- has a tie it cannot break, and which policy applies depends on row order. That is the kind of bug
 -- that shows up as two people on the same terms accruing differently.
+alter table "mod_hr"."policy_assignments" drop constraint if exists "hr_policy_assign_no_overlap";
+--> statement-breakpoint
 alter table "mod_hr"."policy_assignments"
   add constraint "hr_policy_assign_no_overlap"
   exclude using gist (
@@ -79,6 +87,8 @@ alter table "mod_hr"."policy_assignments"
 
 -- Two periods of a kind may not cover the same day for the same entity: "is this date locked" has
 -- to have exactly one answer.
+alter table "mod_hr"."periods" drop constraint if exists "hr_periods_no_overlap";
+--> statement-breakpoint
 alter table "mod_hr"."periods"
   add constraint "hr_periods_no_overlap"
   exclude using gist (

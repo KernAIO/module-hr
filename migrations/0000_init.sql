@@ -13,7 +13,7 @@ CREATE EXTENSION IF NOT EXISTS btree_gist;
 --> statement-breakpoint
 CREATE SCHEMA IF NOT EXISTS "mod_hr";
 --> statement-breakpoint
-CREATE TABLE "mod_hr"."calendar_days" (
+CREATE TABLE IF NOT EXISTS "mod_hr"."calendar_days" (
 	"id" uuid PRIMARY KEY DEFAULT uuidv7() NOT NULL,
 	"workspace_id" uuid NOT NULL,
 	"calendar_id" uuid NOT NULL,
@@ -27,7 +27,7 @@ CREATE TABLE "mod_hr"."calendar_days" (
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-CREATE TABLE "mod_hr"."calendars" (
+CREATE TABLE IF NOT EXISTS "mod_hr"."calendars" (
 	"id" uuid PRIMARY KEY DEFAULT uuidv7() NOT NULL,
 	"workspace_id" uuid NOT NULL,
 	"name" text NOT NULL,
@@ -43,7 +43,7 @@ CREATE TABLE "mod_hr"."calendars" (
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-CREATE TABLE "mod_hr"."cost_centers" (
+CREATE TABLE IF NOT EXISTS "mod_hr"."cost_centers" (
 	"id" uuid PRIMARY KEY DEFAULT uuidv7() NOT NULL,
 	"workspace_id" uuid NOT NULL,
 	"code" text NOT NULL,
@@ -55,7 +55,7 @@ CREATE TABLE "mod_hr"."cost_centers" (
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-CREATE TABLE "mod_hr"."custom_field_defs" (
+CREATE TABLE IF NOT EXISTS "mod_hr"."custom_field_defs" (
 	"id" uuid PRIMARY KEY DEFAULT uuidv7() NOT NULL,
 	"workspace_id" uuid NOT NULL,
 	"key" text NOT NULL,
@@ -70,7 +70,7 @@ CREATE TABLE "mod_hr"."custom_field_defs" (
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-CREATE TABLE "mod_hr"."employments" (
+CREATE TABLE IF NOT EXISTS "mod_hr"."employments" (
 	"id" uuid PRIMARY KEY DEFAULT uuidv7() NOT NULL,
 	"workspace_id" uuid NOT NULL,
 	"person_id" uuid NOT NULL,
@@ -88,7 +88,7 @@ CREATE TABLE "mod_hr"."employments" (
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-CREATE TABLE "mod_hr"."legal_entities" (
+CREATE TABLE IF NOT EXISTS "mod_hr"."legal_entities" (
 	"id" uuid PRIMARY KEY DEFAULT uuidv7() NOT NULL,
 	"workspace_id" uuid NOT NULL,
 	"name" text NOT NULL,
@@ -101,7 +101,7 @@ CREATE TABLE "mod_hr"."legal_entities" (
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-CREATE TABLE "mod_hr"."office_assignments" (
+CREATE TABLE IF NOT EXISTS "mod_hr"."office_assignments" (
 	"id" uuid PRIMARY KEY DEFAULT uuidv7() NOT NULL,
 	"workspace_id" uuid NOT NULL,
 	"person_id" uuid NOT NULL,
@@ -113,7 +113,7 @@ CREATE TABLE "mod_hr"."office_assignments" (
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-CREATE TABLE "mod_hr"."offices" (
+CREATE TABLE IF NOT EXISTS "mod_hr"."offices" (
 	"id" uuid PRIMARY KEY DEFAULT uuidv7() NOT NULL,
 	"workspace_id" uuid NOT NULL,
 	"name" text NOT NULL,
@@ -134,7 +134,7 @@ CREATE TABLE "mod_hr"."offices" (
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-CREATE TABLE "mod_hr"."org_units" (
+CREATE TABLE IF NOT EXISTS "mod_hr"."org_units" (
 	"id" uuid PRIMARY KEY DEFAULT uuidv7() NOT NULL,
 	"workspace_id" uuid NOT NULL,
 	"parent_id" uuid,
@@ -147,7 +147,7 @@ CREATE TABLE "mod_hr"."org_units" (
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-CREATE TABLE "mod_hr"."people" (
+CREATE TABLE IF NOT EXISTS "mod_hr"."people" (
 	"id" uuid PRIMARY KEY DEFAULT uuidv7() NOT NULL,
 	"workspace_id" uuid NOT NULL,
 	"user_id" uuid,
@@ -166,7 +166,7 @@ CREATE TABLE "mod_hr"."people" (
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-CREATE TABLE "mod_hr"."people_sensitive" (
+CREATE TABLE IF NOT EXISTS "mod_hr"."people_sensitive" (
 	"person_id" uuid PRIMARY KEY NOT NULL,
 	"workspace_id" uuid NOT NULL,
 	"national_id_enc" text,
@@ -176,7 +176,7 @@ CREATE TABLE "mod_hr"."people_sensitive" (
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-CREATE TABLE "mod_hr"."person_documents" (
+CREATE TABLE IF NOT EXISTS "mod_hr"."person_documents" (
 	"id" uuid PRIMARY KEY DEFAULT uuidv7() NOT NULL,
 	"workspace_id" uuid NOT NULL,
 	"person_id" uuid NOT NULL,
@@ -189,7 +189,7 @@ CREATE TABLE "mod_hr"."person_documents" (
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-CREATE TABLE "mod_hr"."person_history" (
+CREATE TABLE IF NOT EXISTS "mod_hr"."person_history" (
 	"id" uuid PRIMARY KEY DEFAULT uuidv7() NOT NULL,
 	"workspace_id" uuid NOT NULL,
 	"person_id" uuid NOT NULL,
@@ -201,7 +201,7 @@ CREATE TABLE "mod_hr"."person_history" (
 	"source" text DEFAULT 'app' NOT NULL
 );
 --> statement-breakpoint
-CREATE TABLE "mod_hr"."positions" (
+CREATE TABLE IF NOT EXISTS "mod_hr"."positions" (
 	"id" uuid PRIMARY KEY DEFAULT uuidv7() NOT NULL,
 	"workspace_id" uuid NOT NULL,
 	"title" text NOT NULL,
@@ -212,25 +212,25 @@ CREATE TABLE "mod_hr"."positions" (
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-CREATE INDEX "hr_calendar_days_idx" ON "mod_hr"."calendar_days" USING btree ("workspace_id","calendar_id","date");--> statement-breakpoint
-CREATE UNIQUE INDEX "hr_calendar_days_uq" ON "mod_hr"."calendar_days" USING btree ("calendar_id","date","kind");--> statement-breakpoint
-CREATE INDEX "hr_calendars_ws_idx" ON "mod_hr"."calendars" USING btree ("workspace_id","archived_at");--> statement-breakpoint
-CREATE UNIQUE INDEX "hr_cost_centers_ws_code_uq" ON "mod_hr"."cost_centers" USING btree ("workspace_id","code");--> statement-breakpoint
-CREATE UNIQUE INDEX "hr_fields_ws_key_uq" ON "mod_hr"."custom_field_defs" USING btree ("workspace_id","key");--> statement-breakpoint
-CREATE INDEX "hr_employments_person_idx" ON "mod_hr"."employments" USING btree ("workspace_id","person_id","effective_from");--> statement-breakpoint
-CREATE INDEX "hr_employments_ws_manager_idx" ON "mod_hr"."employments" USING btree ("workspace_id","manager_person_id");--> statement-breakpoint
-CREATE INDEX "hr_employments_ws_unit_idx" ON "mod_hr"."employments" USING btree ("workspace_id","org_unit_id");--> statement-breakpoint
-CREATE INDEX "hr_entities_ws_idx" ON "mod_hr"."legal_entities" USING btree ("workspace_id","archived_at");--> statement-breakpoint
-CREATE INDEX "hr_office_assign_person_idx" ON "mod_hr"."office_assignments" USING btree ("workspace_id","person_id","effective_from");--> statement-breakpoint
-CREATE INDEX "hr_office_assign_office_idx" ON "mod_hr"."office_assignments" USING btree ("workspace_id","office_id","effective_from");--> statement-breakpoint
-CREATE INDEX "hr_offices_ws_idx" ON "mod_hr"."offices" USING btree ("workspace_id","archived_at");--> statement-breakpoint
-CREATE INDEX "hr_offices_ws_country_idx" ON "mod_hr"."offices" USING btree ("workspace_id","country");--> statement-breakpoint
-CREATE INDEX "hr_org_units_ws_idx" ON "mod_hr"."org_units" USING btree ("workspace_id","archived_at");--> statement-breakpoint
-CREATE INDEX "hr_people_ws_status_idx" ON "mod_hr"."people" USING btree ("workspace_id","status","display_name");--> statement-breakpoint
-CREATE UNIQUE INDEX "hr_people_ws_user_uq" ON "mod_hr"."people" USING btree ("workspace_id","user_id");--> statement-breakpoint
-CREATE UNIQUE INDEX "hr_people_ws_empno_uq" ON "mod_hr"."people" USING btree ("workspace_id","employee_no");--> statement-breakpoint
-CREATE INDEX "hr_people_sensitive_ws_idx" ON "mod_hr"."people_sensitive" USING btree ("workspace_id");--> statement-breakpoint
-CREATE INDEX "hr_person_docs_idx" ON "mod_hr"."person_documents" USING btree ("workspace_id","person_id","created_at");--> statement-breakpoint
-CREATE INDEX "hr_person_docs_expiry_idx" ON "mod_hr"."person_documents" USING btree ("workspace_id","expires_on");--> statement-breakpoint
-CREATE INDEX "hr_person_history_idx" ON "mod_hr"."person_history" USING btree ("workspace_id","person_id","created_at");--> statement-breakpoint
-CREATE INDEX "hr_positions_ws_idx" ON "mod_hr"."positions" USING btree ("workspace_id","archived_at");
+CREATE INDEX IF NOT EXISTS "hr_calendar_days_idx" ON "mod_hr"."calendar_days" USING btree ("workspace_id","calendar_id","date");--> statement-breakpoint
+CREATE UNIQUE INDEX IF NOT EXISTS "hr_calendar_days_uq" ON "mod_hr"."calendar_days" USING btree ("calendar_id","date","kind");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "hr_calendars_ws_idx" ON "mod_hr"."calendars" USING btree ("workspace_id","archived_at");--> statement-breakpoint
+CREATE UNIQUE INDEX IF NOT EXISTS "hr_cost_centers_ws_code_uq" ON "mod_hr"."cost_centers" USING btree ("workspace_id","code");--> statement-breakpoint
+CREATE UNIQUE INDEX IF NOT EXISTS "hr_fields_ws_key_uq" ON "mod_hr"."custom_field_defs" USING btree ("workspace_id","key");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "hr_employments_person_idx" ON "mod_hr"."employments" USING btree ("workspace_id","person_id","effective_from");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "hr_employments_ws_manager_idx" ON "mod_hr"."employments" USING btree ("workspace_id","manager_person_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "hr_employments_ws_unit_idx" ON "mod_hr"."employments" USING btree ("workspace_id","org_unit_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "hr_entities_ws_idx" ON "mod_hr"."legal_entities" USING btree ("workspace_id","archived_at");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "hr_office_assign_person_idx" ON "mod_hr"."office_assignments" USING btree ("workspace_id","person_id","effective_from");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "hr_office_assign_office_idx" ON "mod_hr"."office_assignments" USING btree ("workspace_id","office_id","effective_from");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "hr_offices_ws_idx" ON "mod_hr"."offices" USING btree ("workspace_id","archived_at");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "hr_offices_ws_country_idx" ON "mod_hr"."offices" USING btree ("workspace_id","country");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "hr_org_units_ws_idx" ON "mod_hr"."org_units" USING btree ("workspace_id","archived_at");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "hr_people_ws_status_idx" ON "mod_hr"."people" USING btree ("workspace_id","status","display_name");--> statement-breakpoint
+CREATE UNIQUE INDEX IF NOT EXISTS "hr_people_ws_user_uq" ON "mod_hr"."people" USING btree ("workspace_id","user_id");--> statement-breakpoint
+CREATE UNIQUE INDEX IF NOT EXISTS "hr_people_ws_empno_uq" ON "mod_hr"."people" USING btree ("workspace_id","employee_no");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "hr_people_sensitive_ws_idx" ON "mod_hr"."people_sensitive" USING btree ("workspace_id");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "hr_person_docs_idx" ON "mod_hr"."person_documents" USING btree ("workspace_id","person_id","created_at");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "hr_person_docs_expiry_idx" ON "mod_hr"."person_documents" USING btree ("workspace_id","expires_on");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "hr_person_history_idx" ON "mod_hr"."person_history" USING btree ("workspace_id","person_id","created_at");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "hr_positions_ws_idx" ON "mod_hr"."positions" USING btree ("workspace_id","archived_at");

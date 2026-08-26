@@ -1,4 +1,4 @@
-CREATE TABLE "mod_hr"."attendance_days" (
+CREATE TABLE IF NOT EXISTS "mod_hr"."attendance_days" (
 	"id" uuid PRIMARY KEY DEFAULT uuidv7() NOT NULL,
 	"workspace_id" uuid NOT NULL,
 	"person_id" uuid NOT NULL,
@@ -19,7 +19,7 @@ CREATE TABLE "mod_hr"."attendance_days" (
 	"computed_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-CREATE TABLE "mod_hr"."punches" (
+CREATE TABLE IF NOT EXISTS "mod_hr"."punches" (
 	"id" uuid DEFAULT uuidv7() NOT NULL,
 	"workspace_id" uuid NOT NULL,
 	"person_id" uuid NOT NULL,
@@ -48,9 +48,11 @@ CREATE TABLE "mod_hr"."punches" (
 -- A partitioned table's primary key must contain the partition column, which is why it is
 -- (id, business_date) rather than (id). Same for the idempotency index: without business_date in it
 -- Postgres refuses to create it at all.
-ALTER TABLE "mod_hr"."punches" ADD PRIMARY KEY ("id", "business_date");
+alter table "mod_hr"."punches" drop constraint if exists "punches_pkey";
 --> statement-breakpoint
-CREATE UNIQUE INDEX "hr_punches_idem_uq"
+alter table "mod_hr"."punches" add constraint "punches_pkey" primary key ("id", "business_date");
+--> statement-breakpoint
+CREATE UNIQUE INDEX IF NOT EXISTS "hr_punches_idem_uq"
   ON "mod_hr"."punches" ("workspace_id", "idempotency_key", "business_date")
   WHERE "idempotency_key" IS NOT NULL;
 --> statement-breakpoint
@@ -64,11 +66,13 @@ ALTER TABLE "mod_hr"."punches_default" ENABLE ROW LEVEL SECURITY;
 --> statement-breakpoint
 ALTER TABLE "mod_hr"."punches_default" FORCE ROW LEVEL SECURITY;
 --> statement-breakpoint
+drop policy if exists "punches_ws_isolation" on "mod_hr"."punches_default";
+--> statement-breakpoint
 CREATE POLICY "punches_ws_isolation" ON "mod_hr"."punches_default"
   USING (workspace_id::text = current_setting('app.workspace_id', true))
   WITH CHECK (workspace_id::text = current_setting('app.workspace_id', true));
 --> statement-breakpoint
--- Creating a partition is not just `CREATE TABLE ... PARTITION OF`.
+-- Creating a partition is not just `CREATE TABLE IF NOT EXISTS ... PARTITION OF`.
 --
 -- A policy on a partitioned parent applies when you query **through the parent**. Query a partition
 -- directly and its own row-level security setting applies — and a fresh partition has none. Any
@@ -120,7 +124,7 @@ BEGIN
   END LOOP;
 END $$;
 --> statement-breakpoint
-CREATE TABLE "mod_hr"."regularizations" (
+CREATE TABLE IF NOT EXISTS "mod_hr"."regularizations" (
 	"id" uuid PRIMARY KEY DEFAULT uuidv7() NOT NULL,
 	"workspace_id" uuid NOT NULL,
 	"person_id" uuid NOT NULL,
@@ -134,7 +138,7 @@ CREATE TABLE "mod_hr"."regularizations" (
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-CREATE TABLE "mod_hr"."schedule_assignments" (
+CREATE TABLE IF NOT EXISTS "mod_hr"."schedule_assignments" (
 	"id" uuid PRIMARY KEY DEFAULT uuidv7() NOT NULL,
 	"workspace_id" uuid NOT NULL,
 	"person_id" uuid NOT NULL,
@@ -144,7 +148,7 @@ CREATE TABLE "mod_hr"."schedule_assignments" (
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-CREATE TABLE "mod_hr"."schedules" (
+CREATE TABLE IF NOT EXISTS "mod_hr"."schedules" (
 	"id" uuid PRIMARY KEY DEFAULT uuidv7() NOT NULL,
 	"workspace_id" uuid NOT NULL,
 	"name" text NOT NULL,
@@ -162,12 +166,12 @@ CREATE TABLE "mod_hr"."schedules" (
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
-CREATE UNIQUE INDEX "hr_attendance_days_uq" ON "mod_hr"."attendance_days" USING btree ("workspace_id","person_id","business_date");--> statement-breakpoint
-CREATE INDEX "hr_attendance_days_date_idx" ON "mod_hr"."attendance_days" USING btree ("workspace_id","business_date","status");--> statement-breakpoint
-CREATE INDEX "hr_punches_person_idx" ON "mod_hr"."punches" USING btree ("workspace_id","person_id","business_date");--> statement-breakpoint
-CREATE INDEX "hr_regularizations_idx" ON "mod_hr"."regularizations" USING btree ("workspace_id","person_id","business_date");--> statement-breakpoint
-CREATE INDEX "hr_schedule_assign_idx" ON "mod_hr"."schedule_assignments" USING btree ("workspace_id","person_id","effective_from");--> statement-breakpoint
-CREATE INDEX "hr_schedules_ws_idx" ON "mod_hr"."schedules" USING btree ("workspace_id","archived_at");--> statement-breakpoint
+CREATE UNIQUE INDEX IF NOT EXISTS "hr_attendance_days_uq" ON "mod_hr"."attendance_days" USING btree ("workspace_id","person_id","business_date");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "hr_attendance_days_date_idx" ON "mod_hr"."attendance_days" USING btree ("workspace_id","business_date","status");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "hr_punches_person_idx" ON "mod_hr"."punches" USING btree ("workspace_id","person_id","business_date");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "hr_regularizations_idx" ON "mod_hr"."regularizations" USING btree ("workspace_id","person_id","business_date");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "hr_schedule_assign_idx" ON "mod_hr"."schedule_assignments" USING btree ("workspace_id","person_id","effective_from");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "hr_schedules_ws_idx" ON "mod_hr"."schedules" USING btree ("workspace_id","archived_at");--> statement-breakpoint
 -- ---------------------------------------------------------------------------------------------
 -- Row-level security on the attendance tables.
 --
@@ -177,30 +181,40 @@ CREATE INDEX "hr_schedules_ws_idx" ON "mod_hr"."schedules" USING btree ("workspa
 -- true until a Postgres upgrade says otherwise.
 alter table "mod_hr"."schedules" enable row level security;--> statement-breakpoint
 alter table "mod_hr"."schedules" force row level security;--> statement-breakpoint
+drop policy if exists "schedules_ws_isolation" on "mod_hr"."schedules";
+--> statement-breakpoint
 create policy "schedules_ws_isolation" on "mod_hr"."schedules"
   using (workspace_id::text = current_setting('app.workspace_id', true))
   with check (workspace_id::text = current_setting('app.workspace_id', true));--> statement-breakpoint
 
 alter table "mod_hr"."schedule_assignments" enable row level security;--> statement-breakpoint
 alter table "mod_hr"."schedule_assignments" force row level security;--> statement-breakpoint
+drop policy if exists "schedule_assignments_ws_isolation" on "mod_hr"."schedule_assignments";
+--> statement-breakpoint
 create policy "schedule_assignments_ws_isolation" on "mod_hr"."schedule_assignments"
   using (workspace_id::text = current_setting('app.workspace_id', true))
   with check (workspace_id::text = current_setting('app.workspace_id', true));--> statement-breakpoint
 
 alter table "mod_hr"."punches" enable row level security;--> statement-breakpoint
 alter table "mod_hr"."punches" force row level security;--> statement-breakpoint
+drop policy if exists "punches_ws_isolation" on "mod_hr"."punches";
+--> statement-breakpoint
 create policy "punches_ws_isolation" on "mod_hr"."punches"
   using (workspace_id::text = current_setting('app.workspace_id', true))
   with check (workspace_id::text = current_setting('app.workspace_id', true));--> statement-breakpoint
 
 alter table "mod_hr"."attendance_days" enable row level security;--> statement-breakpoint
 alter table "mod_hr"."attendance_days" force row level security;--> statement-breakpoint
+drop policy if exists "attendance_days_ws_isolation" on "mod_hr"."attendance_days";
+--> statement-breakpoint
 create policy "attendance_days_ws_isolation" on "mod_hr"."attendance_days"
   using (workspace_id::text = current_setting('app.workspace_id', true))
   with check (workspace_id::text = current_setting('app.workspace_id', true));--> statement-breakpoint
 
 alter table "mod_hr"."regularizations" enable row level security;--> statement-breakpoint
 alter table "mod_hr"."regularizations" force row level security;--> statement-breakpoint
+drop policy if exists "regularizations_ws_isolation" on "mod_hr"."regularizations";
+--> statement-breakpoint
 create policy "regularizations_ws_isolation" on "mod_hr"."regularizations"
   using (workspace_id::text = current_setting('app.workspace_id', true))
   with check (workspace_id::text = current_setting('app.workspace_id', true));
