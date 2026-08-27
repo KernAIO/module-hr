@@ -22,7 +22,7 @@ import { hrKeys, isoDate } from '../query.js'
 import PersonDocumentsSection from './PersonDocumentsSection.svelte'
 import PersonJobSection from './PersonJobSection.svelte'
 import PersonSensitiveSection from './PersonSensitiveSection.svelte'
-import { personnelVisibility } from './redaction.js'
+import { personnelWithheld } from './redaction.js'
 import { explainRefusal } from './refusal.js'
 
 /**
@@ -195,11 +195,11 @@ const left = $derived(person?.status === 'terminated')
  * Whether the server withheld this person's personnel fields from this reader.
  *
  * The four it nulls arrive as nulls, so an empty phone row on this panel says "no phone number" —
- * a different and wrong fact. `personnelVisibility` says which of the two it is, or says it cannot
- * tell; only a certain `withheld` is marked, and the panel then explains itself once below the
- * list rather than once per field.
+ * a different and wrong fact. The record carries the answer (`personnelHidden`, set where the
+ * nulling happens), so this is a read rather than an inference; the panel then explains itself once
+ * below the list rather than once per field.
  */
-const withheld = $derived(person ? personnelVisibility(person) === 'withheld' : false)
+const withheld = $derived(person ? personnelWithheld(person) : false)
 /**
  * And only where something on *this* panel is actually blank because of it. The two are the same
  * thing while the client and the server agree about the reader's keys; tying the sentence to what

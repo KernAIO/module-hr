@@ -22,19 +22,9 @@ export function canHr(permission: HrPermission): boolean {
   return session.can(HR_PERMISSIONS[permission])
 }
 
-/**
- * Whether the viewer reads the personnel record behind a directory card, for anybody but themselves.
- *
- * Not "can they open somebody else's page" — everybody can, and should. `hr.person.view` is a
- * `member` default and the directory is meant to be read. What the three widening keys decide is
- * how much of each person comes back: personal email, phone, hire date and termination date are the
- * personnel record, and the server nulls all four for anybody outside the reader's scope.
- *
- * The three do not imply one another — a country HR manager must not silently become a global one —
- * so a screen asks the union once, here. It is only a hint: which *people* fall inside a team or an
- * office is resolved on the server from the org chart, so a screen may not conclude from `true`
- * that a particular person's record is readable. Render what came back; use this to decide whether
- * a "personal details" section is worth offering at all.
- */
-export const canSeeFullRecords = (): boolean =>
-  canHr('personViewTeam') || canHr('personViewOffice') || canHr('personViewAll')
+// No union helper over the three person-visibility keys. There has been one here twice —
+// `canSeeOthers`, then `canSeeFullRecords` — and both were dead the whole time, because the question
+// a screen actually has is "was *this* record withheld", and the answer to that is on the record:
+// `Person.personnelHidden`, set by the server at the one place that does the nulling. A client-side
+// union can only say "the reader holds one of three keys somewhere", which is never enough to decide
+// what to draw over one person's phone number. See `components/redaction.ts`.

@@ -25,7 +25,7 @@ import { getHrApi } from '../api-instance.js'
 import DecisionDialog from '../components/DecisionDialog.svelte'
 import PersonFormDialog from '../components/PersonFormDialog.svelte'
 import PersonPanel from '../components/PersonPanel.svelte'
-import { personnelVisibility } from '../components/redaction.js'
+import { personnelWithheld } from '../components/redaction.js'
 import { t } from '../i18n.js'
 import type { ApprovalRequest } from '../index.js'
 import { canHr, HR_CAPABILITIES } from '../permissions.js'
@@ -434,12 +434,15 @@ const started = (iso: string | null) =>
  * and it arrives here as a null like any other — so the em dash this column drew for it said
  * "never started", about everybody in the company, to every colleague without a widening key.
  *
- * `personnelVisibility` answers `unknown` for a reader whose scope only the server can resolve, and
- * an unknown row keeps the dash: a dash over an empty field is imprecise, and "Hidden" over one is
- * a lie. Both are marked once, under the table, rather than per row.
+ * The record says which it is — `personnelHidden`, set at the one place that does the nulling — so
+ * a row is marked only when the server actually withheld it, and a genuinely empty hire date keeps
+ * its dash. Marked once, under the table, rather than per row.
+ *
+ * The `!person.hiredOn` half stays deliberately: the mark only ever goes over a value that is
+ * absent, so a stale or unrecognised payload can never paint "Hidden" across data on screen.
  */
-const startWithheld = (person: { userId: string | null; hiredOn: string | null }) =>
-  !person.hiredOn && personnelVisibility(person) === 'withheld'
+const startWithheld = (person: { hiredOn: string | null; personnelHidden?: boolean }) =>
+  !person.hiredOn && personnelWithheld(person)
 
 /** Whether anything on the page is actually marked — the sentence must not outlive the marks. */
 const anyWithheld = $derived(people.some(startWithheld))
