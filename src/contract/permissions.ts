@@ -285,9 +285,39 @@ export const hrPermissions = definePermissions([
   // Why a key of its own at all, when the two above would do: a reports surface is the one place a
   // whole population's figures are put in front of somebody in a form that goes into a payroll or a
   // performance conversation, and a workspace has to be able to grant a manager their team's day
-  // sheets without granting them that. There is deliberately **no** `hr.report.export`: nothing in
-  // this module writes a file, and a key gating a button nobody built is the thing the removed
-  // `hr.overtime.*` block below is a note about.
+  // sheets without granting them that. There is still no `hr.report.export` — the reports write no
+  // file — and the one thing in this module that does have its own key below.
+
+  // ---------------------------------------------------------------- payroll export
+  {
+    key: 'hr.payroll.export',
+    label: 'Export a payroll file',
+    description:
+      "Writes every employee's period, employment basis and hours out of Kern as CSV, for one " +
+      'legal entity. The file leaves the building. Grant to whoever files payroll, not to a role.',
+    scope: 'workspace',
+    // Nobody by default, like `hr.person.view_sensitive` and `hr.privacy.manage`. An owner passes
+    // every check regardless; every other holder had to be given it deliberately.
+    defaultRoles: [],
+    dangerous: true,
+  },
+  // This is the key the note above says did not exist yet, and it exists now because something
+  // finally writes a file: `payroll.export.v1` and `payroll.export.preview` both ship gated on it in
+  // this same change, which is the rule — a capability, a permission key and an entitlement key are
+  // all lies until something enforces them.
+  //
+  // It is not `hr.report.export`, and the difference is not cosmetic. A report is a screen somebody
+  // reads inside Kern; this is a file that leaves it, addressed to an organisation that will pay
+  // people from it. The two audiences are different and so is the blast radius, so a workspace has to
+  // be able to grant every report without granting this.
+  //
+  // Like the reports, it is a **second** check rather than a replacement: both procedures also ask
+  // for `hr.attendance.view_team` (the hours file) and `hr.leave.view_team` (the leave file), because
+  // an export must not answer what the row-level procedure would refuse.
+  //
+  // It reads no sensitive field, so it writes no `sensitive_access_log` row. A later version that
+  // adds `iban` becomes a bulk sensitive read and owes one row per person with `via: 'export'` — the
+  // enum member already exists — and its own key on top of this one.
 
   // ---------------------------------------------------------------- policies and periods
   {
@@ -395,6 +425,7 @@ export const HR_PERMISSIONS = {
   attendanceViewTeam: 'hr.attendance.view_team',
   attendanceManage: 'hr.attendance.manage',
   reportView: 'hr.report.view',
+  payrollExport: 'hr.payroll.export',
   policyView: 'hr.policy.view',
   policyManage: 'hr.policy.manage',
   periodManage: 'hr.period.manage',

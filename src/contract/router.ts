@@ -18,6 +18,7 @@ import {
   ScheduleAssignment,
   ScheduleWeek,
 } from './attendance.js'
+import { PayrollExport, PayrollExportPreview } from './exports.js'
 import {
   DayPart,
   LeaveBalance,
@@ -1380,6 +1381,78 @@ export const hrContract = {
         }),
       )
       .output(LeaveBalanceReport),
+  },
+
+  // ---------------------------------------------------------------- payroll export
+  /**
+   * The monthly handover to whoever runs payroll, per legal entity, frozen at v1.
+   *
+   * `exports.ts` carries the reasoning; three things about the *shape of the surface* belong here:
+   *
+   * **`legalEntityId` is required, and `periodId` is the range.** `reportInput` makes its slice
+   * optional with a `workspace` default and takes free `from`/`to` dates; neither is available here.
+   * A workspace is not an employer, and a half-month export is a question about a boundary this
+   * module already has an answer for — letting a caller draw their own reintroduces the mixed-finality
+   * problem `ReportFinality` exists to name.
+   *
+   * **`v1` is a procedure, not a parameter.** A later column set ships as `payroll.export.v2` beside
+   * this one, with this one unchanged, and both live through at least one deprecation window. A
+   * `?version=` on one mutable procedure would make the frozen path a branch inside a function three
+   * people will edit, and freezing by intention has never worked.
+   *
+   * **Both cost three keys.** `hr.payroll.export`, which ships granted to nobody, plus
+   * `hr.attendance.view_team` for the hours file and `hr.leave.view_team` for the leave file — the
+   * same second-check rule the reports follow, because an export must not answer what the row-level
+   * procedure would refuse.
+   */
+  payroll: {
+    export: {
+      /**
+       * One entity, one period, two CSVs and a manifest.
+       *
+       * Refuses an open period unless `draft` is set, refuses an entity with nobody in it, and
+       * refuses a person with no employment row covering their days here — because a row of zeros is
+       * something a payroll clerk will pay from, and an error is not.
+       */
+      v1: baseContract
+        .route({ method: 'GET', path: '/payroll/export/v1', tags: t })
+        .input(
+          ws.extend({
+            /** Required. There is no workspace-wide export: a workspace is not an employer. */
+            legalEntityId: z.uuid(),
+            /** The range is the period's, never the caller's. */
+            periodId: z.uuid(),
+            /**
+             * Export an open period anyway, and stamp the file as a draft.
+             *
+             * Not a permission — a statement the caller made, which the file then repeats in its
+             * manifest, its filename and its `open_days`. Defaults to false: `reconcile-days` rebuilds
+             * every day a period does not close, so the same export at 18:00 and at 09:00 the next
+             * morning can differ with nobody having touched anything.
+             */
+            draft: z.boolean().default(false),
+          }),
+        )
+        .output(PayrollExport),
+
+      /**
+       * The same rows as JSON, with no file written and no refusal thrown.
+       *
+       * So the screen shows the totals and the reasons the export would be refused before anybody
+       * downloads anything. Deliberately not versioned: a preview is this module talking to its own
+       * screen, and nothing outside Kern parses it.
+       */
+      preview: baseContract
+        .route({ method: 'GET', path: '/payroll/export/preview', tags: t })
+        .input(
+          ws.extend({
+            legalEntityId: z.uuid(),
+            periodId: z.uuid(),
+            draft: z.boolean().default(false),
+          }),
+        )
+        .output(PayrollExportPreview),
+    },
   },
 
   // ---------------------------------------------------------------- privacy

@@ -130,6 +130,21 @@ export const hrCapabilities = defineCapabilities([
     defaultEnabled: false,
     level: 2,
   },
+  {
+    id: 'payroll_export',
+    label: 'Payroll export',
+    description: 'Hand a closed period to a payroll provider as CSV, per legal entity',
+    // Everything it reads: the day sheet, the periods that say the numbers have stopped moving, and
+    // the employment facts under `core`.
+    dependsOn: ['core', 'periods', 'attendance'],
+    // Off by default, and its own switch rather than riding on the two above — which is the whole
+    // argument for it existing. A company can perfectly well clock people in and close its months
+    // and still not want every employee's pay basis leaving the building as a file. The permission
+    // decides *who* may export; this decides whether the workspace does that at all, and the two
+    // answer different questions.
+    defaultEnabled: false,
+    level: 3,
+  },
 ])
 
 export type HrCapabilityId = (typeof hrCapabilities)[number]['id']
@@ -189,6 +204,7 @@ export const hrCapabilityProcedures: Record<string, readonly string[]> = {
     'calendars.workingDays',
   ],
   documents: ['documents.list', 'documents.attach', 'documents.remove'],
+  payroll_export: ['payroll.export.v1', 'payroll.export.preview'],
   leave: [
     'leave.types.list',
     'leave.types.create',

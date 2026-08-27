@@ -87,6 +87,13 @@ import { ApprovalService, type SubjectAppliers } from './services/approvals.js'
 import { AttendanceService } from './services/attendance.js'
 import { accessLogSort, HrAuditService } from './services/audit.js'
 import { inForceOn, todayIso } from './services/db.js'
+import {
+  assembleExport,
+  exportManifest,
+  type PayrollExportAssembly,
+  type PayrollExportData,
+  PayrollExportService,
+} from './services/exports.js'
 import { LedgerService, MINUTES_PER_DAY, yearOf } from './services/ledger.js'
 import { PeopleService } from './services/people.js'
 import { hashConfig, PolicyService } from './services/policies.js'
@@ -637,6 +644,7 @@ export function implement_(kernel: Kernel) {
   const approvals = new ApprovalService(kernel, subjects.appliersFor(null))
   const privacy = new PrivacyService()
   const reports = new ReportsService(resolve)
+  const payroll = new PayrollExportService(reports)
   const audit = new HrAuditService(kernel, access)
   const db = kernel.database
   const settingsOf = (workspaceId: string) => kernel.settings.module(workspaceId, MODULE_ID, HrSettings)
@@ -4324,6 +4332,97 @@ export function implement_(kernel: Kernel) {
         ),
     },
 
+    // ================================================================= payroll export
+    /**
+     * The monthly handover to whoever runs payroll, for one legal entity, frozen at v1.
+     *
+     * **Three keys, and the middle one is new.** `hr.payroll.export` ships in this change because
+     * this is the change that makes a writer exist — it is granted to nobody by default, like
+     * `hr.person.view_sensitive` and `hr.privacy.manage`, so on a fresh workspace only an owner can
+     * reach it. On top of it, the same second-check rule the reports follow:
+     * `hr.attendance.view_team` for the hours file and `hr.leave.view_team` for the leave file,
+     * because an export must not answer what the row-level procedure would refuse.
+     *
+     * **One capability gate, and it carries two more inside it.** `payroll_export` declares
+     * `dependsOn: ['core', 'periods', 'attendance']`, and `kernel.capabilities` prunes a capability
+     * whose dependencies are off — so a workspace with attendance off has no day sheet to hand over
+     * and this answers 404, and a workspace with periods off would have every day open, the refusal
+     * below would fire on every call, and a switch that only ever produces an error is worse than no
+     * switch. Gating on the three separately would say the same thing three times and let them drift;
+     * the dependency list is where that belongs.
+     *
+     * That pruning is measured rather than assumed, because the whole gate rests on it: against a real
+     * kernel, `payroll.export.v1` answers `NOT_FOUND` with `attendance` off, with `periods` off, and
+     * with `payroll_export` itself off, and reaches the handler only when all three are on. Worth
+     * knowing when reading a support ticket: all three refusals say *`hr.payroll_export` is not
+     * enabled*, so an administrator looking at a switch that is plainly on is looking at a dependency
+     * that is off.
+     *
+     * **Nothing here writes**, including no `sensitive_access_log` row: this export reads no
+     * sensitive field. Adding `iban` would make it a bulk decrypt of every employee's bank account
+     * and would owe one audit row per person with `via: 'export'` — a different procedure with its
+     * own key, not a column on this one.
+     */
+    payroll: {
+      export: {
+        /**
+         * One entity, one period, two CSVs and a manifest.
+         *
+         * Synchronous, and that is checked rather than preferred: `core.files.createUpload` needs a
+         * user principal and returns a presigned PUT for a browser, so a background job cannot mint a
+         * `FileObject` at all, and writing bytes straight into `kernel.storage` would orphan an
+         * object `core.files.*` cannot see and nothing will ever delete.
+         *
+         * It throws the first refusal `collect` found rather than emitting a row of zeros — an open
+         * period without `draft`, an entity with nobody in it, or somebody with no employment record
+         * covering their days here. The preview below returns all of them instead, so a screen can
+         * show the reader every reason at once before anybody downloads anything.
+         */
+        v1: scoped.payroll.export.v1
+          .use(cap('payroll_export'))
+          .use(requires('hr.payroll.export'))
+          .use(requires('hr.attendance.view_team'))
+          .use(requires('hr.leave.view_team'))
+          .handler(({ input }) =>
+            db.withWorkspace(input.workspaceId, async (tx) => {
+              const data = await payroll.collect(tx, input)
+              const [first] = data.refusals
+              // `conflict` rather than `badRequest`: the request is well formed and the state is not
+              // ready. `hr.period.not_locked` mirrors the spelling of `hr.period.locked`, which
+              // `PolicyService.assertOpen` throws pointed the other way.
+              if (first) throw KernError.conflict(first.message, first.code)
+              return assembleExport(payrollAssembly(data, input.draft))
+            }),
+          ),
+
+        /**
+         * The same rows as JSON, with no file and no refusal thrown.
+         *
+         * The manifest it carries is the manifest the export *would* write, filenames included, so a
+         * screen can name the files before they exist and a reader can see `DRAFT` in the name before
+         * choosing to send it.
+         */
+        preview: scoped.payroll.export.preview
+          .use(cap('payroll_export'))
+          .use(requires('hr.payroll.export'))
+          .use(requires('hr.attendance.view_team'))
+          .use(requires('hr.leave.view_team'))
+          .handler(({ input }) =>
+            db.withWorkspace(input.workspaceId, async (tx) => {
+              const data = await payroll.collect(tx, input)
+              return {
+                manifest: exportManifest(payrollAssembly(data, input.draft)),
+                refusals: data.refusals,
+                exportable: data.refusals.length === 0,
+                totals: data.totals,
+                hours: data.hours,
+                leave: data.leave,
+              }
+            }),
+          ),
+      },
+    },
+
     // ================================================================= privacy
     /**
      * Subject access, erasure and retention.
@@ -4968,6 +5067,35 @@ export function implement_(kernel: Kernel) {
       slice: { ...slice, name: population.sliceName },
       population: population.personIds.length,
       rows,
+    }
+  }
+
+  /**
+   * The provenance half of a payroll export's manifest — the part that is the router's to supply.
+   *
+   * `kernVersion` is the platform version this image was built as, recorded so a file can be traced
+   * back to what wrote it. It is **not** the contract identity: `PAYROLL_EXPORT_CONTRACT` is a
+   * literal that moves only when the column set does, and reading the module version into that field
+   * would rename the format on every patch release.
+   *
+   * The three permissions are the ones the middlewares above actually asked for, written out rather
+   * than inferred, for the reason `ReportScope` exists: two readers must never hold one file's
+   * figures under one title without being told which grants produced them.
+   */
+  function payrollAssembly(data: PayrollExportData, draft: boolean): PayrollExportAssembly {
+    return {
+      entity: data.entity,
+      period: data.period,
+      draft,
+      generatedAt: new Date().toISOString(),
+      kernVersion: kernel.version,
+      permissions: ['hr.payroll.export', 'hr.attendance.view_team', 'hr.leave.view_team'],
+      dayLengthMinutes: MINUTES_PER_DAY,
+      population: data.population,
+      counted: data.counted,
+      attendance: data.attendance,
+      hours: data.hours,
+      leave: data.leave,
     }
   }
 

@@ -490,6 +490,8 @@ export const en: Record<string, Message> = {
   'hr.cap_legal_entities_desc': 'Several employing companies, for a group operating across borders',
   'hr.cap_offices': 'Offices',
   'hr.cap_offices_desc': 'More than one place of work, each with its own country, timezone and holidays',
+  'hr.cap_payroll_export': 'Payroll export',
+  'hr.cap_payroll_export_desc': 'Hand a closed period to a payroll provider as CSV, per legal entity',
   'hr.cap_periods': 'Payroll periods',
   'hr.cap_periods_desc': 'Close a month so a filed payroll cannot move underneath it',
   'hr.capabilities_desc':
@@ -1946,6 +1948,8 @@ export const ar: Record<string, Message> = {
   'hr.cap_legal_entities_desc': 'عدة شركات موظِّفة، لمجموعة تعمل عبر الحدود',
   'hr.cap_offices': 'المكاتب',
   'hr.cap_offices_desc': 'أكثر من مكان عمل، لكلٍّ منه بلده ومنطقته الزمنية وعطلاته',
+  'hr.cap_payroll_export': 'تصدير كشوف الرواتب',
+  'hr.cap_payroll_export_desc': 'تسليم فترة مُقفلة إلى مزوّد كشوف الرواتب بصيغة CSV، لكل كيان قانوني',
   'hr.cap_periods': 'فترات الرواتب',
   'hr.cap_periods_desc': 'إغلاق الشهر حتى لا يتغيّر كشف رواتب مُعتمد بعد اعتماده',
   'hr.capabilities_desc':
@@ -3431,6 +3435,9 @@ export const de: Record<string, Message> = {
   'hr.cap_offices': 'Standorte',
   'hr.cap_offices_desc':
     'Mehr als ein Arbeitsort, jeder mit eigenem Land, eigener Zeitzone und eigenen Feiertagen',
+  'hr.cap_payroll_export': 'Lohnexport',
+  'hr.cap_payroll_export_desc':
+    'Einen abgeschlossenen Zeitraum je Rechtsträger als CSV an einen Lohndienstleister übergeben',
   'hr.cap_periods': 'Abrechnungszeiträume',
   'hr.cap_periods_desc':
     'Einen Monat schließen, damit eine eingereichte Abrechnung sich nicht nachträglich verschiebt',
@@ -4835,6 +4842,9 @@ export const fa: Record<string, Message> = {
   'hr.cap_legal_entities_desc': 'چند شرکت کارفرما، برای گروهی که در چند کشور فعالیت می‌کند',
   'hr.cap_offices': 'دفاتر',
   'hr.cap_offices_desc': 'بیش از یک محل کار، هرکدام با کشور، منطقهٔ زمانی و تعطیلات خودش',
+  'hr.cap_payroll_export': 'خروجی حقوق و دستمزد',
+  'hr.cap_payroll_export_desc':
+    'تحویل یک دورهٔ بسته‌شده به ارائه‌دهندهٔ حقوق و دستمزد به‌صورت CSV، به تفکیک شخصیت حقوقی',
   'hr.cap_periods': 'دوره‌های حقوق و دستمزد',
   'hr.cap_periods_desc': 'بستن یک ماه تا حقوق ثبت‌شده دیگر تغییر نکند',
   'hr.capabilities_desc':
@@ -6207,6 +6217,9 @@ export const tr: Record<string, Message> = {
   'hr.cap_legal_entities_desc': 'Sınır ötesinde faaliyet gösteren bir grup için birden fazla işveren şirket',
   'hr.cap_offices': 'Ofisler',
   'hr.cap_offices_desc': 'Birden fazla çalışma yeri; her biri kendi ülkesi, saat dilimi ve tatilleriyle',
+  'hr.cap_payroll_export': 'Bordro dışa aktarma',
+  'hr.cap_payroll_export_desc':
+    'Kapanmış bir dönemi, tüzel kişilik bazında CSV olarak bordro sağlayıcısına aktarın',
   'hr.cap_periods': 'Bordro dönemleri',
   'hr.cap_periods_desc': 'Bir ayı kapatın; böylece verilmiş bordro sonradan kaymaz',
   'hr.capabilities_desc':
