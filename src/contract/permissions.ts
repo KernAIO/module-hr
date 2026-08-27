@@ -263,6 +263,32 @@ export const hrPermissions = definePermissions([
   // administrator the same lesson a dead capability switch does. They come back with the approval
   // flow that needs them.
 
+  // ---------------------------------------------------------------- reports
+  {
+    key: 'hr.report.view',
+    label: 'Open HR reports',
+    description:
+      'Aggregate attendance, absence, overtime and leave balances across a team or an office. ' +
+      'Each report also needs the key for the data it sums.',
+    scope: 'workspace',
+    defaultRoles: ['owner', 'admin'],
+    dangerous: false,
+  },
+  // Four procedures, one key, one commit — `reports.attendance`, `reports.overtime`,
+  // `reports.absence` and `reports.leaveBalance` all ship gated on it, exactly as `hr.privacy.manage`
+  // ships across four. It is a **second** check rather than a replacement: a report must not answer
+  // a question its row-level procedure would refuse, so each one also asks for the key that already
+  // guards the rows it sums — `hr.attendance.view_team` for the three attendance reports (which is
+  // what `attendance.days.list` costs to read a whole office) and `hr.leave.view_team` for balances
+  // (which is what `leave.balance.get` costs to read somebody else's).
+  //
+  // Why a key of its own at all, when the two above would do: a reports surface is the one place a
+  // whole population's figures are put in front of somebody in a form that goes into a payroll or a
+  // performance conversation, and a workspace has to be able to grant a manager their team's day
+  // sheets without granting them that. There is deliberately **no** `hr.report.export`: nothing in
+  // this module writes a file, and a key gating a button nobody built is the thing the removed
+  // `hr.overtime.*` block below is a note about.
+
   // ---------------------------------------------------------------- policies and periods
   {
     key: 'hr.policy.view',
@@ -368,6 +394,7 @@ export const HR_PERMISSIONS = {
   attendanceView: 'hr.attendance.view',
   attendanceViewTeam: 'hr.attendance.view_team',
   attendanceManage: 'hr.attendance.manage',
+  reportView: 'hr.report.view',
   policyView: 'hr.policy.view',
   policyManage: 'hr.policy.manage',
   periodManage: 'hr.period.manage',

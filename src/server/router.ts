@@ -27,7 +27,17 @@ import {
   or,
   sql,
 } from 'drizzle-orm'
-import { HrSettings, hrContract, hrEvents, MODULE_ID, type WorkingWeek } from '../contract/index.js'
+import {
+  type AbsenceBasis,
+  HrSettings,
+  hrContract,
+  hrEvents,
+  MODULE_ID,
+  type ReportAttribution,
+  type ReportSlice,
+  type ReportSliceBy,
+  type WorkingWeek,
+} from '../contract/index.js'
 import {
   AccrualConfig,
   CarryForwardConfig,
@@ -37,7 +47,7 @@ import {
   WorkingTimeConfig,
 } from '../contract/policies.js'
 import { accrueForPeriod } from '../policy/accrual.js'
-import { countWorkingDays, workingDays } from '../policy/calendar.js'
+import { countWorkingDays, datesBetween, workingDays } from '../policy/calendar.js'
 import { COUNTRY_PACKS, packDays, packFor } from './packs/index.js'
 import {
   approvalChains,
@@ -86,6 +96,19 @@ import {
   RETENTION_CLASSES,
   stripSensitiveCustom,
 } from './services/privacy.js'
+import {
+  type AbsenceAggregateRow,
+  absenceBasis,
+  absenceSplit,
+  capTotal,
+  type DayAggregateRow,
+  expectedDaysFor,
+  mergeFinality,
+  ReportsService,
+  rangeRefusal,
+  ratio,
+  round2,
+} from './services/reports.js'
 import { DEFAULT_WORKING_WEEK, ResolveService } from './services/resolve.js'
 
 const os = implement(hrContract).$context<RequestContext>()
@@ -216,7 +239,13 @@ async function calendarChain(tx: Tx, workspaceId: string, calendarId: string) {
  * `hrSubjects` below reach it, so the leave calculation a deadline runs reads the same calendar as
  * the one a person runs.
  */
-async function composedDays(tx: Tx, workspaceId: string, calendarId: string, from: string, to: string) {
+export async function composedDays(
+  tx: Tx,
+  workspaceId: string,
+  calendarId: string,
+  from: string,
+  to: string,
+) {
   const chain = await calendarChain(tx, workspaceId, calendarId)
   const rows = await tx
     .select()
@@ -607,6 +636,7 @@ export function implement_(kernel: Kernel) {
    */
   const approvals = new ApprovalService(kernel, subjects.appliersFor(null))
   const privacy = new PrivacyService()
+  const reports = new ReportsService(resolve)
   const audit = new HrAuditService(kernel, access)
   const db = kernel.database
   const settingsOf = (workspaceId: string) => kernel.settings.module(workspaceId, MODULE_ID, HrSettings)
@@ -977,28 +1007,24 @@ export function implement_(kernel: Kernel) {
       ),
 
       sensitive: {
-        get: scoped.people.sensitive.get.use(requires('hr.person.view_sensitive')).handler(({ input }) =>
-          db.withWorkspace(input.workspaceId, async (tx) => {
-            const [row] = await tx
-              .select()
-              .from(peopleSensitive)
-              .where(
-                and(
-                  eq(peopleSensitive.workspaceId, input.workspaceId),
-                  eq(peopleSensitive.personId, input.personId),
-                ),
-              )
-              .limit(1)
-            return {
-              personId: input.personId,
+        /**
+         * Through `readSensitive`, not inline — this is the whole point of that method.
+         *
+         * It decrypts and writes the `sensitive_access_log` row in one transaction, so the read
+         * cannot happen without being recorded. Decrypting here instead left the log recording
+         * *exports* and nothing else: the one procedure that exists to read these fields was the
+         * one procedure not logging them, and a subject-access answer built on that would have
+         * stated in writing that nobody had opened her bank details.
+         */
+        get: scoped.people.sensitive.get
+          .use(requires('hr.person.view_sensitive'))
+          .handler(({ input, context }) =>
+            svc.readSensitive({
               workspaceId: input.workspaceId,
-              nationalId: row?.nationalIdEnc ? await kernel.secrets.decrypt(row.nationalIdEnc) : null,
-              birthDate: row?.birthDate ?? null,
-              iban: row?.ibanEnc ? await kernel.secrets.decrypt(row.ibanEnc) : null,
-              emergencyContact: (row?.emergencyContact as never) ?? null,
-            }
-          }),
-        ),
+              personId: input.personId,
+              principal: context.principal,
+            }),
+          ),
 
         update: scoped.people.sensitive.update
           .use(requires('hr.person.manage_sensitive'))
@@ -3883,6 +3909,419 @@ export function implement_(kernel: Kernel) {
       }),
     },
 
+    // ================================================================= reports
+    /**
+     * Four aggregates, and the two rules that decide every line of them.
+     *
+     * **A report is a separate grant, and it says which one produced it.** Each of these costs
+     * `hr.report.view` *and* the key that already guards the rows it sums — `hr.attendance.view_team`
+     * is what reading a whole office's day sheets costs on `attendance.days.list`, and
+     * `hr.leave.view_team` is what reading somebody else's balance costs through `personFor`. So a
+     * report reaches no further than the rows a reader could already page through, and it does not
+     * narrow below them either: the population is never intersected with
+     * `HrAccessService.visiblePersonIds`, which withholds *fields* nothing here reads and would
+     * otherwise leave two managers reading different totals under one title. A reader holding
+     * neither key gets nothing at all rather than a one-row self-report.
+     *
+     * Both `view_team` keys are declared `scope: 'object'` and are asked here at **workspace** scope,
+     * which is what `requires()` does and what every existing caller does explicitly. Binding one to
+     * an office id narrows nothing today — `Authz.can(object, id)` falls through to the
+     * workspace-level effective set — so the response says `askedAt: 'workspace'` rather than
+     * letting a reader infer a scoping that is not happening.
+     *
+     * **Nothing here writes.** No recompute, no refresh: `recomputeDay` is the only thing entitled to
+     * decide whether a day may move, and a report over a filed month must not be able to move it.
+     */
+    reports: {
+      /**
+       * Scheduled against worked, per person.
+       *
+       * `workedRatio` is null wherever nothing was scheduled. That is not a rare edge: somebody with
+       * no schedule assignment resolves to `NO_SCHEDULE`, owes no hours, and is written down as
+       * `present` with `scheduledMinutes: 0` — so a percentage would be a division by zero dressed
+       * up as 0% or 100%. `noScheduleDays` counts them from the policy stamp, which is the only
+       * positive evidence; `scheduledMinutes === 0` is also true of a scheduled rest day.
+       */
+      attendance: scoped.reports.attendance
+        .use(cap('attendance'))
+        .use(requires('hr.report.view'))
+        .use(requires('hr.attendance.view_team'))
+        .handler(({ input }) =>
+          db.withWorkspace(input.workspaceId, async (tx) => {
+            const { slice, population, rows } = await dayReport(tx, input)
+            const totals = {
+              days: sum(rows, (r) => r.days),
+              scheduledMinutes: sum(rows, (r) => r.scheduledMinutes),
+              workedMinutes: sum(rows, (r) => r.workedMinutes),
+              breakMinutes: sum(rows, (r) => r.breakMinutes),
+              lateMinutes: sum(rows, (r) => r.lateMinutes),
+              earlyLeaveMinutes: sum(rows, (r) => r.earlyLeaveMinutes),
+              noScheduleDays: sum(rows, (r) => r.noScheduleDays),
+              unknownScheduleDays: sum(rows, (r) => r.unknownScheduleDays),
+            }
+            const shown = [...rows]
+              .sort((a, b) => b.workedMinutes - a.workedMinutes || a.personId.localeCompare(b.personId))
+              .slice(0, input.limit)
+            const names = await reports.namesOf(
+              tx,
+              input.workspaceId,
+              shown.map((r) => r.personId),
+            )
+            return {
+              header: reportHeader({
+                input,
+                slice,
+                population,
+                counted: rows.length,
+                shown: shown.length,
+                permissions: ['hr.report.view', 'hr.attendance.view_team'],
+              }),
+              finality: mergeFinality(rows),
+              totals: {
+                ...totals,
+                workedRatio: ratio(totals.workedMinutes, totals.scheduledMinutes),
+              },
+              rows: shown.map((r) => ({
+                personId: r.personId,
+                displayName: names.get(r.personId) ?? '',
+                days: r.days,
+                scheduledMinutes: r.scheduledMinutes,
+                workedMinutes: r.workedMinutes,
+                breakMinutes: r.breakMinutes,
+                lateMinutes: r.lateMinutes,
+                earlyLeaveMinutes: r.earlyLeaveMinutes,
+                workedRatio: ratio(r.workedMinutes, r.scheduledMinutes),
+                noScheduleDays: r.noScheduleDays,
+                unknownScheduleDays: r.unknownScheduleDays,
+              })),
+            }
+          }),
+        ),
+
+      /**
+       * Overtime, and how much of it an annual ceiling would not take.
+       *
+       * `beyondCapMinutes` is summed as a nullable column and never coalesced: Postgres answers NULL
+       * when every day in the group is null, which is exactly "no ceiling was in force on any of
+       * these days" — a different fact from "one applied and nothing passed it". `cappedDays` is
+       * beside it so a reader can see which of the two they are looking at.
+       */
+      overtime: scoped.reports.overtime
+        .use(cap('attendance'))
+        .use(requires('hr.report.view'))
+        .use(requires('hr.attendance.view_team'))
+        .handler(({ input }) =>
+          db.withWorkspace(input.workspaceId, async (tx) => {
+            const { slice, population, rows } = await dayReport(tx, input)
+            const shown = [...rows]
+              .sort((a, b) => b.overtimeMinutes - a.overtimeMinutes || a.personId.localeCompare(b.personId))
+              .slice(0, input.limit)
+            const names = await reports.namesOf(
+              tx,
+              input.workspaceId,
+              shown.map((r) => r.personId),
+            )
+            return {
+              header: reportHeader({
+                input,
+                slice,
+                population,
+                counted: rows.length,
+                shown: shown.length,
+                permissions: ['hr.report.view', 'hr.attendance.view_team'],
+              }),
+              finality: mergeFinality(rows),
+              totals: {
+                days: sum(rows, (r) => r.days),
+                overtimeMinutes: sum(rows, (r) => r.overtimeMinutes),
+                // The days are added up; the minutes are not, unless at least one day had a ceiling.
+                beyondCapMinutes: capTotal(rows.map((r) => r.beyondCapMinutes)).beyondCapMinutes,
+                cappedDays: sum(rows, (r) => r.cappedDays),
+                uncappedDays: sum(rows, (r) => r.uncappedDays),
+              },
+              rows: shown.map((r) => ({
+                personId: r.personId,
+                displayName: names.get(r.personId) ?? '',
+                days: r.days,
+                overtimeMinutes: r.overtimeMinutes,
+                beyondCapMinutes: r.beyondCapMinutes,
+                cappedDays: r.cappedDays,
+                uncappedDays: r.uncappedDays,
+              })),
+            }
+          }),
+        ),
+
+      /**
+       * Expected working days, minus days worked, minus approved leave.
+       *
+       * **Never `status = 'absent'`.** `attendance_days` holds a row only where somebody punched —
+       * the punch path, a regularization, auto-clock-out and the two recompute jobs are the only
+       * writers, and not one of them creates a row for a day nobody clocked in on. Counting absent
+       * rows therefore reports near-zero absence in every workspace and looks entirely healthy while
+       * doing it. The denominator is built from the calendar instead, and the two populations it
+       * cannot answer for are named rather than dropped: somebody with no schedule assignment owes
+       * no hours, and an office with no calendar attached would only be measured against an assumed
+       * Monday–Friday week.
+       */
+      absence: scoped.reports.absence
+        .use(cap('attendance'))
+        .use(requires('hr.report.view'))
+        .use(requires('hr.attendance.view_team'))
+        .handler(({ input }) =>
+          db.withWorkspace(input.workspaceId, async (tx) => {
+            const slice = sliceOf(input)
+            // Always a per-day report, sliced or not: every person's expectation is their own
+            // office's calendar on each day, which is a ladder walk per day either way.
+            const refusal = rangeRefusal({ from: input.from, to: input.to, perDay: true })
+            if (refusal) throw KernError.badRequest(refusal)
+
+            const population = await reports.population(tx, input.workspaceId, slice, input.from, input.to)
+            const dates = datesBetween(input.from, input.to)
+            const resolutions =
+              population.resolutions ??
+              (await reports.resolveByDate(tx, input.workspaceId, population.personIds, dates))
+
+            const calendarIds = new Set<string>()
+            for (const perDate of resolutions.values())
+              for (const resolution of perDate.values())
+                if (resolution.calendarId) calendarIds.add(resolution.calendarId)
+            // Composed once per calendar rather than once per person: the holidays are a property
+            // of the office, and a workspace has a handful of calendars behind however many people.
+            const calendarDaysById = new Map<
+              string,
+              Array<{ date: string; name: string; workingFraction: number }>
+            >()
+            for (const calendarId of calendarIds)
+              calendarDaysById.set(
+                calendarId,
+                (await composedDays(tx, input.workspaceId, calendarId, input.from, input.to)).map((d) => ({
+                  date: d.date,
+                  name: d.name,
+                  workingFraction: d.workingFraction,
+                })),
+              )
+
+            const scheduled = await reports.scheduledPeople(
+              tx,
+              input.workspaceId,
+              population.personIds,
+              input.from,
+              input.to,
+            )
+            // `leave` is a capability of its own, and a workspace that has it off holds no approved
+            // leave to subtract. The column is then absent rather than zero, and `leaveCounted` says
+            // so — a zero would read as "nobody was away", which is a claim rather than a silence.
+            const leaveCounted = (await kernel.capabilities(input.workspaceId, MODULE_ID)).has('leave')
+
+            const basisByPerson = new Map<string, AbsenceBasis>()
+            const groups = new Map<
+              string,
+              { personIds: string[]; expected: Array<{ date: string; fraction: number }> }
+            >()
+            for (const personId of population.personIds) {
+              const mine = population.datesByPerson?.get(personId) ?? dates
+              const { expected, hasCalendar } = expectedDaysFor(
+                mine,
+                (date) => resolutions.get(date)?.get(personId),
+                (calendarId) => calendarDaysById.get(calendarId) ?? [],
+              )
+              const basis = absenceBasis({ hasSchedule: scheduled.has(personId), hasCalendar })
+              basisByPerson.set(personId, basis)
+              if (basis !== 'calendar') continue
+              const signature = expected.map((e) => `${e.date}:${e.fraction}`).join(',')
+              const existing = groups.get(signature)
+              if (existing) existing.personIds.push(personId)
+              else groups.set(signature, { personIds: [personId], expected })
+            }
+
+            const measured: AbsenceAggregateRow[] = []
+            for (const group of groups.values())
+              measured.push(
+                ...(await reports.absenceAggregate(
+                  tx,
+                  input.workspaceId,
+                  group.personIds,
+                  group.expected,
+                  leaveCounted,
+                )),
+              )
+            const byPerson = new Map(measured.map((r) => [r.personId, r]))
+
+            const rows = [...basisByPerson].map(([personId, basis]) => {
+              const found = byPerson.get(personId)
+              if (basis !== 'calendar' || !found)
+                return {
+                  personId,
+                  basis,
+                  expectedDays: null,
+                  workedDays: null,
+                  leaveDays: null,
+                  absentDays: null,
+                  absenceRate: null,
+                }
+              const split = absenceSplit(found)
+              return {
+                personId,
+                basis,
+                expectedDays: found.expectedDays,
+                workedDays: found.workedDays,
+                leaveDays: found.leaveDays,
+                absentDays: split.absentDays,
+                absenceRate: split.absenceRate,
+              }
+            })
+
+            const totalExpected = sum(measured, (r) => r.expectedDays)
+            const totalWorked = sum(measured, (r) => r.workedDays)
+            const totalLeave = leaveCounted ? sum(measured, (r) => r.leaveDays ?? 0) : null
+            const totalSplit = absenceSplit({
+              expectedDays: totalExpected,
+              workedDays: totalWorked,
+              leaveDays: totalLeave,
+            })
+
+            // Measured people first, ordered by what a reader came for; the two named buckets after
+            // them, so they are visible rather than truncated away by the row limit.
+            const shown = rows
+              .sort(
+                (a, b) =>
+                  (a.basis === 'calendar' ? 0 : 1) - (b.basis === 'calendar' ? 0 : 1) ||
+                  (b.absentDays ?? -1) - (a.absentDays ?? -1) ||
+                  a.personId.localeCompare(b.personId),
+              )
+              .slice(0, input.limit)
+            const names = await reports.namesOf(
+              tx,
+              input.workspaceId,
+              shown.map((r) => r.personId),
+            )
+
+            return {
+              header: reportHeader({
+                input,
+                slice: { ...slice, name: population.sliceName },
+                population: population.personIds.length,
+                counted: measured.length,
+                shown: shown.length,
+                permissions: ['hr.report.view', 'hr.attendance.view_team'],
+                attribution: 'each_day' as const,
+              }),
+              finality: mergeFinality(measured),
+              leaveCounted,
+              totals: {
+                measured: measured.length,
+                expectedDays: round2(totalExpected),
+                workedDays: round2(totalWorked),
+                leaveDays: totalLeave === null ? null : round2(totalLeave),
+                absentDays: totalSplit.absentDays,
+                absenceRate: totalSplit.absenceRate,
+              },
+              excluded: {
+                noSchedule: rows.filter((r) => r.basis === 'no_schedule').length,
+                noCalendar: rows.filter((r) => r.basis === 'no_calendar').length,
+              },
+              rows: shown.map((r) => ({ ...r, displayName: names.get(r.personId) ?? '' })),
+            }
+          }),
+        ),
+
+      /**
+       * Every balance in the population, per leave type, for one entitlement year.
+       *
+       * Summed from `leave_ledger` and nothing else — the cursor exists to be locked, and a cache
+       * that is also the source of truth eventually disagrees with it. There is no entitlement, no
+       * allowance remaining and no year-end projection: all three need an accrual policy, the
+       * `leave_accrual` capability ships off, and a company that grants a fixed allowance on 1
+       * January has a perfectly real balance and no policy at all. `dayLengthMinutes` is published
+       * because `toUnit` renders a `day` at a constant eight hours, and a report that prints days
+       * without saying which day is the quiet way this goes wrong.
+       */
+      leaveBalance: scoped.reports.leaveBalance
+        .use(cap('leave'))
+        .use(requires('hr.report.view'))
+        .use(requires('hr.leave.view_team'))
+        .handler(({ input }) =>
+          db.withWorkspace(input.workspaceId, async (tx) => {
+            const asOf = input.asOf ?? todayIso()
+            const periodYear = input.periodYear ?? yearOf(asOf)
+            const slice = sliceOf(input)
+            // A balance is a position rather than a per-day quantity, so it is attributed as of one
+            // date and the header says which. Resolving it per day would be arithmetic nobody asked
+            // for on a figure that does not vary by day.
+            const population = await reports.population(tx, input.workspaceId, slice, asOf, asOf)
+            const all = await reports.leaveBalances(tx, input.workspaceId, population.personIds, periodYear)
+
+            const counted = [...new Set(all.map((r) => r.personId))]
+            const names = await reports.namesOf(tx, input.workspaceId, counted)
+            const shownPeople = counted
+              .sort((a, b) => (names.get(a) ?? '').localeCompare(names.get(b) ?? '') || a.localeCompare(b))
+              .slice(0, input.limit)
+            const keep = new Set(shownPeople)
+
+            const totals = new Map<string, (typeof all)[number] & { people: number }>()
+            for (const row of all) {
+              const found = totals.get(row.leaveTypeId)
+              if (found) {
+                found.balanceMinutes += row.balanceMinutes
+                found.bookedMinutes += row.bookedMinutes
+                found.pendingMinutes += row.pendingMinutes
+                found.availableMinutes += row.availableMinutes
+                found.people += 1
+              } else totals.set(row.leaveTypeId, { ...row, people: 1 })
+            }
+
+            return {
+              header: reportHeader({
+                input: { from: asOf, to: asOf, by: input.by },
+                slice: { ...slice, name: population.sliceName },
+                population: population.personIds.length,
+                counted: counted.length,
+                shown: shownPeople.length,
+                permissions: ['hr.report.view', 'hr.leave.view_team'],
+                attribution: 'as_of_date' as const,
+                attributionOn: asOf,
+              }),
+              periodYear,
+              dayLengthMinutes: MINUTES_PER_DAY,
+              totals: [...totals.values()]
+                .sort((a, b) => a.order - b.order || a.leaveTypeName.localeCompare(b.leaveTypeName))
+                .map((t) => ({
+                  leaveTypeId: t.leaveTypeId,
+                  leaveTypeName: t.leaveTypeName,
+                  unit: t.unit,
+                  people: t.people,
+                  balanceMinutes: t.balanceMinutes,
+                  bookedMinutes: t.bookedMinutes,
+                  pendingMinutes: t.pendingMinutes,
+                  availableMinutes: t.availableMinutes,
+                })),
+              rows: all
+                .filter((r) => keep.has(r.personId))
+                .sort(
+                  (a, b) =>
+                    (names.get(a.personId) ?? '').localeCompare(names.get(b.personId) ?? '') ||
+                    a.order - b.order ||
+                    a.leaveTypeName.localeCompare(b.leaveTypeName),
+                )
+                .map((r) => ({
+                  personId: r.personId,
+                  displayName: names.get(r.personId) ?? '',
+                  leaveTypeId: r.leaveTypeId,
+                  leaveTypeName: r.leaveTypeName,
+                  unit: r.unit,
+                  balanceMinutes: r.balanceMinutes,
+                  bookedMinutes: r.bookedMinutes,
+                  pendingMinutes: r.pendingMinutes,
+                  availableMinutes: r.availableMinutes,
+                  balance: r.balance,
+                  available: r.available,
+                })),
+            }
+          }),
+        ),
+    },
+
     // ================================================================= privacy
     /**
      * Subject access, erasure and retention.
@@ -4440,6 +4879,94 @@ export function implement_(kernel: Kernel) {
       workspaceId,
     })
     return personId
+  }
+
+  // ------------------------------------------------------------------ reports
+
+  /** What the caller asked to narrow to, refusing a slice with nothing to narrow *to*. */
+  function sliceOf(input: { by: ReportSliceBy; sliceId?: string }): {
+    by: ReportSliceBy
+    id: string | null
+    name: string | null
+  } {
+    if (input.by === 'workspace') return { by: 'workspace', id: null, name: null }
+    if (!input.sliceId)
+      throw KernError.badRequest('A report sliced by an office or a legal entity needs the id of one.')
+    return { by: input.by, id: input.sliceId, name: null }
+  }
+
+  /**
+   * A declaration rather than a `const`, like every other helper down here.
+   *
+   * This whole block sits *after* `return os.router(…)`, so a `const` is never evaluated and every
+   * handler that reached for it would throw a `ReferenceError` the first time somebody opened a
+   * report — at runtime only, with a clean type-check and a clean test run behind it. Function
+   * declarations hoist; that is the only reason the helpers below one already-returned statement
+   * work at all.
+   */
+  function sum<T>(rows: readonly T[], of: (row: T) => number): number {
+    return rows.reduce((total, row) => total + of(row), 0)
+  }
+
+  /**
+   * The header every report carries, and the reason it is not optional.
+   *
+   * A total with no denominator beside it is the defect, not the scoping: "47 hours of overtime"
+   * means one thing to somebody reading a whole company and another to somebody reading a team, and
+   * neither of them is told which they have. So the population, the range, the slice, the
+   * attribution rule and the keys that produced it all travel with the figures.
+   */
+  function reportHeader(args: {
+    input: { from: string; to: string; by: ReportSliceBy }
+    slice: ReportSlice
+    population: number
+    counted: number
+    shown: number
+    permissions: string[]
+    attribution?: ReportAttribution
+    attributionOn?: string
+  }) {
+    return {
+      from: args.input.from,
+      to: args.input.to,
+      slice: args.slice,
+      scope: { permissions: args.permissions, askedAt: 'workspace' as const },
+      population: args.population,
+      counted: args.counted,
+      attribution:
+        args.attribution ??
+        (args.input.by === 'workspace' ? ('not_applicable' as const) : ('each_day' as const)),
+      attributionOn: args.attributionOn ?? null,
+      truncated: args.shown < args.counted,
+    }
+  }
+
+  /**
+   * The population and the per-person day-sheet aggregate the attendance and overtime reports share.
+   *
+   * One grouped aggregate per set of people who belonged to the slice on the same days — which for a
+   * range nobody transferred through is one query over the whole range. The rows are one per person,
+   * never one per person-day: a year of five hundred people is a hundred and thirty thousand day
+   * sheets, and adding them up in this process is the shape that works in a demo and falls over on
+   * the first real customer.
+   */
+  async function dayReport(
+    tx: Tx,
+    input: { workspaceId: string; from: string; to: string; by: ReportSliceBy; sliceId?: string },
+  ): Promise<{ slice: ReportSlice; population: number; rows: DayAggregateRow[] }> {
+    const slice = sliceOf(input)
+    const refusal = rangeRefusal({ from: input.from, to: input.to, perDay: slice.by !== 'workspace' })
+    if (refusal) throw KernError.badRequest(refusal)
+
+    const population = await reports.population(tx, input.workspaceId, slice, input.from, input.to)
+    const rows: DayAggregateRow[] = []
+    for (const group of reports.groupsFor(population, input.from, input.to))
+      rows.push(...(await reports.dayAggregate(tx, input.workspaceId, group, input.from, input.to)))
+    return {
+      slice: { ...slice, name: population.sliceName },
+      population: population.personIds.length,
+      rows,
+    }
   }
 
   /** The request a retry is a retry *of*, or undefined the first time a key is seen. */

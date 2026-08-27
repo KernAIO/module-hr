@@ -69,10 +69,33 @@ import {
   SensitiveAccess,
   SubjectAccessBundle,
 } from './privacy.js'
+import {
+  AbsenceReport,
+  AttendanceSummaryReport,
+  LeaveBalanceReport,
+  OvertimeReport,
+  ReportSliceBy,
+} from './reports.js'
 
 const ws = z.object({ workspaceId: WorkspaceId })
 const t = ['hr'] as const
 const ok = z.object({ ok: z.literal(true) })
+
+/**
+ * What every report takes: a range, a slice and how many rows to draw.
+ *
+ * `limit` bounds the rows, never the figures — `totals` and `population` are computed over everyone
+ * the slice covers and `truncated` says when the rows are the top of a longer list. A headline that
+ * silently described only the first page would be the exact defect these reports exist to avoid.
+ */
+const reportInput = ws.extend({
+  from: IsoDate,
+  to: IsoDate,
+  by: ReportSliceBy.default('workspace'),
+  /** Required by `office` and `legal_entity`, ignored by `workspace`. */
+  sliceId: z.uuid().optional(),
+  limit: z.number().int().min(1).max(1000).default(100),
+})
 
 export const hrContract = {
   // ---------------------------------------------------------------- people
@@ -1273,6 +1296,93 @@ export const hrContract = {
    * nobody by default and ships in the same change as these — see `privacy.ts` for why there is one
    * key rather than four, and why none of this is a capability.
    */
+  // ---------------------------------------------------------------- reports
+  /**
+   * Four aggregates, and one rule that decides all four: **a report may not answer a question its
+   * row-level procedure would refuse, and may not narrow below what that procedure already
+   * returns.**
+   *
+   * So each of these costs `hr.report.view` *and* the key that already guards the rows it sums —
+   * `hr.attendance.view_team`, which is what reading a whole office's day sheets costs on
+   * `attendance.days.list`, or `hr.leave.view_team`, which is what reading somebody else's balance
+   * costs on `leave.balance.get`. A reader holding neither gets nothing: not a one-row self-report,
+   * because a reports menu that quietly collapses to your own attendance is a menu entry that lies
+   * about what it is, and your own attendance is already the attendance page.
+   *
+   * The population is **not** intersected with `HrAccessService.visiblePersonIds`. That service
+   * narrows *fields* rather than rows — it withholds `personalEmail`, `phone`, `hiredOn` and
+   * `terminatedOn`, none of which any report reads — and intersecting on it would produce the worst
+   * outcome available here: two managers reading different totals under the same title, with
+   * nothing on the page to say so.
+   */
+  reports: {
+    /**
+     * Scheduled against worked, per person, over a range.
+     *
+     * Built from `attendance_days` and never from `punches`: punches are raw and append-only, a
+     * voided punch survives beside its correction, and summing them double-counts every fix. The
+     * day sheet is the projection those punches produce.
+     */
+    attendance: baseContract
+      .route({ method: 'GET', path: '/reports/attendance', tags: t })
+      .input(reportInput)
+      .output(AttendanceSummaryReport),
+
+    /**
+     * Overtime, and how much of it an annual ceiling would not take.
+     *
+     * `beyondCapMinutes` is null where no ceiling was in force — summed as a nullable column rather
+     * than coalesced, so "no ceiling applied to these days" and "a ceiling applied and nothing
+     * passed it" stay different answers. No projection: there is no "at this rate you will pass the
+     * ceiling in November", because that needs a policy that may not exist.
+     */
+    overtime: baseContract
+      .route({ method: 'GET', path: '/reports/overtime', tags: t })
+      .input(reportInput)
+      .output(OvertimeReport),
+
+    /**
+     * Expected working days, minus days worked, minus approved leave.
+     *
+     * **Never `status = 'absent'`.** `attendance_days` has a row only where somebody punched — no
+     * writer creates one for a day nobody clocked in on — so counting absent rows reports near-zero
+     * absence everywhere and looks entirely healthy while doing it. The denominator comes from the
+     * calendar instead, and a person the module cannot build one for lands in a named row rather
+     * than being counted as present.
+     *
+     * Held to `MAX_SLICED_REPORT_DAYS` whether it is sliced or not: every person's expectation is
+     * their office's calendar on each day, which is a ladder walk per day.
+     */
+    absence: baseContract
+      .route({ method: 'GET', path: '/reports/absence', tags: t })
+      .input(reportInput)
+      .output(AbsenceReport),
+
+    /**
+     * Every balance in the population, per leave type, for one entitlement year.
+     *
+     * A balance is a position rather than a per-day quantity, so it is attributed as of one date —
+     * `asOf`, defaulting to today — and the response says so. Summed from `leave_ledger`, never
+     * from `leave_balance_cursor`: the cursor exists to be locked, and a cache that is also the
+     * source of truth is one that eventually disagrees with it.
+     */
+    leaveBalance: baseContract
+      .route({ method: 'GET', path: '/reports/leave-balance', tags: t })
+      .input(
+        ws.extend({
+          /** Defaults to the year `asOf` falls in. */
+          periodYear: z.number().int().min(1970).max(2200).optional(),
+          /** Which day decides who is in the slice. Defaults to today. */
+          asOf: IsoDate.optional(),
+          by: ReportSliceBy.default('workspace'),
+          sliceId: z.uuid().optional(),
+          limit: z.number().int().min(1).max(1000).default(100),
+        }),
+      )
+      .output(LeaveBalanceReport),
+  },
+
+  // ---------------------------------------------------------------- privacy
   privacy: {
     /**
      * Everything HR holds about one person, in one response.
