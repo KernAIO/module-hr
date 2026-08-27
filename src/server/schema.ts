@@ -190,6 +190,29 @@ export const people = schema.table(
     /** Overrides the primary office's zone for somebody who genuinely works elsewhere. */
     timezone: text('timezone'),
     custom: jsonb('custom').$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
+    /**
+     * The erasure tombstone.
+     *
+     * Deliberately **not** a member of `status`. `status` carries the employment lifecycle —
+     * onboarding, active, on leave, offboarding, terminated — and overloading it with `erased` makes
+     * "was she still employed when this was approved" unanswerable, which is the question a payroll
+     * audit asks. It would also be a *constructing* break on a shared contract: adding a member to
+     * `PersonStatus` keeps every stored row parsing and stops every site that builds one compiling.
+     * A separate nullable timestamp says the same thing and costs nothing.
+     */
+    erasedAt: ts('erased_at'),
+    erasedBy: uuid('erased_by'),
+    erasureReason: text('erasure_reason'),
+    /**
+     * File objects an erasure had to leave in core's storage.
+     *
+     * `core.files.get` is the only file procedure a module can reach — there is no `files.delete` —
+     * so clearing `photo_file_id` and `leave_requests.document_file_id` removes the *pointer* and
+     * orphans the object. Recording the ids here is what keeps that finishable: without them the
+     * bytes stay in the bucket with nothing left that knows they were hers. `person_documents` rows
+     * are kept instead of being nulled, so their files need no entry here.
+     */
+    erasedFileIds: uuid('erased_file_ids').array(),
     createdAt: created(),
     updatedAt: updated(),
   },
@@ -297,6 +320,65 @@ export const personHistory = schema.table(
     source: text('source').notNull().default('app'),
   },
   (t) => [index('hr_person_history_idx').on(t.workspaceId, t.personId, t.at)],
+)
+
+/**
+ * Who looked at somebody's identity number, birth date or bank details.
+ *
+ * `people_sensitive` is the one table in this module where the *read* is the event worth recording:
+ * `hr.person.view_sensitive` is granted to nobody by default, and a subject-access request that
+ * cannot answer "who has seen my data" is not a complete answer. Every other table is audited by
+ * `person_history`, which records changes — a change to a national identity number is interesting,
+ * and so is a colleague opening it and changing nothing.
+ *
+ * Append-only, like `person_history` and the ledger: a row here is evidence, and evidence that can
+ * be edited is not evidence. One row per read of one person's record rather than per field — a
+ * screen that opens twenty people writes twenty rows, not eighty, and `fields` says what was on
+ * screen so a narrower read is still distinguishable from a full one.
+ *
+ * `actor_user_id` is the account, not the person: the reader may be an administrator with no
+ * employee record at all, and the question a subject asks is about accounts. `actor_person_id` is
+ * kept beside it when there is one, so the log reads as names without a join through core.
+ */
+export const sensitiveAccessLog = schema.table(
+  'sensitive_access_log',
+  {
+    id: id(),
+    workspaceId: ws(),
+    /** Whose record was read. */
+    personId: uuid('person_id').notNull(),
+    actorUserId: uuid('actor_user_id').notNull(),
+    actorPersonId: uuid('actor_person_id'),
+    /** Which fields the read returned, so a narrow read is not filed as a full one. */
+    fields: text('fields').array().notNull(),
+    /** Why, where a caller offered a reason. Never invented on the caller's behalf. */
+    purpose: text('purpose'),
+    /**
+     * How it was reached: `ui`, `api` or `export`, and nothing else that is producible today.
+     *
+     * Not `mcp`: core's MCP proxy forwards a plain bearer token, so an assistant's read arrives here
+     * as an ordinary `kind: 'user'` principal and is indistinguishable from a person at a keyboard.
+     * Recording it as its own channel would be a claim the code cannot support. Not `service`
+     * either: a service principal always has a null `userId`, and a reader nobody can be named for
+     * is refused before a row is written — an audit row whose actor is "the system" answers the
+     * subject's question with a shrug.
+     */
+    via: text('via').notNull(),
+    at: created(),
+  },
+  (t) => [
+    // Both reads this table exists to answer: what was seen of one person (a subject-access
+    // request), and what one account has been looking at (an investigation). Newest first in both,
+    // because nobody asks these questions oldest-first.
+    // `t.at.desc()`, never `desc(t.at)`. The second is the *query* helper: drizzle records it in the
+    // snapshot as a SQL expression — `("created_at" desc)` — rather than as a column with a sort
+    // direction, and Postgres will not build an index on that. `check-snapshot-drift` catches it by
+    // asking Postgres to build what the snapshot describes, which is the only reason it is visible
+    // at all: the emitted `CREATE INDEX` is valid either way, so the migration applies and only the
+    // snapshot is wrong. `hr_approval_requests_requester_idx` below is the spelling to copy.
+    index('hr_sens_access_subject_idx').on(t.workspaceId, t.personId, t.at.desc()),
+    index('hr_sens_access_actor_idx').on(t.workspaceId, t.actorUserId, t.at.desc()),
+  ],
 )
 
 export const personDocuments = schema.table(
@@ -991,6 +1073,38 @@ export const periods = schema.table(
   (t) => [index('hr_periods_idx').on(t.workspaceId, t.kind, t.startsOn)],
 )
 
+// =====================================================================================
+// privacy
+// =====================================================================================
+
+/**
+ * How long this workspace keeps each class of personal data. One row per workspace.
+ *
+ * **A table rather than a key in module settings, and the reason is mechanical rather than
+ * aesthetic.** `core.settings.setModule` merges a write over what is stored and then parses the
+ * result against the module's declared zod schema — and a zod object strips what it does not
+ * declare. A retention key living beside `country` and `employeeNumberPrefix` in `HrSettings` would
+ * therefore be deleted by the next unrelated settings write, silently, from a screen that never
+ * mentions retention. That is the same trap `$capabilities` needed a reserved key to escape.
+ * Extending `HrSettings` itself is the other honest route; it is a change to a shape shared with the
+ * client, and this keeps the numbers somewhere nothing else can drop them.
+ *
+ * `workspace_id` is the primary key, so "one row per workspace" is the database's promise and not a
+ * convention a second code path can break. The horizons are a jsonb `config` validated by
+ * `HrRetention` on both sides: the honest end state is per legal entity — a Dutch entity and a
+ * Turkish one have different obligations, which is why `periods` is already per entity — and that
+ * move is then an added nullable column rather than a new table.
+ *
+ * Every horizon is null until somebody sets one, and null means "keep indefinitely". No number in
+ * here ships with a value: "seven years" is a fact about one country and one document class.
+ */
+export const retentionSettings = schema.table('retention_settings', {
+  workspaceId: uuid('workspace_id').primaryKey(),
+  config: jsonb('config').$type<Record<string, number | null>>().notNull().default(sql`'{}'::jsonb`),
+  updatedAt: updated(),
+  updatedBy: uuid('updated_by'),
+})
+
 /** Every tenant table, so the RLS migration is checked against one list rather than memory. */
 export const TENANT_TABLES = [
   'legal_entities',
@@ -1003,6 +1117,7 @@ export const TENANT_TABLES = [
   'employments',
   'office_assignments',
   'person_history',
+  'sensitive_access_log',
   'person_documents',
   'custom_field_defs',
   'calendars',
@@ -1025,4 +1140,5 @@ export const TENANT_TABLES = [
   'policies',
   'policy_assignments',
   'periods',
+  'retention_settings',
 ] as const

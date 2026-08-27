@@ -179,6 +179,12 @@ describe('the module boots', () => {
       'person_documents',
       'person_history',
       'positions',
+      // 0011 — the sensitive-read log. Listed with the rest rather than beside its own migration
+      // because a missing table here is not a failing test but a *vacuous* one: `readSensitive`
+      // writes its row in the same transaction as the read, so without the table every sensitive
+      // read throws and every test that touches one fails for a reason that looks nothing like
+      // "the migration did not run".
+      'sensitive_access_log',
       // 0002 — if these are missing the leave migration did not run, and every leave test below
       // would pass vacuously against a schema that is not there.
       'leave_types',

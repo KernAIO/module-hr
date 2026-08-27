@@ -71,6 +71,13 @@
       "when": 1787851246006,
       "tag": "0010_approval_timeouts",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1787858088123,
+      "tag": "0011_privacy",
+      "breakpoints": true
     }
   ]
 }

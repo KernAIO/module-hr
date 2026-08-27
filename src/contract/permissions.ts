@@ -304,6 +304,27 @@ export const hrPermissions = definePermissions([
     dangerous: false,
   },
 
+  // ---------------------------------------------------------------- privacy
+  {
+    key: 'hr.privacy.manage',
+    label: 'Handle privacy requests: export, erase and retention',
+    description:
+      'Subject access requests, erasure and retention horizons under GDPR and KVKK. An export ' +
+      'contains decrypted bank and identity details, and an erasure cannot be undone. Grant to a ' +
+      'named data-protection owner, not to a role.',
+    scope: 'workspace',
+    // Nobody by default, like `hr.person.view_sensitive` and for the same reason: whether anybody
+    // below an owner may erase a colleague is the workspace's decision, and it has to be made
+    // deliberately rather than inherited by everyone who happens to be an admin.
+    defaultRoles: [],
+    dangerous: true,
+  },
+  // One key, four procedures, one commit — `privacy.subjectAccess`, `privacy.erase`,
+  // `privacy.retention.get` and `privacy.retention.set` all ship gated on it. Four screens suggest
+  // four keys and the temptation is real; the cost of taking it is recorded twice in this repository
+  // already, at the removed `hr.overtime.*` keys above and at `directoryVisibleToMembers` in
+  // `settings.ts`. A separate `hr.privacy.view` arrives when a procedure asks for it and not before.
+
   // ---------------------------------------------------------------- fields
   {
     key: 'hr.field.manage',
@@ -352,4 +373,5 @@ export const HR_PERMISSIONS = {
   periodManage: 'hr.period.manage',
   approvalManage: 'hr.approval.manage',
   approvalDelegate: 'hr.approval.delegate',
+  privacyManage: 'hr.privacy.manage',
 } as const

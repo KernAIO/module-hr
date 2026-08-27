@@ -62,6 +62,13 @@ import {
   PolicySubjectKind,
   ResolvedPolicy,
 } from './policies.js'
+import {
+  ErasureReport,
+  HrRetention,
+  RetentionSettings,
+  SensitiveAccess,
+  SubjectAccessBundle,
+} from './privacy.js'
 
 const ws = z.object({ workspaceId: WorkspaceId })
 const t = ['hr'] as const
@@ -1258,6 +1265,120 @@ export const hrContract = {
       .route({ method: 'DELETE', path: '/fields/{fieldId}', tags: t })
       .input(ws.extend({ fieldId: z.uuid() }))
       .output(ok),
+  },
+
+  // ---------------------------------------------------------------- privacy
+  /**
+   * Subject access, erasure and retention. All four behind `hr.privacy.manage`, which is granted to
+   * nobody by default and ships in the same change as these — see `privacy.ts` for why there is one
+   * key rather than four, and why none of this is a capability.
+   */
+  privacy: {
+    /**
+     * Everything HR holds about one person, in one response.
+     *
+     * `personId` is required and there is no filter: a workspace-wide export is two and a half
+     * million rows with decrypted bank details in flight, and it is not offered.
+     *
+     * The decrypt makes this a bulk read of the sensitive record, so it writes a
+     * `sensitive_access_log` row with `via: 'export'` in the same transaction.
+     */
+    subjectAccess: baseContract
+      .route({ method: 'GET', path: '/people/{personId}/privacy/subject-access', tags: t })
+      .input(
+        ws.extend({
+          personId: z.uuid(),
+          /** Recorded on the access-log row and shown to the subject in their own bundle. */
+          purpose: z.string().max(500).nullish(),
+        }),
+      )
+      .output(SubjectAccessBundle),
+
+    /**
+     * Redact a person, and say what survived.
+     *
+     * **`dryRun` defaults to true**, which is the opposite of every other write in this module and
+     * deliberate. This is the one irreversible act HR offers, so a caller that forgets the flag has
+     * to get the preview rather than the erasure. It matters more than it reads: core generates an
+     * MCP tool from every hosted module's OpenAPI document, so a procedure with a REST route is
+     * agent-callable the day it ships, and the call made with no arguments has to be the harmless
+     * one. The preview runs the same predicates the run does and returns the same shape.
+     *
+     * Nothing is deleted. The identifying columns are cleared and every record a wage, an
+     * entitlement or an authorisation was computed from stays, listed in `kept` with the basis it
+     * survived under. Running it twice is safe and reports zero rows the second time: each step
+     * matches only rows that still have something to clear.
+     */
+    erase: baseContract
+      .route({ method: 'POST', path: '/people/{personId}/privacy/erase', tags: t })
+      .input(
+        ws.extend({
+          personId: z.uuid(),
+          dryRun: z.boolean().default(true),
+          /** Recorded on the person row. The only place this reason is kept. */
+          reason: z.string().max(500).nullish(),
+          /**
+           * Keep the national identity number.
+           *
+           * The one decision in here that is not the module's to make. A Turkish payroll audit may
+           * want it; a GDPR erasure request wants it gone first. The default clears it, the response
+           * says which was done, and `caveats` carries `nationalIdKeptForAudit` when it did not.
+           */
+          keepNationalIdForAudit: z.boolean().default(false),
+        }),
+      )
+      .output(ErasureReport),
+
+    /**
+     * Who read somebody's identity, birth date or bank details.
+     *
+     * **About yourself this carries no permission**, which is why it has no `requires()` and sits in
+     * `module.test.ts`'s `SELF_SERVICE` allowlist. Reading your own access log is a thing nobody may
+     * lack, exactly like `people.me`; a grantable key here could only ever be one somebody could be
+     * denied, and being denied sight of who has been looking at your bank details is not a state
+     * this product should be able to express.
+     *
+     * About anybody else it needs `hr.privacy.manage`, and the handler is what asks — a `personId`
+     * that is not the caller's own, or an `actorUserId` at all. The second is not a smaller question
+     * than the first: "what has this account been looking at" is an investigation into a colleague,
+     * and it is the query that makes this log something to be careful with rather than only
+     * something to be reassured by.
+     */
+    accessLog: {
+      list: baseContract
+        .route({ method: 'GET', path: '/privacy/access-log', tags: t })
+        .input(
+          ws.extend({
+            ...PageInput.shape,
+            /** Whose record. Defaults to the caller's own, which is the self-service case. */
+            personId: z.uuid().optional(),
+            /** Whose reading. Always an investigation, so always `hr.privacy.manage`. */
+            actorUserId: z.uuid().optional(),
+          }),
+        )
+        .output(page(SensitiveAccess)),
+    },
+
+    retention: {
+      /**
+       * The horizons, and — with `withCounts` — how much is already past each one.
+       *
+       * The counts are the dry run. They cost a query per class that has a horizon set, so they are
+       * asked for rather than always computed; a retention screen should ask for them.
+       */
+      get: baseContract
+        .route({ method: 'GET', path: '/privacy/retention', tags: t })
+        .input(ws.extend({ withCounts: z.boolean().default(false) }))
+        .output(RetentionSettings),
+      /**
+       * Set them. A field left out is unchanged; a field sent as `null` goes back to "keep
+       * indefinitely", which is what every class ships as.
+       */
+      set: baseContract
+        .route({ method: 'PUT', path: '/privacy/retention', tags: t })
+        .input(ws.extend({ retention: HrRetention.partial() }))
+        .output(RetentionSettings),
+    },
   },
 }
 export type HrContract = typeof hrContract

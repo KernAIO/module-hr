@@ -1,7 +1,8 @@
-import type { WorkspaceId } from '@kernhq/contracts'
+import type { Principal, WorkspaceId } from '@kernhq/contracts'
 import {
   KernError,
   type Kernel,
+  packageVersion,
   type RequestContext,
   requires,
   requiresCapability,
@@ -74,13 +75,23 @@ import {
 import { forViewer, HrAccessService, seesRecordOf, visibleSet } from './services/access.js'
 import { ApprovalService, type SubjectAppliers } from './services/approvals.js'
 import { AttendanceService } from './services/attendance.js'
+import { accessLogSort, HrAuditService } from './services/audit.js'
 import { inForceOn, todayIso } from './services/db.js'
 import { LedgerService, MINUTES_PER_DAY, yearOf } from './services/ledger.js'
 import { PeopleService } from './services/people.js'
 import { hashConfig, PolicyService } from './services/policies.js'
+import {
+  closingBalance,
+  PrivacyService,
+  RETENTION_CLASSES,
+  stripSensitiveCustom,
+} from './services/privacy.js'
 import { DEFAULT_WORKING_WEEK, ResolveService } from './services/resolve.js'
 
 const os = implement(hrContract).$context<RequestContext>()
+
+/** Shared so the ordinary case — no sensitive custom fields defined — allocates nothing per page. */
+const NO_HIDDEN_FIELDS: ReadonlySet<string> = new Set<string>()
 
 // ---------------------------------------------------------------------- pagination
 
@@ -595,6 +606,8 @@ export function implement_(kernel: Kernel) {
    * this one is built for no actor — the per-request actor arrives at `decide` below.
    */
   const approvals = new ApprovalService(kernel, subjects.appliersFor(null))
+  const privacy = new PrivacyService()
+  const audit = new HrAuditService(kernel, access)
   const db = kernel.database
   const settingsOf = (workspaceId: string) => kernel.settings.module(workspaceId, MODULE_ID, HrSettings)
 
@@ -715,11 +728,15 @@ export function implement_(kernel: Kernel) {
             : []
           const officeBy = new Map(assignments.map((a) => [a.personId, a]))
 
+          const hidden = await sensitiveCustomKeys(tx, input.workspaceId, context.principal)
+          const own = hidden.size ? await access.personIdOf(tx, input.workspaceId, context.principal) : null
+
           return {
             items: rows.map((r) =>
               forViewer(
                 {
                   ...PeopleService.toPerson(r),
+                  custom: r.id === own ? (r.custom ?? {}) : stripSensitiveCustom(r.custom ?? {}, hidden),
                   // Spreading into a fresh literal drops the branded WorkspaceId that flowed through
                   // `toPerson`, so it is restored rather than widened to `string`.
                   workspaceId: r.workspaceId as WorkspaceId,
@@ -745,8 +762,14 @@ export function implement_(kernel: Kernel) {
       get: scoped.people.get.use(requires('hr.person.view')).handler(({ input, context }) =>
         db.withWorkspace(input.workspaceId, async (tx) => {
           const visible = visibleSet(await access.visiblePersonIds(tx, input.workspaceId, context.principal))
+          const person = PeopleService.toPerson(await svc.load(tx, input.workspaceId, input.personId))
+          const hidden = await sensitiveCustomKeys(tx, input.workspaceId, context.principal)
+          const own = hidden.size ? await access.personIdOf(tx, input.workspaceId, context.principal) : null
           return forViewer(
-            PeopleService.toPerson(await svc.load(tx, input.workspaceId, input.personId)),
+            {
+              ...person,
+              custom: person.id === own ? person.custom : stripSensitiveCustom(person.custom, hidden),
+            },
             visible,
           )
         }),
@@ -3859,11 +3882,333 @@ export function implement_(kernel: Kernel) {
         return { ok: true as const }
       }),
     },
+
+    // ================================================================= privacy
+    /**
+     * Subject access, erasure and retention.
+     *
+     * `hr.privacy.manage` gates all of it except reading your own access log, and it is granted to
+     * nobody by default — so on a fresh workspace only an owner, who passes every check, can reach
+     * any of this. That is the intended starting position: whether anybody below an owner may export
+     * or erase a colleague is a decision the workspace makes deliberately, in the role editor.
+     */
+    privacy: {
+      /**
+       * Everything HR holds about one person.
+       *
+       * Two transactions rather than one, and on purpose. `PeopleService.readSensitive` opens its
+       * own so the decrypt and the `sensitive_access_log` row it writes are atomic with each other —
+       * that atomicity is the point of the log and it must not be widened into a transaction that
+       * also holds several thousand rows of punches open. The bundle's own reads then run in a
+       * second transaction. The consequence is that the two halves are a moment apart, which for a
+       * subject-access snapshot is not a property anybody depends on.
+       *
+       * The access log is read **after** the export's own row is written, so a subject's bundle
+       * always contains the read that produced it. A bundle that could not account for its own
+       * existence is the first hole somebody would find in it.
+       */
+      subjectAccess: scoped.privacy.subjectAccess
+        .use(requires('hr.privacy.manage'))
+        .handler(async ({ input, context }) => {
+          const { workspaceId, personId } = input
+          // Before anything else: this both proves the person exists and records the disclosure.
+          // Refusing here means nothing was decrypted and nothing was assembled.
+          const sensitive = await svc.readSensitive({
+            workspaceId,
+            personId,
+            principal: context.principal,
+            via: 'export',
+            purpose: input.purpose ?? null,
+          })
+
+          return db.withWorkspace(workspaceId, async (tx) => {
+            const person = await svc.load(tx, workspaceId, personId)
+            const data = await privacy.subjectAccess(tx, workspaceId, personId)
+
+            // Resolved here rather than left to the client, and included whatever the
+            // `leave_accrual` capability says: "why is my balance this number" is the commonest
+            // follow-up to a subject-access request, and it is the subject's own data either way.
+            const kinds = ['accrual', 'carry_forward', 'overtime', 'rounding', 'working_time'] as const
+            const policiesInForce = []
+            for (const kind of kinds)
+              policiesInForce.push(await policySvc.forPerson(tx, workspaceId, personId, kind, todayIso()))
+
+            const decisionsOf = (stepId: string) =>
+              data.approvals.stepDecisions
+                .filter((d) => d.stepId === stepId)
+                .map((d) => ({ ...d, decision: d.decision as 'approve' | 'reject', at: d.at.toISOString() }))
+            const toStep = (s: (typeof data.approvals.raisedSteps)[number]) => ({
+              ...s,
+              mode: s.mode as never,
+              status: s.status as never,
+              dueAt: s.dueAt?.toISOString() ?? null,
+              escalatedAt: s.escalatedAt?.toISOString() ?? null,
+              decisions: decisionsOf(s.id),
+            })
+
+            return {
+              manifest: {
+                workspaceId,
+                personId,
+                generatedAt: new Date().toISOString(),
+                generatedBy: context.principal.userId ?? null,
+                moduleVersion: packageVersion(import.meta.url),
+                truncated: data.truncated,
+                // Stated rather than left to be noticed. HR holds the metadata and the file id for
+                // every document; the bytes live in core's storage and `core.files.get` signs one
+                // download at a time, so a module cannot put them in a bundle. Naming the omission
+                // is the difference between an incomplete export and a dishonest one.
+                excluded: [{ section: 'documents.contents', reason: 'fileContentsNotExportable' as const }],
+              },
+              // The whole row, never `forViewer`: the four personnel fields it withholds from a
+              // reader are the subject's own.
+              person: PeopleService.toPerson(person),
+              sensitive,
+              employment: data.employment.map(PeopleService.toEmployment),
+              offices: data.offices.map((r) => ({ ...r, createdAt: r.createdAt.toISOString() })),
+              history: data.history.map((r) => ({
+                id: r.id,
+                field: r.field,
+                from: r.from ?? null,
+                to: r.to ?? null,
+                at: r.at.toISOString(),
+                actorId: r.actorId,
+                source: r.source,
+              })),
+              documents: data.documents.map((r) => ({ ...r, createdAt: r.createdAt.toISOString() })),
+              leave: {
+                types: data.leave.types.map(toLeaveType),
+                requests: data.leave.requests.map(toLeaveRequest),
+                days: data.leave.days.map((r) => ({
+                  id: r.id,
+                  requestId: r.requestId,
+                  date: r.date,
+                  fraction: Number.parseFloat(r.fraction),
+                  counted: r.counted,
+                  status: r.status,
+                })),
+                ledger: data.leave.ledger.map(toLedgerEntry),
+                closingBalanceMinutes: closingBalance(data.leave.ledger),
+              },
+              attendance: {
+                punches: data.attendance.punches.map(toPunch),
+                days: data.attendance.days.map(toAttendanceDay),
+              },
+              regularizations: data.regularizations.map(toRegularization),
+              approvals: {
+                raised: data.approvals.raised.map((r) => ({
+                  ...r,
+                  subjectType: r.subjectType as never,
+                  status: r.status as never,
+                  // The requester is the subject of this bundle, so the name is already loaded —
+                  // and after an erasure it is the tombstone token, which is the right answer.
+                  requesterName: person.displayName,
+                  requestedAt: r.requestedAt.toISOString(),
+                  decidedAt: r.decidedAt?.toISOString() ?? null,
+                  steps: data.approvals.raisedSteps.filter((s) => s.requestId === r.id).map(toStep),
+                })),
+                approverOn: data.approvals.approverOn.map(toStep),
+                decisions: data.approvals.decisions.map((d) => ({
+                  ...d,
+                  decision: d.decision as 'approve' | 'reject',
+                  at: d.at.toISOString(),
+                })),
+              },
+              delegations: {
+                given: data.delegations.given.map(toDelegation),
+                received: data.delegations.received.map(toDelegation),
+              },
+              policiesInForce,
+              accessLog: data.accessLog.map(HrAuditService.toEntry),
+            }
+          })
+        }),
+
+      /**
+       * Redact a person, or say what redacting them would do.
+       *
+       * One transaction for the whole erasure: a half-run erasure is worse than a refused one, and a
+       * partial one is not something anybody could tell had happened. It is replayable as well as
+       * atomic — every step matches only rows that still have something to clear — so the recovery
+       * from any failure is to run it again.
+       *
+       * The dry run takes the same transaction and rolls nothing back because it writes nothing; it
+       * runs the identical predicates, which is what stops a preview drifting from the act.
+       */
+      erase: scoped.privacy.erase.use(requires('hr.privacy.manage')).handler(async ({ input, context }) => {
+        const result = await db.withWorkspace(input.workspaceId, (tx) =>
+          privacy.erase(tx, {
+            workspaceId: input.workspaceId,
+            personId: input.personId,
+            dryRun: input.dryRun,
+            reason: input.reason ?? null,
+            keepNationalIdForAudit: input.keepNationalIdForAudit,
+            actorUserId: context.principal.userId ?? null,
+          }),
+        )
+        // Only a real run moved anything. A dry run that pushed a realtime change would blank the
+        // person's card on every open screen in the workspace for a preview nobody committed.
+        if (!input.dryRun) await changed(input.workspaceId, 'person', input.personId, 'updated')
+        return {
+          workspaceId: input.workspaceId,
+          personId: input.personId,
+          dryRun: input.dryRun,
+          erasedAt: result.erasedAt?.toISOString() ?? null,
+          displayName: result.displayName,
+          redacted: result.redacted,
+          kept: result.kept,
+          caveats: result.caveats,
+          filesRemaining: result.filesRemaining,
+        }
+      }),
+
+      accessLog: {
+        /**
+         * Who read this person's sensitive fields.
+         *
+         * **No `requires()`, and that is the whole design of this procedure.** Reading your own
+         * access log is a thing nobody may lack — a grantable key here could only ever be one
+         * somebody could be *denied*, and "you may not see who has been looking at your bank
+         * details" is not a state this product should be able to express. It is in
+         * `module.test.ts`'s `SELF_SERVICE` allowlist for that reason, beside `people.me`.
+         *
+         * The permission check is in the handler because it depends on the arguments: any
+         * `personId` that is not the caller's own, and any `actorUserId` at all. The second is not
+         * the smaller case — "what has this account been looking at" is an investigation into a
+         * colleague, and it is the query that makes this log a thing to be careful with rather than
+         * only a thing to be reassured by.
+         */
+        list: scoped.privacy.accessLog.list.handler(({ input, context }) =>
+          db.withWorkspace(input.workspaceId, async (tx) => {
+            const own = await access.personIdOf(tx, input.workspaceId, context.principal)
+            const aboutSomebodyElse = input.personId !== undefined && input.personId !== own
+            const isInvestigation = input.actorUserId !== undefined
+            if (aboutSomebodyElse || isInvestigation)
+              await kernel.authz.require(context.principal, 'hr.privacy.manage', {
+                kind: 'workspace',
+                workspaceId: input.workspaceId,
+              })
+            // A member who was never made a person has no log of their own and no permission to
+            // read anybody's. Refusing beats returning an empty page, which reads as "nobody has
+            // ever looked at your record" — an answer, and the wrong one.
+            if (!aboutSomebodyElse && !isInvestigation && !own) throw KernError.notFound('Person')
+
+            const cursor = decodeCursor(input.cursor)
+            const rows = await audit.list(tx, {
+              workspaceId: input.workspaceId,
+              personId: input.personId ?? own ?? undefined,
+              actorUserId: input.actorUserId,
+              limit: input.limit,
+              after: cursor ? after(accessLogSort.at, accessLogSort.id, 'desc', cursor) : undefined,
+            })
+            // `atText`, never the `Date`: one export writes its rows in a single insert, so they
+            // share `now()` to the microsecond, and a millisecond-truncated cursor drops every row
+            // that ties with the last one on the page.
+            const { items, nextCursor } = paginate(rows, input.limit, (r) => [r.atText, r.id])
+            // No `total`. Counting an append-only log a subject scrolls through costs a second scan
+            // of the same rows to answer a question nobody asked, and `page()` makes it optional
+            // precisely so a list can decline.
+            return { items: items.map(HrAuditService.toEntry), nextCursor }
+          }),
+        ),
+      },
+
+      retention: {
+        /**
+         * The horizons, and what is already past them.
+         *
+         * `sweepEnabled` is a literal `false` in the contract, and it says the thing this feature
+         * must not imply: nothing in HR deletes on a timer. The horizons are read here, to count
+         * what has passed one, and by `privacy.erase`, to say under which horizon each surviving
+         * class was kept. An unattended job that prunes personnel records is the one act in this
+         * module that cannot be undone by re-running anything, so it ships off, with a dry run and
+         * a per-run report naming every person it touched — and until it exists, saying so in the
+         * response is what keeps this screen from promising it.
+         */
+        get: scoped.privacy.retention.get.use(requires('hr.privacy.manage')).handler(({ input }) =>
+          db.withWorkspace(input.workspaceId, async (tx) => {
+            const { retention, updatedAt, updatedBy } = await privacy.retention(tx, input.workspaceId)
+            const counts = input.withCounts
+              ? await privacy.retentionCounts(tx, input.workspaceId, retention)
+              : null
+            return {
+              workspaceId: input.workspaceId,
+              classes: RETENTION_CLASSES.map((cls) => ({
+                class: cls,
+                days: retention[cls],
+                dueNow: counts?.[cls] ?? null,
+              })),
+              updatedAt: updatedAt?.toISOString() ?? null,
+              updatedBy,
+              sweepEnabled: false as const,
+            }
+          }),
+        ),
+
+        set: scoped.privacy.retention.set.use(requires('hr.privacy.manage')).handler(({ input, context }) =>
+          db.withWorkspace(input.workspaceId, async (tx) => {
+            const { retention, updatedAt, updatedBy } = await privacy.setRetention(
+              tx,
+              input.workspaceId,
+              input.retention,
+              context.principal.userId ?? null,
+            )
+            // The counts are not recomputed on a write: a screen that has just changed a horizon
+            // asks for them again, and doing eight counts inside the write transaction would hold
+            // it open across the most expensive queries in this file.
+            return {
+              workspaceId: input.workspaceId,
+              classes: RETENTION_CLASSES.map((cls) => ({
+                class: cls,
+                days: retention[cls],
+                dueNow: null,
+              })),
+              updatedAt: updatedAt?.toISOString() ?? null,
+              updatedBy,
+              sweepEnabled: false as const,
+            }
+          }),
+        ),
+      },
+    },
   })
 
   // ------------------------------------------------------------------ helpers
   // Closures over `kernel` and `db`, kept at the bottom so the router above reads as a list of
   // procedures rather than a list of procedures interrupted by plumbing.
+
+  /**
+   * The `people.custom` keys this reader may not be shown.
+   *
+   * `custom_field_defs.sensitive` has been declared, stored, editable and documented as "needs
+   * `hr.person.view_sensitive`, like a national identity number" since the day custom fields
+   * shipped — and until now **nothing read it**. `toPerson` returns `custom` whole and `forViewer`
+   * narrows only the four personnel fields, so a field an administrator deliberately marked
+   * sensitive went to every holder of `hr.person.view`, which is a `member` default. That is the
+   * same defect as a permission key nothing asks about, one level down, and it is why the fix lands
+   * here rather than waiting for a screen.
+   *
+   * Empty for a reader who holds the permission, and empty for a workspace with no sensitive fields
+   * — which is the ordinary case and the one that must not pay for this. Archived definitions are
+   * still counted: `fields.archive` deliberately leaves the values in `people.custom`, so an
+   * archived sensitive field is a sensitive value with its guard removed.
+   *
+   * A person always sees their own, which is the same rule `people.me` follows: a permission you
+   * would need to read your own record is one nobody may lack.
+   */
+  async function sensitiveCustomKeys(
+    tx: Tx,
+    workspaceId: string,
+    principal: Principal,
+  ): Promise<ReadonlySet<string>> {
+    if (await kernel.authz.can(principal, 'hr.person.view_sensitive', { kind: 'workspace', workspaceId }))
+      return NO_HIDDEN_FIELDS
+    const rows = await tx
+      .select({ key: customFieldDefs.key })
+      .from(customFieldDefs)
+      .where(and(eq(customFieldDefs.workspaceId, workspaceId), eq(customFieldDefs.sensitive, true)))
+    return rows.length ? new Set(rows.map((r) => r.key)) : NO_HIDDEN_FIELDS
+  }
 
   async function loadOffice(tx: Tx, input: { workspaceId: string; officeId: string }) {
     const [row] = await tx

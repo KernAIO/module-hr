@@ -71,6 +71,21 @@ export const Person = z.object({
    * from data the directory does not even fetch. So the one place that does the nulling says so.
    */
   personnelHidden: z.boolean().default(false),
+  /**
+   * When this person's record was erased on request, or null.
+   *
+   * Erasure is redaction, not deletion: the identifying columns are cleared and the rows a payroll
+   * audit needs survive against a person who is no longer nameable. So an erased record still
+   * appears — in a headcount, behind a ledger entry, as the subject of an approval from two years
+   * ago — and a screen that cannot tell it apart from an ordinary one shows a blank name and lets
+   * the reader conclude the record is broken.
+   *
+   * The date rather than a boolean, because the two questions a reader has are "is this erased" and
+   * "when", and the first is `!== null`. `erasedBy` and `erasureReason` are deliberately *not* here:
+   * they answer an administrator's question, not a directory's, and putting them on the model every
+   * screen fetches would spread them further than the act they describe.
+   */
+  erasedAt: Timestamp.nullable(),
   createdAt: Timestamp,
   updatedAt: Timestamp,
 })

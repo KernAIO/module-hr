@@ -1,7 +1,10 @@
+import type { Principal, WorkspaceId } from '@kernhq/contracts'
 import { KernError, type Kernel, type Tx, uuidv7 } from '@kernhq/kernel'
 import { and, eq, isNull, sql } from 'drizzle-orm'
-import type { EmploymentType, HrSettings, PersonStatus } from '../../contract/index.js'
-import { employments, officeAssignments, people, personHistory } from '../schema.js'
+import type { EmploymentType, HrSettings, PersonSensitive, PersonStatus } from '../../contract/index.js'
+import { employments, officeAssignments, people, peopleSensitive, personHistory } from '../schema.js'
+import { HrAccessService } from './access.js'
+import { fieldsPresent, HrAuditService, type SensitiveReadVia, viaFor } from './audit.js'
 import { isOpen, todayIso } from './db.js'
 
 /** Row shapes the router turns into contract objects. */
@@ -17,7 +20,87 @@ export type EmploymentRow = typeof employments.$inferSelect
  * a validation error instead of a race.
  */
 export class PeopleService {
-  constructor(private readonly kernel: Kernel) {}
+  private readonly audit: HrAuditService
+
+  constructor(private readonly kernel: Kernel) {
+    this.audit = new HrAuditService(kernel, new HrAccessService(kernel))
+  }
+
+  /**
+   * Read a person's identity number, birth date and bank details — and record that it happened.
+   *
+   * **The decryption and the record are one function because they have to be one decision.** The
+   * router used to select, decrypt and return inline, and "every path that decrypts also logs" was
+   * then a rule somebody had to remember at each new call site: the subject-access export is the
+   * second such path and would have been the first chance to forget. Here there is nothing to
+   * remember. `kernel.secrets.decrypt` is called on these columns in exactly one place in the
+   * module, and it is this one, five lines above the insert that records it.
+   *
+   * ## A failure to record fails the read, and that is the decision
+   *
+   * The insert is in the same transaction as the select, on the same database, so if it fails the
+   * transaction rolls back and the caller gets an error instead of a national identity number.
+   *
+   * That direction is deliberate, and the argument for it is that the alternative buys almost
+   * nothing. The insert has no failure mode the select does not already have — a lost connection, a
+   * full disk, an unset `app.workspace_id`. There is no realistic world in which the read is healthy
+   * and the record alone fails, so catching it would not keep a working feature working; it would
+   * only convert the rare broken case from a loud error into a silent hole. And a hole is the exact
+   * failure this log exists to prevent: a subject-access response assembled from a log with gaps
+   * states in writing that nobody read a record that was read, which is worse than no log at all,
+   * because it is wrong with authority. Refusing is also the safer half of the trade in the other
+   * direction — the plaintext never leaves the process, because the transaction that would have
+   * returned it did not commit.
+   *
+   * The cost is real and worth naming: if this table or its policy is ever broken, sensitive reads
+   * stop rather than degrade. For this class of data that is the correct outcome, and it is a loud
+   * one somebody fixes in minutes instead of a quiet one nobody discovers until a regulator asks.
+   *
+   * The best-effort copy sent to core's activity feed falls the other way — see `HrAuditService`.
+   * It is sent after the transaction has committed, so a read that rolled back is never announced.
+   *
+   * `purpose` is recorded only where a caller has a real one to give, which today means an export
+   * run against a subject-access request. `sensitive.get` passes `null`: its contract has no field
+   * for a reason and inventing one would put a sentence in the reader's mouth.
+   */
+  async readSensitive(input: {
+    workspaceId: WorkspaceId
+    personId: string
+    principal: Principal
+    /** Omitted for an ordinary request, where the principal says it. Passed by a bulk reader. */
+    via?: SensitiveReadVia
+    purpose?: string | null
+  }): Promise<PersonSensitive> {
+    const { workspaceId, personId } = input
+    const via = input.via ?? viaFor(input.principal)
+    const { value, reader, access } = await this.kernel.database.withWorkspace(workspaceId, async (tx) => {
+      // Before the select, so an unattributable reader is refused without the row ever being loaded.
+      const reader = await this.audit.readerFor(tx, workspaceId, input.principal, via, input.purpose ?? null)
+      const [row] = await tx
+        .select()
+        .from(peopleSensitive)
+        .where(and(eq(peopleSensitive.workspaceId, workspaceId), eq(peopleSensitive.personId, personId)))
+        .limit(1)
+      const value: PersonSensitive = {
+        personId,
+        workspaceId,
+        nationalId: row?.nationalIdEnc ? this.kernel.secrets.decrypt(row.nationalIdEnc) : null,
+        birthDate: row?.birthDate ?? null,
+        iban: row?.ibanEnc ? this.kernel.secrets.decrypt(row.ibanEnc) : null,
+        emergencyContact: (row?.emergencyContact as PersonSensitive['emergencyContact']) ?? null,
+      }
+      // `fieldsPresent(value)` and not the columns selected: what is recorded is what came back, so a
+      // record holding only a birth date is not filed as though the bank details had been read too.
+      const access = [{ personId, fields: fieldsPresent(value) }]
+      await this.audit.record(tx, workspaceId, reader, access)
+      return { value, reader, access }
+    })
+    // After the commit, never inside it: a mirror sent from a transaction that then rolled back
+    // announces a read that did not happen. The same `access` the row was written from, so the
+    // console and the evidence cannot drift apart.
+    await this.audit.mirror(workspaceId, reader, access)
+    return value
+  }
 
   /** Serialise a row for the wire. Postgres `numeric` arrives as a string; the contract says number. */
   static toPerson(row: PersonRow) {
@@ -31,6 +114,7 @@ export class PeopleService {
       // False here and set true by `forViewer` alone, which is the only thing that withholds these
       // fields. A record that never passed through it was never redacted.
       personnelHidden: false,
+      erasedAt: row.erasedAt?.toISOString() ?? null,
       createdAt: row.createdAt.toISOString(),
       updatedAt: row.updatedAt.toISOString(),
     }

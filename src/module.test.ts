@@ -84,6 +84,13 @@ const SELF_SERVICE = new Set([
   // `decide` checks that the caller is on the step, which is stronger than any grantable key: a
   // permission would let somebody approve a request they were never asked about.
   'approvals.decide',
+  // Reading the record of who has looked at *your* identity number is the one thing on this list
+  // that would be perverse to gate: a permission to see your own access log is a permission to be
+  // told who read your bank details, and nobody may lack that. So the handler checks identity
+  // instead, and asks for `hr.privacy.manage` in the two cases that are not self-service — a
+  // `personId` that is somebody else, and any `actorUserId` at all, since "what has this account
+  // been looking at" is an investigation rather than a question about yourself.
+  'privacy.accessLog.list',
 ])
 
 describe('every procedure is authorised', () => {
