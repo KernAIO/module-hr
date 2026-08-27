@@ -58,7 +58,7 @@ export const en: Record<string, Message> = {
   'hr.accr_days_field_hint': 'Before seniority tiers, proration and part-time hours.',
   'hr.accr_days_per_year': { one: '{count} day a year', other: '{count} days a year' },
   'hr.accr_desc':
-    'How leave is earned over time: the policies, who each one applies to, and what the next run would credit.',
+    'How leave is earned over time and what survives the turn of the year: the policies, who each one applies to, and what the next run would credit.',
   'hr.accr_duplicate': 'Duplicate',
   'hr.accr_edit_retroactive':
     'An edit rewrites what was true in the past, and anything already credited from it becomes hard to explain. To change the rules from a date, duplicate this policy and give the copy a later start.',
@@ -287,6 +287,7 @@ export const en: Record<string, Message> = {
   'hr.att_corrections_error': 'Corrections you have asked for could not be loaded',
   'hr.att_corrections_pending': 'Corrections you have asked for',
   'hr.att_locked_no_change': 'This month is closed for payroll, so a correction cannot move its figures.',
+  'hr.att_method_auto': 'Closed automatically',
   'hr.att_method_device': 'Terminal',
   'hr.att_method_import': 'Imported',
   'hr.att_method_kiosk': 'Kiosk',
@@ -491,6 +492,44 @@ export const en: Record<string, Message> = {
   'hr.capability_off_title': 'Turn {name} off?',
   'hr.capability_requires': 'Needs {name}',
   'hr.capability_write_error': 'That switch could not be changed. Nothing was saved.',
+  'hr.cf_cap': 'Days that carry over',
+  'hr.cf_cap_hint':
+    'The most that survives the turn of the year. Anything above it lapses, and the ledger records the lapse.',
+  'hr.cf_cap_zero':
+    'Nothing carries at zero: the whole remaining balance is written off on 31 December, as an expiry entry somebody can point at.',
+  'hr.cf_carries_nothing': 'Nothing carries',
+  'hr.cf_col_carries': 'Carries over',
+  'hr.cf_col_deadline': 'Deadline',
+  'hr.cf_create_title': 'New carry-forward policy',
+  'hr.cf_deadline_short': { one: '{count} month to use it', other: '{count} months to use it' },
+  'hr.cf_edit_title': 'Edit carry-forward policy',
+  'hr.cf_error': 'Carry-forward policies could not be loaded',
+  'hr.cf_error_leave_type': 'Pick the leave type it carries.',
+  'hr.cf_expires': 'Carried leave expires',
+  'hr.cf_expires_hint':
+    'Counted from 1 January, when the new leave year opens — not from the day the job runs.',
+  'hr.cf_job_note':
+    "A job carries the balance over on each office's own 2 January, once December has been credited, and takes carried leave away on the day it lapses. Both halves are written to the ledger.",
+  'hr.cf_leave_type_hint': 'Which balance carries over.',
+  'hr.cf_months': 'Months to use it',
+  'hr.cf_months_hint':
+    'Between 1 and 24. Three months means carried leave survives the whole of March and is gone on 1 April.',
+  'hr.cf_needs_accrual':
+    'There is no accrual policy, so nothing can carry: a cap in days needs the length of a working day, and only an accrual policy states one.',
+  'hr.cf_needs_accrual_note':
+    'The cap is in days, and only an accrual policy says how long a day is. Somebody with no accrual policy carries nothing at all.',
+  'hr.cf_no_deadline': 'No deadline',
+  'hr.cf_no_default':
+    'No carry-forward policy sits on the workspace, so anybody with nothing nearer keeps nothing at the turn of the year.',
+  'hr.cf_none': 'No carry-forward policies yet',
+  'hr.cf_none_desc':
+    'Nothing moves into the new year without one. An unused balance stays in the year it was earned, and the new year starts from what accrues in it.',
+  'hr.cf_section': 'Carry-forward',
+  'hr.cf_section_desc':
+    'What is left when a leave year ends: how much of it survives into the next one, and how long there is to use it.',
+  'hr.cf_unassign_no_fallback':
+    'There is no carry-forward policy on any rung below this one, so nothing of theirs carries into the new year.',
+  'hr.cf_unassign_title': 'Stop carrying leave for {subject}?',
   'hr.chain_actions_for': 'Actions for {name}',
   'hr.chain_add_approver': 'Add an approver',
   'hr.chain_add_step': 'Add a step',
@@ -1125,7 +1164,7 @@ export const en: Record<string, Message> = {
   'hr.periods_kind_hint': 'What the month is closed for. Either kind closes the same days.',
   'hr.periods_lock': 'Close',
   'hr.periods_lock_adjustments':
-    'A policy change dated inside it becomes an adjustment in an open period instead. You can reopen the period later, with a reason.',
+    'A policy change dated inside it leaves those days exactly as they were closed, so anything it owes has to be recorded by hand as an adjustment in an open period. You can reopen the period later, with a reason.',
   'hr.periods_lock_body': 'Every recorded day inside this period stops being recomputable, for {scope}.',
   'hr.periods_lock_confirm': 'Close the period',
   'hr.periods_lock_error': 'The period could not be closed',
@@ -1176,6 +1215,9 @@ export const en: Record<string, Message> = {
   'hr.person_create_error': 'This person could not be added — nothing was saved',
   'hr.person_created': '{name} is in the directory',
   'hr.person_error': 'This person could not be loaded',
+  'hr.person_hidden': 'Hidden',
+  'hr.person_hidden_hint':
+    'Personal contact details and employment dates are shown only for the people you are responsible for.',
   'hr.person_manage_denied': 'You cannot add people to this workspace',
   'hr.person_offboard_error': 'The employment could not be ended — nothing was changed',
   'hr.person_offboarded': '{name} has left',
@@ -1184,8 +1226,10 @@ export const en: Record<string, Message> = {
   'hr.person_updated': 'Saved',
   'hr.personal_email': 'Personal email',
   'hr.phone': 'Phone',
+  'hr.policy_kind_accrual': 'Accrual',
+  'hr.policy_kind_carry_forward': 'Carry-forward',
   'hr.reject': 'Reject',
-  'hr.reject_confirm_body': 'They are notified and nothing changes for them. They can send a new request.',
+  'hr.reject_confirm_body': 'Nothing changes for them. They can send a new request.',
   'hr.reject_confirm_title': 'Reject this request?',
   'hr.request_leave': 'Request time off',
   'hr.retry': 'Try again',
@@ -1209,7 +1253,7 @@ export const en: Record<string, Message> = {
   'hr.schedule_assigned': '{name} is on this schedule from {date}',
   'hr.schedule_auto_out': 'Close a forgotten shift after',
   'hr.schedule_auto_out_hint':
-    'Somebody who never clocks out is clocked out automatically once this long has passed, and the day is flagged for review. Left off, the day waits for a correction.',
+    'Somebody who never clocks out is clocked out automatically once this long has passed, and the day counts as that long rather than staying marked unfinished. Left off, the day stays open and waits for a correction.',
   'hr.schedule_auto_out_off': 'Leave it for a human',
   'hr.schedule_break': 'Break',
   'hr.schedule_break_hint': "The break is unpaid and comes off the day's total.",
@@ -1387,7 +1431,7 @@ export const ar: Record<string, Message> = {
     other: '{count} يوم سنويًا',
   },
   'hr.accr_desc':
-    'كيف تُكتسب الإجازة مع الوقت: السياسات، ومن تنطبق عليه كل واحدة، وما الذي ستضيفه عملية التشغيل التالية.',
+    'كيف تُكتسب الإجازة مع الوقت وما الذي يعبر رأس السنة: السياسات، ومن تنطبق عليه كل واحدة، وما الذي ستضيفه عملية التشغيل التالية.',
   'hr.accr_duplicate': 'نسخ',
   'hr.accr_edit_retroactive':
     'التحرير يعيد كتابة ما كان صحيحًا في الماضي، فيصعب تفسير كل ما أُضيف بناءً عليه. لتغيير القواعد اعتبارًا من تاريخ معيّن، انسخ هذه السياسة وامنح النسخة تاريخ بدء لاحقًا.',
@@ -1674,6 +1718,7 @@ export const ar: Record<string, Message> = {
   'hr.att_corrections_error': 'تعذّر تحميل التصحيحات التي طلبتها',
   'hr.att_corrections_pending': 'التصحيحات التي طلبتها',
   'hr.att_locked_no_change': 'أُغلق هذا الشهر للرواتب، فلا يستطيع التصحيح تغيير أرقامه.',
+  'hr.att_method_auto': 'أُغلق تلقائيًا',
   'hr.att_method_device': 'جهاز',
   'hr.att_method_import': 'مستورد',
   'hr.att_method_kiosk': 'كشك',
@@ -1887,6 +1932,48 @@ export const ar: Record<string, Message> = {
   'hr.capability_off_title': 'إيقاف {name}؟',
   'hr.capability_requires': 'يتطلب {name}',
   'hr.capability_write_error': 'تعذّر تغيير هذا المفتاح. لم يُحفظ أي شيء.',
+  'hr.cf_cap': 'الأيام التي تُرحَّل',
+  'hr.cf_cap_hint': 'هذا أقصى ما يعبر رأس السنة. وما زاد عليه تنتهي صلاحيته، ويسجّل الدفتر ذلك.',
+  'hr.cf_cap_zero':
+    'عند الصفر لا يُرحَّل شيء: يُشطب الرصيد المتبقي كله في 31 ديسمبر بقيد انتهاء صلاحية يمكن الإشارة إليه.',
+  'hr.cf_carries_nothing': 'لا شيء يُرحَّل',
+  'hr.cf_col_carries': 'المُرحَّل',
+  'hr.cf_col_deadline': 'المهلة',
+  'hr.cf_create_title': 'سياسة ترحيل جديدة',
+  'hr.cf_deadline_short': {
+    zero: '{count} شهر للاستخدام',
+    one: 'شهر واحد للاستخدام',
+    two: 'شهران للاستخدام',
+    few: '{count} أشهر للاستخدام',
+    many: '{count} شهرًا للاستخدام',
+    other: '{count} شهر للاستخدام',
+  },
+  'hr.cf_edit_title': 'تعديل سياسة الترحيل',
+  'hr.cf_error': 'تعذّر تحميل سياسات الترحيل',
+  'hr.cf_error_leave_type': 'اختر نوع الإجازة الذي يُرحَّل.',
+  'hr.cf_expires': 'الإجازة المُرحَّلة تنتهي صلاحيتها',
+  'hr.cf_expires_hint': 'تُحتسب من 1 يناير، حين تبدأ سنة الإجازات الجديدة، لا من يوم تشغيل المهمة.',
+  'hr.cf_job_note':
+    'تُرحّل مهمة تلقائية الرصيدَ في الثاني من يناير بتوقيت كل مكتب، بعد إضافة ديسمبر، وتسحب الإجازة المُرحَّلة في اليوم الذي تنتهي فيه صلاحيتها. ويُسجَّل النصفان كلاهما في الدفتر.',
+  'hr.cf_leave_type_hint': 'أي رصيد يُرحَّل.',
+  'hr.cf_months': 'المهلة بالأشهر',
+  'hr.cf_months_hint': 'بين 1 و24. ثلاثة أشهر تعني أن الإجازة المُرحَّلة تبقى طوال مارس وتنتهي في 1 أبريل.',
+  'hr.cf_needs_accrual':
+    'لا توجد سياسة استحقاق، لذلك لا يمكن ترحيل شيء: السقف بالأيام يحتاج طول يوم العمل، ولا تذكره إلا سياسة الاستحقاق.',
+  'hr.cf_needs_accrual_note':
+    'السقف بالأيام، ولا تقول طولَ اليوم إلا سياسة الاستحقاق. ومن لا سياسة استحقاق له لا يُرحَّل له شيء إطلاقًا.',
+  'hr.cf_no_deadline': 'بلا مهلة',
+  'hr.cf_no_default':
+    'لا توجد سياسة ترحيل على مستوى مساحة العمل، لذلك لا يحتفظ بشيء عند رأس السنة كل من لا تنطبق عليه سياسة أقرب.',
+  'hr.cf_none': 'لا توجد سياسات ترحيل بعد',
+  'hr.cf_none_desc':
+    'بدون سياسة كهذه لا ينتقل شيء إلى السنة الجديدة. الرصيد غير المستخدم يبقى في السنة التي اكتُسب فيها، وتبدأ السنة الجديدة بما يُكتسب فيها.',
+  'hr.cf_section': 'الترحيل',
+  'hr.cf_section_desc':
+    'ما يتبقّى عند نهاية سنة الإجازات: كم منه ينتقل إلى السنة التالية، وكم من الوقت يبقى لاستخدامه.',
+  'hr.cf_unassign_no_fallback':
+    'لا توجد سياسة ترحيل على أي درجة أدنى من هذه، فلا ينتقل لهم شيء إلى السنة الجديدة.',
+  'hr.cf_unassign_title': 'إيقاف الترحيل لـ {subject}؟',
   'hr.chain_actions_for': 'إجراءات {name}',
   'hr.chain_add_approver': 'إضافة موقّع',
   'hr.chain_add_step': 'إضافة خطوة',
@@ -2602,7 +2689,7 @@ export const ar: Record<string, Message> = {
   'hr.periods_kind_hint': 'سبب إغلاق الشهر. وكلا النوعين يُغلق الأيام نفسها.',
   'hr.periods_lock': 'إغلاق',
   'hr.periods_lock_adjustments':
-    'أي تغيير في السياسات يقع تاريخه داخلها يصبح تسوية في فترة مفتوحة بدل ذلك. ويمكنك إعادة فتح الفترة لاحقاً مع ذكر السبب.',
+    'أي تغيير في السياسات يقع تاريخه داخلها يترك تلك الأيام كما أُغلقت، فما يترتّب عليه يُسجَّل يدويًا كتسوية في فترة مفتوحة. ويمكنك إعادة فتح الفترة لاحقاً مع ذكر السبب.',
   'hr.periods_lock_body': 'كل يوم مسجَّل داخل هذه الفترة يتوقف عن قابلية إعادة الاحتساب، بالنسبة إلى {scope}.',
   'hr.periods_lock_confirm': 'إغلاق الفترة',
   'hr.periods_lock_error': 'تعذّر إغلاق الفترة',
@@ -2659,6 +2746,8 @@ export const ar: Record<string, Message> = {
   'hr.person_create_error': 'تعذّرت إضافة هذا الشخص — لم يُحفظ شيء',
   'hr.person_created': 'أُضيف {name} إلى الدليل',
   'hr.person_error': 'تعذّر تحميل سجل هذا الشخص',
+  'hr.person_hidden': 'مخفي',
+  'hr.person_hidden_hint': 'تظهر بيانات الاتصال الشخصية وتواريخ التوظيف للأشخاص المسؤول عنهم فقط.',
   'hr.person_manage_denied': 'ليست لديك صلاحية إضافة أشخاص إلى مساحة العمل هذه',
   'hr.person_offboard_error': 'تعذّر إنهاء التوظيف — لم يتغيّر شيء',
   'hr.person_offboarded': 'غادر {name}',
@@ -2667,8 +2756,10 @@ export const ar: Record<string, Message> = {
   'hr.person_updated': 'حُفظ',
   'hr.personal_email': 'البريد الشخصي',
   'hr.phone': 'الهاتف',
+  'hr.policy_kind_accrual': 'استحقاق',
+  'hr.policy_kind_carry_forward': 'ترحيل',
   'hr.reject': 'رفض',
-  'hr.reject_confirm_body': 'يصله إشعار ولا يتغيّر شيء بالنسبة له. يمكنه إرسال طلب جديد.',
+  'hr.reject_confirm_body': 'لا يتغيّر شيء بالنسبة له. يمكنه إرسال طلب جديد.',
   'hr.reject_confirm_title': 'رفض هذا الطلب؟',
   'hr.request_leave': 'طلب إجازة',
   'hr.retry': 'أعد المحاولة',
@@ -2692,7 +2783,7 @@ export const ar: Record<string, Message> = {
   'hr.schedule_assigned': '{name} على هذه المناوبة اعتبارًا من {date}',
   'hr.schedule_auto_out': 'إغلاق المناوبة المنسية بعد',
   'hr.schedule_auto_out_hint':
-    'من ينسى تسجيل الانصراف يُسجَّل انصرافه تلقائيًا بعد هذه المدة، ويُعلَّم اليوم للمراجعة. وإذا كان الخيار متوقفًا، ينتظر اليوم تصحيحًا.',
+    'من ينسى تسجيل الانصراف يُسجَّل انصرافه تلقائيًا بعد هذه المدة، وتُحتسب له هذه المدة بدل أن يبقى اليوم معلَّمًا كغير مكتمل. وإذا كان الخيار متوقفًا، يبقى اليوم مفتوحًا في انتظار تصحيح.',
   'hr.schedule_auto_out_off': 'اتركها لشخص',
   'hr.schedule_break': 'الاستراحة',
   'hr.schedule_break_hint': 'الاستراحة غير مدفوعة وتُخصم من إجمالي اليوم.',
@@ -2855,7 +2946,7 @@ export const de: Record<string, Message> = {
   'hr.accr_days_field_hint': 'Vor Senioritätsstufen, anteiliger Berechnung und Teilzeitstunden.',
   'hr.accr_days_per_year': { one: '{count} Tag pro Jahr', other: '{count} Tage pro Jahr' },
   'hr.accr_desc':
-    'Wie Urlaub über die Zeit entsteht: die Regeln, für wen jede gilt, und was der nächste Lauf gutschreiben würde.',
+    'Wie Urlaub mit der Zeit entsteht und was den Jahreswechsel übersteht: die Regeln, für wen jede gilt, und was der nächste Lauf gutschreiben würde.',
   'hr.accr_duplicate': 'Duplizieren',
   'hr.accr_edit_retroactive':
     'Eine Änderung schreibt auch die Vergangenheit um, und alles daraus bereits Gutgeschriebene lässt sich kaum noch erklären. Um die Regeln ab einem Datum zu ändern, duplizieren Sie diese Regel und geben der Kopie einen späteren Beginn.',
@@ -3096,6 +3187,7 @@ export const de: Record<string, Message> = {
   'hr.att_corrections_pending': 'Von Ihnen beantragte Korrekturen',
   'hr.att_locked_no_change':
     'Dieser Monat ist für die Lohnabrechnung geschlossen; eine Korrektur ändert seine Zahlen nicht mehr.',
+  'hr.att_method_auto': 'Automatisch geschlossen',
   'hr.att_method_device': 'Terminal',
   'hr.att_method_import': 'Importiert',
   'hr.att_method_kiosk': 'Kiosk',
@@ -3310,6 +3402,44 @@ export const de: Record<string, Message> = {
   'hr.capability_off_title': '{name} ausschalten?',
   'hr.capability_requires': 'Erfordert {name}',
   'hr.capability_write_error': 'Dieser Schalter konnte nicht geändert werden. Es wurde nichts gespeichert.',
+  'hr.cf_cap': 'Tage, die übertragen werden',
+  'hr.cf_cap_hint':
+    'Höchstens so viel übersteht den Jahreswechsel. Alles darüber verfällt, und das Konto hält den Verfall fest.',
+  'hr.cf_cap_zero':
+    'Bei null wird nichts übertragen: der gesamte Restsaldo wird am 31. Dezember abgeschrieben — als Verfallsbuchung, auf die man zeigen kann.',
+  'hr.cf_carries_nothing': 'Kein Übertrag',
+  'hr.cf_col_carries': 'Übertrag',
+  'hr.cf_col_deadline': 'Frist',
+  'hr.cf_create_title': 'Neue Übertragsregel',
+  'hr.cf_deadline_short': { one: '{count} Monat Zeit', other: '{count} Monate Zeit' },
+  'hr.cf_edit_title': 'Übertragsregel bearbeiten',
+  'hr.cf_error': 'Die Übertragsregeln konnten nicht geladen werden',
+  'hr.cf_error_leave_type': 'Wählen Sie die Abwesenheitsart, die übertragen wird.',
+  'hr.cf_expires': 'Übertragener Urlaub verfällt',
+  'hr.cf_expires_hint':
+    'Gezählt ab dem 1. Januar, wenn das neue Urlaubsjahr beginnt — nicht ab dem Tag, an dem der Job läuft.',
+  'hr.cf_job_note':
+    'Ein Job überträgt den Saldo am jeweils eigenen 2. Januar jedes Standorts, sobald der Dezember gutgeschrieben ist, und nimmt übertragenen Urlaub an dem Tag weg, an dem er verfällt. Beide Hälften stehen im Konto.',
+  'hr.cf_leave_type_hint': 'Welcher Saldo übertragen wird.',
+  'hr.cf_months': 'Monate Zeit',
+  'hr.cf_months_hint':
+    'Zwischen 1 und 24. Drei Monate heißt: übertragener Urlaub gilt den ganzen März und ist am 1. April weg.',
+  'hr.cf_needs_accrual':
+    'Es gibt keine Anspruchsregel, also kann nichts übertragen werden: eine Obergrenze in Tagen braucht die Länge eines Arbeitstages, und die steht nur in einer Anspruchsregel.',
+  'hr.cf_needs_accrual_note':
+    'Die Obergrenze steht in Tagen, und nur eine Anspruchsregel sagt, wie lang ein Tag ist. Wer keine Anspruchsregel hat, überträgt überhaupt nichts.',
+  'hr.cf_no_deadline': 'Ohne Frist',
+  'hr.cf_no_default':
+    'Auf dem Arbeitsbereich liegt keine Übertragsregel — wer keine nähere hat, behält zum Jahreswechsel nichts.',
+  'hr.cf_none': 'Noch keine Übertragsregeln',
+  'hr.cf_none_desc':
+    'Ohne eine solche Regel geht nichts ins neue Jahr über. Ein nicht genommener Saldo bleibt in dem Jahr, in dem er entstanden ist, und das neue Jahr beginnt mit dem, was in ihm entsteht.',
+  'hr.cf_section': 'Übertrag',
+  'hr.cf_section_desc':
+    'Was am Ende eines Urlaubsjahres übrig ist: wie viel davon ins nächste Jahr übergeht und wie lange Zeit bleibt, es zu nehmen.',
+  'hr.cf_unassign_no_fallback':
+    'Auf keiner Stufe darunter liegt eine Übertragsregel — es geht nichts von ihnen ins neue Jahr über.',
+  'hr.cf_unassign_title': 'Übertrag für {subject} beenden?',
   'hr.chain_actions_for': 'Aktionen für {name}',
   'hr.chain_add_approver': 'Freigebende Person hinzufügen',
   'hr.chain_add_step': 'Schritt hinzufügen',
@@ -3970,7 +4100,7 @@ export const de: Record<string, Message> = {
   'hr.periods_kind_hint': 'Wofür der Monat geschlossen wird. Beide Arten schließen dieselben Tage.',
   'hr.periods_lock': 'Schließen',
   'hr.periods_lock_adjustments':
-    'Eine Richtlinienänderung mit einem Datum darin wird stattdessen zu einer Korrektur in einem offenen Zeitraum. Sie können den Zeitraum später mit einer Begründung wieder öffnen.',
+    'Eine Richtlinienänderung mit einem Datum darin lässt diese Tage genau so, wie sie geschlossen wurden; was sich daraus ergibt, muss von Hand als Korrektur in einem offenen Zeitraum erfasst werden. Sie können den Zeitraum später mit einer Begründung wieder öffnen.',
   'hr.periods_lock_body': 'Jeder erfasste Tag in diesem Zeitraum wird nicht mehr neu berechnet, für {scope}.',
   'hr.periods_lock_confirm': 'Zeitraum schließen',
   'hr.periods_lock_error': 'Der Zeitraum konnte nicht geschlossen werden',
@@ -4022,6 +4152,9 @@ export const de: Record<string, Message> = {
   'hr.person_create_error': 'Diese Person konnte nicht hinzugefügt werden — es wurde nichts gespeichert',
   'hr.person_created': '{name} steht im Verzeichnis',
   'hr.person_error': 'Der Eintrag dieser Person konnte nicht geladen werden',
+  'hr.person_hidden': 'Ausgeblendet',
+  'hr.person_hidden_hint':
+    'Private Kontaktdaten und Beschäftigungsdaten werden nur für die Personen angezeigt, für die Sie zuständig sind.',
   'hr.person_manage_denied': 'Sie dürfen zu diesem Workspace keine Personen hinzufügen',
   'hr.person_offboard_error': 'Die Beschäftigung konnte nicht beendet werden — es wurde nichts geändert',
   'hr.person_offboarded': '{name} ist ausgeschieden',
@@ -4030,9 +4163,10 @@ export const de: Record<string, Message> = {
   'hr.person_updated': 'Gespeichert',
   'hr.personal_email': 'Private E-Mail',
   'hr.phone': 'Telefon',
+  'hr.policy_kind_accrual': 'Anspruch',
+  'hr.policy_kind_carry_forward': 'Übertrag',
   'hr.reject': 'Ablehnen',
-  'hr.reject_confirm_body':
-    'Die Person wird benachrichtigt; für sie ändert sich nichts. Sie kann einen neuen Antrag stellen.',
+  'hr.reject_confirm_body': 'Für die Person ändert sich nichts. Sie kann einen neuen Antrag stellen.',
   'hr.reject_confirm_title': 'Diesen Antrag ablehnen?',
   'hr.request_leave': 'Abwesenheit beantragen',
   'hr.retry': 'Erneut versuchen',
@@ -4056,7 +4190,7 @@ export const de: Record<string, Message> = {
   'hr.schedule_assigned': '{name} steht ab {date} auf diesem Modell',
   'hr.schedule_auto_out': 'Vergessene Schicht schließen nach',
   'hr.schedule_auto_out_hint':
-    'Wer sich nicht ausstempelt, wird nach dieser Zeit automatisch ausgestempelt, und der Tag wird zur Prüfung markiert. Ist die Option aus, wartet der Tag auf eine Korrektur.',
+    'Wer sich nicht ausstempelt, wird nach dieser Zeit automatisch ausgestempelt, und der Tag zählt diese Zeit, statt weiter als unfertig markiert zu bleiben. Ist die Option aus, bleibt der Tag offen und wartet auf eine Korrektur.',
   'hr.schedule_auto_out_off': 'Einem Menschen überlassen',
   'hr.schedule_break': 'Pause',
   'hr.schedule_break_hint': 'Die Pause ist unbezahlt und wird vom Tagesergebnis abgezogen.',
@@ -4224,7 +4358,7 @@ export const fa: Record<string, Message> = {
   'hr.accr_days_field_hint': 'پیش از پله‌های سابقه، محاسبهٔ نسبی و ساعت‌های پاره‌وقت.',
   'hr.accr_days_per_year': { one: '{count} روز در سال', other: '{count} روز در سال' },
   'hr.accr_desc':
-    'اینکه مرخصی به‌مرور چطور تعلق می‌گیرد: قاعده‌ها، اینکه هرکدام برای چه کسی است، و اجرای بعدی چه چیزی اضافه می‌کند.',
+    'مرخصی چطور به مرور به دست می‌آید و چه چیزی از سرِ سال عبور می‌کند: قاعده‌ها، اینکه هرکدام برای چه کسی است، و اجرای بعدی چه چیزی اضافه می‌کند.',
   'hr.accr_duplicate': 'رونوشت',
   'hr.accr_edit_retroactive':
     'ویرایش، چیزی را که در گذشته درست بوده هم بازنویسی می‌کند و توضیح‌دادن آنچه از آن اضافه شده سخت می‌شود. برای تغییر قاعده از یک تاریخ به بعد، از این قاعده رونوشت بگیرید و به رونوشت شروع دیرتری بدهید.',
@@ -4448,6 +4582,7 @@ export const fa: Record<string, Message> = {
   'hr.att_corrections_error': 'اصلاح‌هایی که خواسته‌اید بارگذاری نشد',
   'hr.att_corrections_pending': 'اصلاح‌هایی که خواسته‌اید',
   'hr.att_locked_no_change': 'این ماه برای حقوق و دستمزد بسته شده و اصلاح، ارقام آن را جابه‌جا نمی‌کند.',
+  'hr.att_method_auto': 'بستن خودکار',
   'hr.att_method_device': 'دستگاه',
   'hr.att_method_import': 'واردشده',
   'hr.att_method_kiosk': 'کیوسک',
@@ -4651,6 +4786,43 @@ export const fa: Record<string, Message> = {
   'hr.capability_off_title': '{name} خاموش شود؟',
   'hr.capability_requires': 'نیاز به {name}',
   'hr.capability_write_error': 'این کلید تغییر نکرد. چیزی ذخیره نشد.',
+  'hr.cf_cap': 'روزهایی که منتقل می‌شوند',
+  'hr.cf_cap_hint':
+    'بیشترین چیزی که از سرِ سال عبور می‌کند. هر چه بیشتر از آن باشد منقضی می‌شود و دفتر آن را ثبت می‌کند.',
+  'hr.cf_cap_zero':
+    'با صفر چیزی منتقل نمی‌شود: تمام ماندهٔ باقی در ۳۱ دسامبر با یک ثبتِ انقضا که می‌شود به آن اشاره کرد، حذف می‌شود.',
+  'hr.cf_carries_nothing': 'چیزی منتقل نمی‌شود',
+  'hr.cf_col_carries': 'انتقال',
+  'hr.cf_col_deadline': 'مهلت',
+  'hr.cf_create_title': 'قاعدهٔ انتقالی تازه',
+  'hr.cf_deadline_short': { one: '{count} ماه فرصت', other: '{count} ماه فرصت' },
+  'hr.cf_edit_title': 'ویرایش قاعدهٔ انتقالی',
+  'hr.cf_error': 'قاعده‌های انتقالی بارگذاری نشد',
+  'hr.cf_error_leave_type': 'نوع مرخصی‌ای که منتقل می‌شود را انتخاب کنید.',
+  'hr.cf_expires': 'مرخصی منتقل‌شده منقضی می‌شود',
+  'hr.cf_expires_hint':
+    'از یکم ژانویه، وقتی سال مرخصی تازه باز می‌شود، شمرده می‌شود — نه از روزی که کار خودکار اجرا می‌شود.',
+  'hr.cf_job_note':
+    'یک کار خودکار، دوم ژانویهٔ خودِ هر دفتر و پس از آنکه دسامبر اضافه شد، مانده را منتقل می‌کند و مرخصی منتقل‌شده را روزی که منقضی می‌شود برمی‌دارد. هر دو نیمه در دفتر ثبت می‌شود.',
+  'hr.cf_leave_type_hint': 'کدام مانده منتقل می‌شود.',
+  'hr.cf_months': 'مهلت (ماه)',
+  'hr.cf_months_hint': 'بین ۱ تا ۲۴. سه ماه یعنی مرخصی منتقل‌شده تمام مارس هست و یکم آوریل دیگر نیست.',
+  'hr.cf_needs_accrual':
+    'هیچ قاعدهٔ انباشتی نیست، پس چیزی نمی‌تواند منتقل شود: سقفی که به روز است طول یک روز کاری را لازم دارد و فقط قاعدهٔ انباشت آن را می‌گوید.',
+  'hr.cf_needs_accrual_note':
+    'سقف به روز است و فقط قاعدهٔ انباشت می‌گوید یک روز چقدر است. کسی که قاعدهٔ انباشت ندارد اصلاً چیزی منتقل نمی‌کند.',
+  'hr.cf_no_deadline': 'بی‌مهلت',
+  'hr.cf_no_default':
+    'هیچ قاعدهٔ انتقالی روی فضای کاری نیست، پس هرکس قاعدهٔ نزدیک‌تری نداشته باشد سرِ سال نو چیزی برایش نمی‌ماند.',
+  'hr.cf_none': 'هنوز قاعدهٔ انتقالی نیست',
+  'hr.cf_none_desc':
+    'بدون چنین قاعده‌ای چیزی به سال جدید نمی‌رود. ماندهٔ استفاده‌نشده در همان سالی که به دست آمده می‌ماند و سال جدید از آنچه در خودش انباشته می‌شود شروع می‌کند.',
+  'hr.cf_section': 'انتقالی',
+  'hr.cf_section_desc':
+    'آنچه در پایان سال مرخصی می‌ماند: چقدرش به سال بعد می‌رود و چقدر وقت هست که استفاده شود.',
+  'hr.cf_unassign_no_fallback':
+    'در هیچ پلهٔ پایین‌تر از این، قاعدهٔ انتقالی نیست؛ پس چیزی از آن‌ها به سال بعد نمی‌رود.',
+  'hr.cf_unassign_title': 'انتقالی برای {subject} متوقف شود؟',
   'hr.chain_actions_for': 'کارهای {name}',
   'hr.chain_add_approver': 'افزودن تأییدکننده',
   'hr.chain_add_step': 'افزودن مرحله',
@@ -5284,7 +5456,7 @@ export const fa: Record<string, Message> = {
   'hr.periods_kind_hint': 'ماه برای چه بسته می‌شود. هر دو نوع همان روزها را می‌بندند.',
   'hr.periods_lock': 'بستن',
   'hr.periods_lock_adjustments':
-    'تغییر سیاستی که تاریخش درون دوره باشد، به‌جای بازنویسی، در یک دورهٔ باز به اصلاحیه تبدیل می‌شود. بعداً می‌توانید دوره را با ذکر دلیل بازگشایی کنید.',
+    'تغییر سیاستی که تاریخش درون دوره باشد، آن روزها را همان‌گونه که بسته شده‌اند رها می‌کند؛ پس هرچه از آن برمی‌آید باید دستی به‌صورت اصلاحیه در یک دورهٔ باز ثبت شود. بعداً می‌توانید دوره را با ذکر دلیل بازگشایی کنید.',
   'hr.periods_lock_body': 'هر روز ثبت‌شده در این دوره برای {scope} دیگر بازمحاسبه نمی‌شود.',
   'hr.periods_lock_confirm': 'بستن دوره',
   'hr.periods_lock_error': 'دوره بسته نشد',
@@ -5335,6 +5507,9 @@ export const fa: Record<string, Message> = {
   'hr.person_create_error': 'این فرد اضافه نشد — چیزی ذخیره نشد',
   'hr.person_created': '{name} به فهرست اضافه شد',
   'hr.person_error': 'پروندهٔ این فرد بارگیری نشد',
+  'hr.person_hidden': 'پنهان',
+  'hr.person_hidden_hint':
+    'اطلاعات تماس شخصی و تاریخ‌های استخدام تنها برای افرادی نمایش داده می‌شود که مسئول آن‌ها هستید.',
   'hr.person_manage_denied': 'شما اجازهٔ افزودن فرد به این فضای کاری را ندارید',
   'hr.person_offboard_error': 'پایان همکاری ثبت نشد — چیزی عوض نشد',
   'hr.person_offboarded': '{name} رفته است',
@@ -5343,9 +5518,10 @@ export const fa: Record<string, Message> = {
   'hr.person_updated': 'ذخیره شد',
   'hr.personal_email': 'ایمیل شخصی',
   'hr.phone': 'تلفن',
+  'hr.policy_kind_accrual': 'انباشت',
+  'hr.policy_kind_carry_forward': 'انتقالی',
   'hr.reject': 'رد',
-  'hr.reject_confirm_body':
-    'به او اطلاع داده می‌شود و چیزی برایش تغییر نمی‌کند. می‌تواند درخواست تازه‌ای بفرستد.',
+  'hr.reject_confirm_body': 'چیزی برایش تغییر نمی‌کند. می‌تواند درخواست تازه‌ای بفرستد.',
   'hr.reject_confirm_title': 'این درخواست رد شود؟',
   'hr.request_leave': 'درخواست مرخصی',
   'hr.retry': 'تلاش دوباره',
@@ -5369,7 +5545,7 @@ export const fa: Record<string, Message> = {
   'hr.schedule_assigned': '{name} از {date} روی این شیفت است',
   'hr.schedule_auto_out': 'بستن خودکار شیفت فراموش‌شده پس از',
   'hr.schedule_auto_out_hint':
-    'کسی که خروج نزده، پس از این مدت به‌طور خودکار خارج می‌شود و آن روز برای بررسی علامت می‌خورد. اگر خاموش باشد، روز منتظر اصلاح می‌ماند.',
+    'کسی که خروج نزده، پس از این مدت به‌طور خودکار خارج می‌شود و همان مدت برای آن روز حساب می‌شود، به‌جای اینکه روز ناتمام علامت بخورد. اگر خاموش باشد، روز باز می‌ماند و منتظر اصلاح است.',
   'hr.schedule_auto_out_off': 'به عهدهٔ یک نفر بگذار',
   'hr.schedule_break': 'استراحت',
   'hr.schedule_break_hint': 'استراحت بدون حقوق است و از مجموع روز کم می‌شود.',
@@ -5533,7 +5709,7 @@ export const tr: Record<string, Message> = {
   'hr.accr_days_field_hint': 'Kıdem kademeleri, oranlama ve yarı zamanlı saatler uygulanmadan önce.',
   'hr.accr_days_per_year': { one: 'Yılda {count} gün', other: 'Yılda {count} gün' },
   'hr.accr_desc':
-    'İznin zamanla nasıl hak edildiği: kurallar, her birinin kime uygulandığı ve bir sonraki çalıştırmanın ne ekleyeceği.',
+    'İznin zamanla nasıl hak edildiği ve yıl dönümünden nelerin geçtiği: kurallar, her birinin kime uygulandığı ve bir sonraki çalıştırmanın ne ekleyeceği.',
   'hr.accr_duplicate': 'Kopyala',
   'hr.accr_edit_retroactive':
     'Bir düzenleme geçmişte doğru olanı da değiştirir ve buradan eklenmiş her şeyin açıklanması zorlaşır. Kuralları belirli bir tarihten itibaren değiştirmek için bu kuralı kopyalayın ve kopyaya daha geç bir başlangıç verin.',
@@ -5762,6 +5938,7 @@ export const tr: Record<string, Message> = {
   'hr.att_corrections_error': 'İstediğiniz düzeltmeler yüklenemedi',
   'hr.att_corrections_pending': 'İstediğiniz düzeltmeler',
   'hr.att_locked_no_change': 'Bu ay bordro için kapatıldı; düzeltme rakamları değiştiremez.',
+  'hr.att_method_auto': 'Otomatik kapatıldı',
   'hr.att_method_device': 'Terminal',
   'hr.att_method_import': 'Aktarıldı',
   'hr.att_method_kiosk': 'Kiosk',
@@ -5964,6 +6141,43 @@ export const tr: Record<string, Message> = {
   'hr.capability_off_title': '{name} kapatılsın mı?',
   'hr.capability_requires': '{name} gerekir',
   'hr.capability_write_error': 'Bu anahtar değiştirilemedi. Hiçbir şey kaydedilmedi.',
+  'hr.cf_cap': 'Devreden gün sayısı',
+  'hr.cf_cap_hint': 'Yıl dönümünü en fazla bu kadarı geçer. Üstü kalan süresi dolar ve defter bunu kaydeder.',
+  'hr.cf_cap_zero':
+    "Sıfırda hiçbir şey devretmez: kalan bakiyenin tamamı 31 Aralık'ta, gösterilebilir bir 'süresi doldu' kaydıyla silinir.",
+  'hr.cf_carries_nothing': 'Devir yok',
+  'hr.cf_col_carries': 'Devreden',
+  'hr.cf_col_deadline': 'Son kullanım',
+  'hr.cf_create_title': 'Yeni devir kuralı',
+  'hr.cf_deadline_short': { one: '{count} ay süre', other: '{count} ay süre' },
+  'hr.cf_edit_title': 'Devir kuralını düzenle',
+  'hr.cf_error': 'Devir kuralları yüklenemedi',
+  'hr.cf_error_leave_type': 'Hangi izin türünü devredeceğini seçin.',
+  'hr.cf_expires': 'Devreden izin süresi dolar',
+  'hr.cf_expires_hint':
+    "Yeni izin yılının başladığı 1 Ocak'tan itibaren sayılır; işin çalıştığı günden değil.",
+  'hr.cf_job_note':
+    "Bir iş, her ofisin kendi 2 Ocak'ında, aralık eklendikten sonra bakiyeyi devreder ve devredilen izni süresi dolduğu gün geri alır. İki yarısı da deftere yazılır.",
+  'hr.cf_leave_type_hint': 'Hangi bakiyenin devredeceği.',
+  'hr.cf_months': 'Kullanım süresi (ay)',
+  'hr.cf_months_hint':
+    "1 ile 24 arasında. Üç ay demek, devreden izin mart ayı boyunca geçerlidir ve 1 Nisan'da yoktur.",
+  'hr.cf_needs_accrual':
+    'Hakediş kuralı yok, bu yüzden hiçbir şey devredemez: gün cinsinden bir üst sınır, bir iş gününün uzunluğuna ihtiyaç duyar ve bunu yalnızca bir hakediş kuralı söyler.',
+  'hr.cf_needs_accrual_note':
+    'Üst sınır gün cinsindendir ve bir günün ne kadar sürdüğünü yalnızca hakediş kuralı söyler. Hakediş kuralı olmayan hiçbir şey devretmez.',
+  'hr.cf_no_deadline': 'Süresiz',
+  'hr.cf_no_default':
+    'Çalışma alanında bir devir kuralı yok; daha yakın bir kuralı olmayan hiç kimse yıl dönümünde hiçbir şey saklamıyor.',
+  'hr.cf_none': 'Henüz devir kuralı yok',
+  'hr.cf_none_desc':
+    'Böyle bir kural olmadan yeni yıla hiçbir şey geçmez. Kullanılmayan bakiye hak edildiği yılda kalır ve yeni yıl, o yıl hak edilenle başlar.',
+  'hr.cf_section': 'Devir',
+  'hr.cf_section_desc':
+    'Bir izin yılı bittiğinde kalanlar: ne kadarı gelecek yıla geçer ve kullanmak için ne kadar süre kalır.',
+  'hr.cf_unassign_no_fallback':
+    'Bunun altındaki hiçbir basamakta devir kuralı yok; bu yüzden onlardan yeni yıla hiçbir şey geçmez.',
+  'hr.cf_unassign_title': '{subject} için devir dursun mu?',
   'hr.chain_actions_for': '{name} için işlemler',
   'hr.chain_add_approver': 'Onaylayan ekle',
   'hr.chain_add_step': 'Adım ekle',
@@ -6602,7 +6816,7 @@ export const tr: Record<string, Message> = {
   'hr.periods_kind_hint': 'Ayın ne için kapatıldığı. İki tür de aynı günleri kapatır.',
   'hr.periods_lock': 'Kapat',
   'hr.periods_lock_adjustments':
-    'Tarihi dönemin içine düşen bir politika değişikliği, geçmişi yeniden yazmak yerine açık bir dönemde düzeltmeye dönüşür. Dönemi daha sonra gerekçesini yazarak yeniden açabilirsiniz.',
+    'Tarihi dönemin içine düşen bir politika değişikliği o günleri kapatıldıkları hâlde bırakır; doğurduğu fark açık bir dönemde elle düzeltme olarak kaydedilmelidir. Dönemi daha sonra gerekçesini yazarak yeniden açabilirsiniz.',
   'hr.periods_lock_body': 'Bu dönemdeki her kayıtlı gün {scope} için yeniden hesaplanamaz olur.',
   'hr.periods_lock_confirm': 'Dönemi kapat',
   'hr.periods_lock_error': 'Dönem kapatılamadı',
@@ -6653,6 +6867,9 @@ export const tr: Record<string, Message> = {
   'hr.person_create_error': 'Bu kişi eklenemedi — hiçbir şey kaydedilmedi',
   'hr.person_created': '{name} dizine eklendi',
   'hr.person_error': 'Bu kişinin kaydı yüklenemedi',
+  'hr.person_hidden': 'Gizli',
+  'hr.person_hidden_hint':
+    'Kişisel iletişim bilgileri ve çalışma tarihleri yalnızca sorumlu olduğunuz kişiler için gösterilir.',
   'hr.person_manage_denied': 'Bu çalışma alanına kişi ekleme yetkiniz yok',
   'hr.person_offboard_error': 'İş bitirilemedi — hiçbir şey değişmedi',
   'hr.person_offboarded': '{name} ayrıldı',
@@ -6661,8 +6878,10 @@ export const tr: Record<string, Message> = {
   'hr.person_updated': 'Kaydedildi',
   'hr.personal_email': 'Kişisel e-posta',
   'hr.phone': 'Telefon',
+  'hr.policy_kind_accrual': 'Hakediş',
+  'hr.policy_kind_carry_forward': 'Devir',
   'hr.reject': 'Reddet',
-  'hr.reject_confirm_body': 'Bildirim alır ve kendisi için hiçbir şey değişmez. Yeni bir talep gönderebilir.',
+  'hr.reject_confirm_body': 'Kendisi için hiçbir şey değişmez. Yeni bir talep gönderebilir.',
   'hr.reject_confirm_title': 'Bu talep reddedilsin mi?',
   'hr.request_leave': 'İzin talep et',
   'hr.retry': 'Yeniden dene',
@@ -6686,7 +6905,7 @@ export const tr: Record<string, Message> = {
   'hr.schedule_assigned': '{name}, {date} tarihinden itibaren bu vardiyada',
   'hr.schedule_auto_out': 'Unutulan çıkışı şu süre sonra kapat',
   'hr.schedule_auto_out_hint':
-    'Çıkış yapmayı unutan kişi bu süre dolunca otomatik olarak çıkarılır ve gün incelemeye işaretlenir. Kapalıyken gün bir düzeltme bekler.',
+    'Çıkış yapmayı unutan kişi bu süre dolunca otomatik olarak çıkarılır ve gün, tamamlanmamış olarak işaretli kalmak yerine bu kadar sayılır. Kapalıyken gün açık kalır ve bir düzeltme bekler.',
   'hr.schedule_auto_out_off': 'Bir insana bırak',
   'hr.schedule_break': 'Mola',
   'hr.schedule_break_hint': 'Mola ücretsizdir ve günün toplamından düşülür.',

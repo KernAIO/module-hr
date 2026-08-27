@@ -23,10 +23,18 @@ export function canHr(permission: HrPermission): boolean {
 }
 
 /**
- * Whether the viewer can see anybody's record but their own.
+ * Whether the viewer reads the personnel record behind a directory card, for anybody but themselves.
  *
- * Three widths that do not imply one another — a country HR manager must not silently become a
- * global one — so "can this person open somebody else's page" is asked once, here.
+ * Not "can they open somebody else's page" — everybody can, and should. `hr.person.view` is a
+ * `member` default and the directory is meant to be read. What the three widening keys decide is
+ * how much of each person comes back: personal email, phone, hire date and termination date are the
+ * personnel record, and the server nulls all four for anybody outside the reader's scope.
+ *
+ * The three do not imply one another — a country HR manager must not silently become a global one —
+ * so a screen asks the union once, here. It is only a hint: which *people* fall inside a team or an
+ * office is resolved on the server from the org chart, so a screen may not conclude from `true`
+ * that a particular person's record is readable. Render what came back; use this to decide whether
+ * a "personal details" section is worth offering at all.
  */
-export const canSeeOthers = (): boolean =>
+export const canSeeFullRecords = (): boolean =>
   canHr('personViewTeam') || canHr('personViewOffice') || canHr('personViewAll')

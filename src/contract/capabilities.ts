@@ -82,6 +82,16 @@ export const hrCapabilities = defineCapabilities([
     // Off by default. Plenty of companies grant a fixed allowance on 1 January and never accrue —
     // and for them an accrual engine is a screen full of settings that change nothing.
     defaultEnabled: false,
+    // Carry-forward and expiry are named here because they are part of the same switch: a
+    // `carry_forward` policy is a `policies` row, and every `policies.*` procedure is gated by
+    // *this* capability rather than by `leave` — the `leave_accrual` list in
+    // `hrCapabilityProcedures` below names all eight, and each carries `cap('leave_accrual')` in
+    // `src/server/router.ts`. There is no `policies` capability; the whole record type lives behind
+    // accrual, which is why switching accrual off takes carry-forward and expiry with it. The
+    // policy is written on the accrual settings screen beside the accrual policies. The engine had
+    // both from the start (`carryForward`, the `carry-forward` job, `carry_in` / `carry_out` /
+    // `expiry` in the ledger) while nothing could write the policy, which is the one way this
+    // description was ever untrue: the product did it and no administrator could reach it.
     level: 2,
   },
   {

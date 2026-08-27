@@ -24,12 +24,18 @@ export const HrSettings = z.object({
   /** Employee numbers are generated from this when a person is created without one. */
   employeeNumberPrefix: z.string().max(8).default(''),
   employeeNumberNext: z.number().int().min(1).default(1),
-  /**
-   * Whether a member who is not in HR can see the directory at all.
+  /*
+   * `directoryVisibleToMembers` was declared here and removed. The idea is sound — some companies
+   * publish their org chart to everyone and some treat it as HR-only, which is coarser than
+   * `hr.person.view` and would sit above it — but nothing read the field, and no route in shell
+   * renders a module settings schema, so it could not be flipped through the product either. A
+   * setting whose documented rule nothing enforces teaches an administrator that settings do not
+   * mean anything, which is the same failure as a capability nothing checks.
    *
-   * Some companies publish their org chart to everyone; some treat it as HR-only. This is coarser
-   * than the permission and sits above it: off, and `hr.person.view` is not enough on its own.
+   * Bringing it back honestly needs both halves in the change that declares it: an enforcement site
+   * (`people.list` and `people.get` in `src/server/services/people.ts`, refusing a caller who has
+   * only `hr.person.view` while the flag is off), and a way for an administrator to reach it —
+   * a control on `src/client/settings/GeneralSettings.svelte`, which is already routed.
    */
-  directoryVisibleToMembers: z.boolean().default(true),
 })
 export type HrSettings = z.infer<typeof HrSettings>

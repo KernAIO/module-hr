@@ -25,6 +25,7 @@ import { getHrApi } from '../api-instance.js'
 import DecisionDialog from '../components/DecisionDialog.svelte'
 import PersonFormDialog from '../components/PersonFormDialog.svelte'
 import PersonPanel from '../components/PersonPanel.svelte'
+import { personnelVisibility } from '../components/redaction.js'
 import { t } from '../i18n.js'
 import type { ApprovalRequest } from '../index.js'
 import { canHr, HR_CAPABILITIES } from '../permissions.js'
@@ -426,6 +427,23 @@ function localTime(timezone: string | null, _tick: number): string | null {
 const started = (iso: string | null) =>
   iso ? formatDate(`${iso}T00:00:00`, { month: 'short', year: 'numeric' }) : '—'
 
+/**
+ * Whether this row's start date is blank because the server withheld it.
+ *
+ * The hire date is one of the four fields `HrAccessService` nulls for a reader outside its scope,
+ * and it arrives here as a null like any other — so the em dash this column drew for it said
+ * "never started", about everybody in the company, to every colleague without a widening key.
+ *
+ * `personnelVisibility` answers `unknown` for a reader whose scope only the server can resolve, and
+ * an unknown row keeps the dash: a dash over an empty field is imprecise, and "Hidden" over one is
+ * a lie. Both are marked once, under the table, rather than per row.
+ */
+const startWithheld = (person: { userId: string | null; hiredOn: string | null }) =>
+  !person.hiredOn && personnelVisibility(person) === 'withheld'
+
+/** Whether anything on the page is actually marked — the sentence must not outlive the marks. */
+const anyWithheld = $derived(people.some(startWithheld))
+
 /** `formatCount` caps at 99 for badges. A headcount is a real number and must not read "99+". */
 const count = (n: number) => formatCount(n, Number.MAX_SAFE_INTEGER)
 
@@ -543,7 +561,11 @@ const tileCount = (n: number | null) => (n === null ? '—' : count(n))
               </span>
               <span class="cell role" role="cell">{person.employeeNo ?? '—'}</span>
               <span class="cell muted" role="cell">{person.officeName ?? '—'}</span>
-              <span class="cell muted" role="cell">{started(person.hiredOn)}</span>
+              <span class="cell muted" role="cell">
+                {#if startWithheld(person)}
+                  <span class="withheld"><Icon name="eye-off" size={12} strokeWidth={1.8} />{t('person_hidden')}</span>
+                {:else}{started(person.hiredOn)}{/if}
+              </span>
               <span class="cell num" role="cell" title={person.timezone ?? ''}>{time ?? '—'}</span>
               <span class="cell" role="cell">
                 <Badge tone={statusTone(person.status)}>{statusLabel(person.status)}</Badge>
@@ -572,6 +594,14 @@ const tileCount = (n: number | null) => (n === null ? '—' : count(n))
         <EmptyState icon="search" title={t('no_people_match')} description={t('no_people_match_search')} />
       {:else}
         <EmptyState icon="users" title={t('no_people')} description={t('no_people_desc')} />
+      {/if}
+
+      <!--
+        Once for the table, not once per row. A marked cell says which fact is missing and this says
+        why it is missing — a column of "Hidden" with nothing accounting for it reads as a fault.
+      -->
+      {#if anyWithheld}
+        <p class="hint">{t('person_hidden_hint')}</p>
       {/if}
     </section>
 
@@ -758,6 +788,20 @@ const tileCount = (n: number | null) => (n === null ? '—' : count(n))
 }
 .role {
   font-size: 13px;
+}
+/* A colour, never opacity, for the same reason `.sub` and `.muted` above use one. */
+.withheld {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-inline-size: 0;
+}
+.hint {
+  margin: 10px 0 0;
+  max-inline-size: 68ch;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--kern-ink-500);
 }
 .num {
   font-size: 13px;

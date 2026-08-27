@@ -28,6 +28,9 @@ export class PeopleService {
       // consumer; the column is only ever written from the same union.
       status: row.status as PersonStatus,
       custom: row.custom ?? {},
+      // False here and set true by `forViewer` alone, which is the only thing that withholds these
+      // fields. A record that never passed through it was never redacted.
+      personnelHidden: false,
       createdAt: row.createdAt.toISOString(),
       updatedAt: row.updatedAt.toISOString(),
     }

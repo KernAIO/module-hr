@@ -2429,7 +2429,10 @@ describe('the auto clock-out sweep', () => {
     const rows = await punchesOf(forgot)
     const closed = rows.filter((r) => r.direction === 'out')
     expect(closed).toHaveLength(1)
-    expect(closed[0]?.note).toBe('Closed automatically: no clock-out recorded')
+    // The method, not a note. The note used to be an English sentence composed on the server —
+    // before anyone knew who would read it — so it reached a Persian screen in English. `auto` is
+    // what the timeline actually labels from, so it is the thing worth asserting.
+    expect(closed[0]?.method).toBe('auto')
     // Ten hours after the punch that opened it, not ten hours after the sweep noticed.
     expect(closed[0]?.at.getTime()).toBe(rows.find((r) => r.direction === 'in')!.at.getTime() + 600 * 60_000)
   })
@@ -3209,7 +3212,7 @@ describe("the jobs, in each office's own calendar", () => {
       const closed = rows.filter((r) => r.direction === 'out')
       expect(closed).toHaveLength(1)
       expect(closed[0]?.timezone).toBe(IST)
-      expect(closed[0]?.note).toBe('Closed automatically: no clock-out recorded')
+      expect(closed[0]?.method).toBe('auto')
     })
   })
 

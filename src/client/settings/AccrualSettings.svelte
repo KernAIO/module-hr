@@ -30,8 +30,10 @@ import { createMutation, createQuery, useQueryClient } from '@tanstack/svelte-qu
 // `AccrualConfig` is imported as a value on purpose — see `configOf`.
 import {
   AccrualConfig,
+  CarryForwardConfig,
   type Policy,
   type PolicyAssignment,
+  type PolicyKind,
   type PolicySubjectKind,
   SUBJECT_PRIORITY,
 } from '../../contract/policies.js'
@@ -46,7 +48,7 @@ import { formatDays, formatDuration, hrKeys, isoDate, monthRange } from '../quer
  *
  * Switching `leave_accrual` on used to start an hourly job and give nobody a way to look at it: the
  * policies existed, the ladder existed, the preview existed, and none of the three had a caller. So
- * three things justify this screen, and everything on it serves one of them.
+ * four things justify this screen, and everything on it serves one of them.
  *
  * **A policy is data, and the data has to say when leave appears.** All four frequencies are
  * implemented and each answers a different question — a twelfth every month, the whole year on one
@@ -65,6 +67,14 @@ import { formatDays, formatDuration, hrKeys, isoDate, monthRange } from '../quer
  * the run button lives inside the preview dialog and is disabled until there are numbers on screen.
  * A credit cannot be undone from here — it is corrected with a leave adjustment — which is exactly
  * why an admin gets to read it first.
+ *
+ * **What is earned has to survive the turn of the year, and that is a second policy.** The engine
+ * has always carried a capped balance forward and expired the rest — `carryForward`, the
+ * `carry-forward` job, and `carry_in` / `carry_out` / `expiry` in the ledger — but a
+ * `carry_forward` policy could not be written from anywhere, so the capability card promised
+ * carry-forward and expiry and an admin could reach neither. Both kinds are `policies` rows on one
+ * ladder, resolved independently of each other, so they share this screen's assign dialog and are
+ * told apart by a badge rather than by two ladders that would each hide half the answer.
  */
 const api = getHrApi()
 const queryClient = useQueryClient()
@@ -104,6 +114,16 @@ const freqLabel = (frequency: Frequency): string =>
       : frequency === 'anniversary'
         ? t('accr_freq_anniversary')
         : t('accr_freq_per_hour')
+
+/**
+ * Which of the two kinds a row is.
+ *
+ * Only `accrual` and `carry_forward` ever reach this screen: both queries below name their kind, so
+ * nothing else is ever in the arrays this labels. A third kind shown here would read as "Accrual"
+ * and would have to be given its own branch on the way in.
+ */
+const kindLabel = (kind: PolicyKind): string =>
+  kind === 'carry_forward' ? t('policy_kind_carry_forward') : t('policy_kind_accrual')
 
 /** What the frequency actually does. Copied from `grantForPeriod`, which is what performs it. */
 const freqDesc = (frequency: Frequency): string =>
@@ -175,12 +195,6 @@ const policies = $derived((policiesQuery.data ?? []) as PolicyRow[])
  * the first frame offers "no policies yet" to a workspace that has six.
  */
 const policiesLoading = $derived(!workspaceId || policiesQuery.isLoading)
-/**
- * A failed refetch that still has an answer. Every write here invalidates the whole module, so a
- * refetch failing while the last good list is on screen is the ordinary case — an error branch
- * above the data would blank a working page.
- */
-const stale = $derived(policiesQuery.isError && policies.length > 0)
 
 /**
  * The config, parsed rather than cast.
@@ -195,6 +209,40 @@ function configOf(policy: PolicyRow): AccrualConfig | null {
   return parsed.success ? parsed.data : null
 }
 
+// ---------------------------------------------------------------- carry-forward
+
+/**
+ * The other kind of policy on this screen, asked for separately.
+ *
+ * One list per kind rather than one call filtered here: `policies.list` takes the kind, the two
+ * lists are drawn in two sections, and a single query would make the accrual tiles count
+ * carry-forward rows. `showArchived` is shared, because it is one control at the top of the page.
+ */
+const carryQuery = createQuery(() => ({
+  queryKey: ['hr', 'policies', workspaceId, 'carry_forward', showArchived] as const,
+  enabled: Boolean(workspaceId),
+  queryFn: () => api.policies.list({ workspaceId, kind: 'carry_forward', includeArchived: showArchived }),
+}))
+const carryPolicies = $derived((carryQuery.data ?? []) as PolicyRow[])
+const carryLoading = $derived(!workspaceId || carryQuery.isLoading)
+
+/** Same reason as `configOf`: the stored jsonb is only a carry-forward config if it parses as one. */
+function carryConfigOf(policy: PolicyRow): CarryForwardConfig | null {
+  const parsed = CarryForwardConfig.safeParse(policy.config)
+  return parsed.success ? parsed.data : null
+}
+
+/**
+ * A failed refetch that still has an answer, on either list.
+ *
+ * Every write here invalidates the whole module, so a refetch failing while the last good lists are
+ * on screen is the ordinary case — an error branch above the data would blank a working page. One
+ * banner for both, because a reader is being told the page is behind, not which query said so.
+ */
+const stale = $derived(
+  (policiesQuery.isError && policies.length > 0) || (carryQuery.isError && carryPolicies.length > 0),
+)
+
 const leaveTypesQuery = createQuery(() => ({
   queryKey: hrKeys.leaveTypes(workspaceId),
   enabled: Boolean(workspaceId) && canHr('leaveView'),
@@ -204,10 +252,30 @@ const leaveTypes = $derived(leaveTypesQuery.data ?? [])
 const leaveTypeName = (key: string): string => leaveTypes.find((type) => type.key === key)?.name ?? key
 
 const liveAssignments = $derived(policies.filter((p) => !p.archivedAt).flatMap((p) => p.assignments))
-/** The rung everybody with nothing nearer falls to. Its absence is the interesting case. */
-const workspaceDefault = $derived(
-  policies.find((p) => !p.archivedAt && p.assignments.some((a) => a.subjectKind === 'workspace')) ?? null,
-)
+
+/**
+ * The rung everybody with nothing nearer falls to, per kind. Its absence is the interesting case,
+ * and it is a different question for each kind: a workspace can accrue without carrying anything
+ * over, and the two gaps are said in two different places rather than in one sentence about
+ * "policies" that would be half wrong whichever kind was missing.
+ */
+const defaultOn = (rows: PolicyRow[]) =>
+  rows.find((p) => !p.archivedAt && p.assignments.some((a) => a.subjectKind === 'workspace')) ?? null
+const workspaceDefault = $derived(defaultOn(policies))
+const carryDefault = $derived(defaultOn(carryPolicies))
+
+const livePolicies = $derived(policies.filter((policy) => !policy.archivedAt))
+const liveCarry = $derived(carryPolicies.filter((policy) => !policy.archivedAt))
+/**
+ * Both kinds on one ladder.
+ *
+ * They are resolved independently — a person can be answered by their office's accrual policy and
+ * the workspace's carry-forward policy at once — so this is not a list of rivals. It is drawn as
+ * one ladder because the *rungs* are the same six and the precedence is the same rule, and two
+ * ladders side by side would each hide half of what applies to somebody.
+ */
+const ladderPolicies = $derived([...livePolicies, ...liveCarry])
+const ladderAssignments = $derived(ladderPolicies.flatMap((policy) => policy.assignments))
 
 /**
  * A policy change moves leave balances, the accrual preview and every resolution beneath it, so the
@@ -296,6 +364,15 @@ let waitingMonths = $state('0')
 /** A token rather than a minute count — see `roundMinutes`. */
 let roundChoice = $state('0')
 let tiers = $state<Tier[]>([])
+/**
+ * Carried through the form rather than shown in it.
+ *
+ * `AccrualConfig.calendar` decides where a period boundary falls — Iran accrues on Jalali months —
+ * and nothing on this screen sets it yet. Omitting it from the draft is not neutral: the schema
+ * defaults it, so saving a name change on a Persian-calendar policy would silently move it to
+ * Gregorian. It is read back and written out untouched until there is a control for it.
+ */
+let policyCalendar = $state<AccrualConfig['calendar']>('gregorian')
 let policyError = $state<string | null>(null)
 /**
  * Whether the form was seeded from a config the schema could not read.
@@ -320,6 +397,7 @@ function openCreate() {
   waitingMonths = '0'
   roundChoice = '0'
   tiers = []
+  policyCalendar = 'gregorian'
   policyError = null
   seededFromUnreadable = false
 }
@@ -344,6 +422,7 @@ function fillFrom(policy: PolicyRow) {
     afterYears: String(tier.afterYears),
     daysPerYear: String(tier.daysPerYear),
   }))
+  policyCalendar = config?.calendar ?? 'gregorian'
   policyError = null
 }
 
@@ -454,6 +533,7 @@ const configDraft = $derived({
   waitingPeriodMonths: clamped(waitingMonths, 0, 24),
   // Save is blocked above the cap, so this never silently shortens a step somebody chose.
   roundToMinutes: Math.min(roundMinutes, ROUND_CAP_MINUTES),
+  calendar: policyCalendar,
   leaveTypeKey,
 })
 
@@ -525,11 +605,150 @@ function policyMenu(policy: PolicyRow): MenuItem[] {
   ]
 }
 
+// ---------------------------------------------------------------- the carry-forward form
+
+/**
+ * What survives the turn of the year, and how long there is to use it.
+ *
+ * Three fields, and each of them is something the engine already reads: `maxDays` is the cap
+ * `carryForward` clips the closing balance to, `expiresAfterMonths` is what `carryExpiryDate`
+ * counts from 1 January, and `leaveTypeKey` is the balance both apply to. Nothing here is invented
+ * — a fourth field would be a setting nothing obeys, which is the defect this screen exists to
+ * repair rather than repeat.
+ *
+ * The deadline is held as a switch and a number rather than as a nullable number, because "never"
+ * and "one month" are the two answers an admin actually has and a blank box does not say which of
+ * them it means.
+ */
+let carryDialog = $state<'create' | 'edit' | null>(null)
+let carryId = $state('')
+let carryName = $state('')
+let carryTypeKey = $state('')
+let carryMaxDays = $state('5')
+let carryExpires = $state(false)
+let carryMonths = $state('3')
+let carryFrom = $state(isoDate())
+let carryTo = $state('')
+let carryError = $state<string | null>(null)
+/** Same trap as `seededFromUnreadable`, for the other schema. */
+let carrySeededFromUnreadable = $state(false)
+
+function openCarryCreate() {
+  carryDialog = 'create'
+  carryId = ''
+  carryName = ''
+  carryTypeKey = leaveTypes[0]?.key ?? ''
+  carryMaxDays = '5'
+  carryExpires = false
+  carryMonths = '3'
+  carryFrom = `${new Date().getFullYear()}-01-01`
+  carryTo = ''
+  carryError = null
+  carrySeededFromUnreadable = false
+}
+
+function fillCarryFrom(policy: PolicyRow) {
+  const config = carryConfigOf(policy)
+  carrySeededFromUnreadable = config === null
+  carryName = policy.name
+  carryTo = policy.effectiveTo ?? ''
+  carryTypeKey = config?.leaveTypeKey ?? leaveTypes[0]?.key ?? ''
+  carryMaxDays = String(config?.maxDays ?? 5)
+  carryExpires = (config?.expiresAfterMonths ?? null) !== null
+  // The number keeps its last value while the switch is off, so turning it back on offers what was
+  // there rather than an empty box.
+  carryMonths = String(config?.expiresAfterMonths ?? 3)
+  carryError = null
+}
+
+function openCarryEdit(policy: PolicyRow) {
+  carryDialog = 'edit'
+  carryId = policy.id
+  carryFrom = policy.effectiveFrom
+  fillCarryFrom(policy)
+}
+
+/** The same affordance as `openDuplicate`: a rule that changes from a date is a new policy. */
+function openCarryDuplicate(policy: PolicyRow) {
+  carryDialog = 'create'
+  carryId = ''
+  fillCarryFrom(policy)
+  carryName = t('accr_copy_of', { name: policy.name })
+  carryFrom = isoDate()
+  carryTo = ''
+}
+
+const carryCap = $derived(clampedDays(carryMaxDays, 0, 365))
+const carryExpiryMonths = $derived(clamped(carryMonths, 1, 24))
+
+const carryProblem = $derived.by(() => {
+  if (!carryName.trim()) return t('accr_error_name')
+  if (!carryTypeKey) return t('cf_error_leave_type')
+  if (!carryFrom) return t('accr_error_from')
+  if (carryTo && carryTo < carryFrom) return t('accr_error_to_before_from')
+  return null
+})
+
+const carryConfigDraft = $derived({
+  leaveTypeKey: carryTypeKey,
+  maxDays: carryCap,
+  expiresAfterMonths: carryExpires ? carryExpiryMonths : null,
+})
+
+const saveCarry = createMutation(() => ({
+  mutationFn: () =>
+    carryDialog === 'edit'
+      ? api.policies.update({
+          workspaceId,
+          policyId: carryId,
+          name: carryName.trim(),
+          config: $state.snapshot(carryConfigDraft),
+          effectiveTo: carryTo || null,
+        })
+      : api.policies.create({
+          workspaceId,
+          kind: 'carry_forward',
+          name: carryName.trim(),
+          config: $state.snapshot(carryConfigDraft),
+          effectiveFrom: carryFrom,
+          effectiveTo: carryTo || null,
+        }),
+  onSuccess: (policy: Policy) => {
+    toast.success(carryDialog === 'edit' ? t('accr_saved') : t('accr_created', { name: policy.name }))
+    carryDialog = null
+    carryError = null
+    refresh()
+  },
+  onError: (error: Error) => {
+    carryError = failureText(error, 'accr_save_error')
+  },
+  onSettled: settled,
+}))
+
+function carryMenu(policy: PolicyRow): MenuItem[] {
+  return [
+    { label: t('common.edit'), icon: 'square-pen', onSelect: () => openCarryEdit(policy) },
+    { label: t('accr_duplicate'), icon: 'copy', onSelect: () => openCarryDuplicate(policy) },
+    { label: t('accr_assign'), icon: 'user-plus', onSelect: () => openAssign(policy.id) },
+    { type: 'separator' },
+    {
+      label: t('common.archive'),
+      icon: 'archive',
+      danger: true,
+      disabled: Boolean(policy.archivedAt),
+      hint: policy.archivedAt ? t('accr_already_archived') : undefined,
+      onSelect: () => {
+        archiving = policy
+      },
+    },
+  ]
+}
+
 // ---------------------------------------------------------------- the ladder
 
 /** Every rung needs a name for its subjects, and each name costs a request — so each is asked for
  *  only when a rung carries an assignment or the assign dialog is open on it. */
-const rungInUse = (kind: PolicySubjectKind) => liveAssignments.some((a) => a.subjectKind === kind)
+const rungInUse = (kind: PolicySubjectKind) => ladderAssignments.some((a) => a.subjectKind === kind)
 
 let assignOpen = $state(false)
 let assignRung = $state<PolicySubjectKind>('workspace')
@@ -607,18 +826,20 @@ type LadderRow = { assignment: PolicyAssignment; policy: PolicyRow }
 const ladder = $derived(
   LADDER.map((kind) => ({
     kind,
-    rows: policies
-      .filter((policy) => !policy.archivedAt)
+    rows: ladderPolicies
       .flatMap((policy) =>
         policy.assignments
           .filter((assignment) => assignment.subjectKind === kind)
           .map((assignment): LadderRow => ({ assignment, policy })),
       )
-      .sort((a, b) =>
-        subjectName(kind, a.assignment.subjectId).localeCompare(
-          subjectName(kind, b.assignment.subjectId),
-          messageLocale(),
-        ),
+      // Subject first, then kind: one person's two policies belong next to each other, and reading
+      // down a rung is reading down a list of people rather than a list of policy kinds.
+      .sort(
+        (a, b) =>
+          subjectName(kind, a.assignment.subjectId).localeCompare(
+            subjectName(kind, b.assignment.subjectId),
+            messageLocale(),
+          ) || kindLabel(a.policy.kind).localeCompare(kindLabel(b.policy.kind), messageLocale()),
       ),
   })),
 )
@@ -634,11 +855,9 @@ let assignFrom = $state(isoDate())
 let assignTo = $state('')
 let assignError = $state<string | null>(null)
 
-const livePolicies = $derived(policies.filter((policy) => !policy.archivedAt))
-
 function openAssign(preferredId?: string) {
   assignOpen = true
-  assignPolicyId = preferredId ?? livePolicies[0]?.id ?? ''
+  assignPolicyId = preferredId ?? ladderPolicies[0]?.id ?? ''
   assignRung = 'workspace'
   assignSubjectId = ''
   assignFrom = isoDate()
@@ -675,23 +894,30 @@ const subjectsLoading = $derived(
  *  sentence, so the order reads down the ladder in every writing direction. */
 const beatenBy = $derived(LADDER.slice(0, LADDER.indexOf(assignRung)))
 
+/** The policy being assigned, and therefore which kind the rung is being read for. */
+const assignKind = $derived(ladderPolicies.find((p) => p.id === assignPolicyId)?.kind ?? 'accrual')
+
 /**
- * Another accrual policy already sitting on this exact subject, open-ended.
+ * Another policy **of the same kind** already sitting on this exact subject, open-ended.
  *
  * Two policies of one kind on one rung is not refused by the server — their effective ranges may
  * well separate them — but it is the ambiguity this whole screen exists to surface, so it is named
- * rather than blocked.
+ * rather than blocked. Across kinds there is no ambiguity at all: accrual and carry-forward are
+ * resolved separately, so warning about an accrual policy while a carry-forward one is being
+ * assigned would invent a conflict that does not exist.
  */
 const rungTaken = $derived(
   assignOpen
-    ? (livePolicies.find((policy) =>
-        policy.assignments.some(
-          (assignment) =>
-            assignment.subjectKind === assignRung &&
-            (assignment.subjectId ?? '') === (assignRung === 'workspace' ? '' : assignSubjectId) &&
-            assignment.effectiveTo === null &&
-            policy.id !== assignPolicyId,
-        ),
+    ? (ladderPolicies.find(
+        (policy) =>
+          policy.kind === assignKind &&
+          policy.assignments.some(
+            (assignment) =>
+              assignment.subjectKind === assignRung &&
+              (assignment.subjectId ?? '') === (assignRung === 'workspace' ? '' : assignSubjectId) &&
+              assignment.effectiveTo === null &&
+              policy.id !== assignPolicyId,
+          ),
       ) ?? null)
     : null,
 )
@@ -734,6 +960,22 @@ const assign = createMutation(() => ({
 }))
 
 let unassigning = $state<LadderRow | null>(null)
+
+const unassignIsCarry = $derived(unassigning?.policy.kind === 'carry_forward')
+/**
+ * What the people under this assignment fall through to, in the kind being removed.
+ *
+ * The bottom rung is only a fallback for its own kind: naming the accrual policy while a
+ * carry-forward assignment is being removed would promise that leave still carries when nothing
+ * carries it any more.
+ */
+const unassignFallback = $derived(
+  unassigning === null || unassigning.assignment.subjectKind === 'workspace'
+    ? null
+    : unassignIsCarry
+      ? carryDefault
+      : workspaceDefault,
+)
 
 const unassign = createMutation(() => ({
   mutationFn: (row: LadderRow) => api.policies.unassign({ workspaceId, assignmentId: row.assignment.id }),
@@ -794,8 +1036,15 @@ const HEAD = 10
 
 <SettingsPage title={t('settings_accrual')} description={t('accr_desc')}>
   {#snippet actions()}
-    {#if manage}
-      <Button size="sm" icon="plus" onclick={openCreate}>{t('accr_new')}</Button>
+    <!-- One switch for both lists below, so it sits above both rather than inside one of them and
+         silently filtering the other. Each section keeps its own "new" button. -->
+    {#if policies.length > 0 || carryPolicies.length > 0 || showArchived}
+      <Switch
+        size="sm"
+        checked={showArchived}
+        onCheckedChange={(on) => (showArchived = on)}
+        label={t('accr_show_archived')}
+      />
     {/if}
   {/snippet}
 
@@ -808,19 +1057,23 @@ const HEAD = 10
   {#if stale}
     <p class="stale" role="status">
       <span>{t('accr_stale')}</span>
-      <Button size="sm" variant="ghost" onclick={() => void policiesQuery.refetch()}>{t('retry')}</Button>
+      <Button
+        size="sm"
+        variant="ghost"
+        onclick={() => {
+          void policiesQuery.refetch()
+          void carryQuery.refetch()
+        }}
+      >
+        {t('retry')}
+      </Button>
     </p>
   {/if}
 
   <SettingsSection title={t('accr_policies')} description={t('accr_policies_desc')}>
     {#snippet action()}
-      {#if policies.length > 0 || showArchived}
-        <Switch
-          size="sm"
-          checked={showArchived}
-          onCheckedChange={(on) => (showArchived = on)}
-          label={t('accr_show_archived')}
-        />
+      {#if manage}
+        <Button size="sm" icon="plus" onclick={openCreate}>{t('accr_new')}</Button>
       {/if}
     {/snippet}
 
@@ -944,21 +1197,147 @@ const HEAD = 10
     {/if}
   </SettingsSection>
 
+  <!-- ---------------------------------------------------------------- carry-forward -->
+  <SettingsSection title={t('cf_section')} description={t('cf_section_desc')}>
+    {#snippet action()}
+      {#if manage}
+        <Button size="sm" icon="plus" onclick={openCarryCreate}>{t('accr_new')}</Button>
+      {/if}
+    {/snippet}
+
+    {#if carryLoading}
+      <div class="rows">
+        {#each [1, 2] as n (n)}<Skeleton height="52px" />{/each}
+      </div>
+    {:else if carryPolicies.length}
+      <div class="stack">
+        {#if !carryDefault}
+          <!-- Same silence as the accrual ladder's missing bottom rung, and a different sentence:
+               nothing is refused, people simply keep nothing at the turn of the year. -->
+          <p class="note warn">{t('cf_no_default')}</p>
+        {/if}
+        {#if !policiesLoading && livePolicies.length === 0}
+          <!-- The job converts a cap in days with the day length from that person's *accrual*
+               policy, and skips them when there is none. A cap with no accrual policy anywhere is
+               therefore a rule that cannot run at all — said only once the accrual list has
+               actually answered, so the warning cannot flash while it loads. -->
+          <p class="note warn">{t('cf_needs_accrual')}</p>
+        {/if}
+
+        <div class="table cf" role="table" aria-label={t('cf_section')}>
+          <div class="thead" role="row">
+            <span role="columnheader">{t('accr_col_policy')}</span>
+            <span role="columnheader">{t('cf_col_carries')}</span>
+            <span role="columnheader">{t('cf_col_deadline')}</span>
+            <span role="columnheader">{t('accr_col_applies')}</span>
+            <span class="sr-only" role="columnheader">{t('approvals_actions')}</span>
+          </div>
+          {#each carryPolicies as policy (policy.id)}
+            {@const config = carryConfigOf(policy)}
+            <div class="trow" role="row">
+              <span class="cell what" role="cell">
+                <span class="strong">{policy.name}</span>
+                <span class="chips">
+                  {#if policy.archivedAt}
+                    <Badge tone="grey">{t('accr_badge_archived')}</Badge>
+                  {/if}
+                  {#if policy.source === 'pack'}
+                    <Badge tone="grey">{t('cal_origin_pack')}</Badge>
+                  {/if}
+                </span>
+                <span class="sub">{rangeLabel(policy.effectiveFrom, policy.effectiveTo)}</span>
+              </span>
+
+              <span class="cell" role="cell">
+                {#if config}
+                  {#if config.maxDays > 0}
+                    <span class="num">
+                      {days(config.maxDays)}
+                      {t('days', { count: config.maxDays })}
+                    </span>
+                  {:else}
+                    <!-- A cap of zero is a real answer and a drastic one: the whole remaining
+                         balance is written off as an expiry entry. It is named, not left as "0". -->
+                    <span class="warn-text">{t('cf_carries_nothing')}</span>
+                  {/if}
+                  <span class="sub">{leaveTypeName(config.leaveTypeKey)}</span>
+                {:else}
+                  <span class="sub danger">{t('accr_config_unreadable')}</span>
+                {/if}
+              </span>
+
+              <span class="cell" role="cell">
+                {#if config}
+                  {#if config.expiresAfterMonths === null}
+                    <Badge tone="grey">{t('cf_no_deadline')}</Badge>
+                  {:else}
+                    <Badge tone="warning">
+                      {t('cf_deadline_short', { count: config.expiresAfterMonths })}
+                    </Badge>
+                  {/if}
+                {/if}
+              </span>
+
+              <span class="cell num" role="cell">
+                {#if policy.assignments.length > 0}
+                  {formatCount(policy.assignments.length, 999)}
+                {:else}
+                  <span class="sub warn-text">{t('accr_nobody')}</span>
+                {/if}
+              </span>
+
+              <span class="cell actions" role="cell">
+                {#if manage}
+                  <DropdownMenu items={carryMenu(policy)}>
+                    {#snippet trigger(props)}
+                      <IconButton
+                        icon="ellipsis"
+                        label={t('accr_actions_for', { name: policy.name })}
+                        size={28}
+                        {...props}
+                      />
+                    {/snippet}
+                  </DropdownMenu>
+                {/if}
+              </span>
+            </div>
+          {/each}
+        </div>
+
+        <p class="note">{t('cf_job_note')}</p>
+      </div>
+    {:else if carryQuery.isError}
+      <EmptyState icon="triangle-alert" title={t('cf_error')} description={t('accr_error_desc')}>
+        {#snippet actions()}
+          <Button variant="secondary" onclick={() => void carryQuery.refetch()}>{t('retry')}</Button>
+        {/snippet}
+      </EmptyState>
+    {:else}
+      <EmptyState icon="calendar-days" title={t('cf_none')} description={t('cf_none_desc')}>
+        {#snippet actions()}
+          {#if manage}
+            <Button icon="plus" onclick={openCarryCreate}>{t('accr_new')}</Button>
+          {/if}
+        {/snippet}
+      </EmptyState>
+    {/if}
+  </SettingsSection>
+
   <!-- ---------------------------------------------------------------- the ladder -->
   <SettingsSection title={t('accr_ladder')} description={t('accr_ladder_desc')}>
     {#snippet action()}
-      {#if manage && livePolicies.length > 0}
+      {#if manage && ladderPolicies.length > 0}
         <Button size="sm" variant="secondary" icon="user-plus" onclick={() => openAssign()}>
           {t('accr_assign')}
         </Button>
       {/if}
     {/snippet}
 
-    {#if policiesLoading}
+    {#if policiesLoading || carryLoading}
       <div class="rows">
         {#each [1, 2, 3, 4] as n (n)}<Skeleton height="44px" />{/each}
       </div>
-    {:else if liveAssignments.length}
+    {:else if ladderAssignments.length}
       {#if !workspaceDefault}
         <!-- The bottom rung is the only one that catches everybody, and its absence is silent
              everywhere else: people with nothing nearer simply never accrue. -->
@@ -981,7 +1360,15 @@ const HEAD = 10
                       <Badge tone="grey">{rungLabel(rung.kind)}</Badge>
                       <span class="strong">{subjectName(rung.kind, row.assignment.subjectId)}</span>
                     </span>
-                    <span class="rpolicy">{row.policy.name}</span>
+                    <span class="rpolicy">
+                      <!-- Which kind is on this rung. Two policies on one subject is ordinary here
+                           — accrual and carry-forward are resolved separately — and without the
+                           badge the pair reads as a conflict rather than as two answers. -->
+                      <Badge tone={row.policy.kind === 'carry_forward' ? 'info' : 'accent'}>
+                        {kindLabel(row.policy.kind)}
+                      </Badge>
+                      <span class="rname">{row.policy.name}</span>
+                    </span>
                     <span class="sub rwhen">
                       {rangeLabel(row.assignment.effectiveFrom, row.assignment.effectiveTo)}
                     </span>
@@ -1003,20 +1390,30 @@ const HEAD = 10
           </div>
         {/each}
       </div>
-    {:else if policiesQuery.isError}
+    {:else if policiesQuery.isError || carryQuery.isError}
       <EmptyState icon="triangle-alert" title={t('accr_ladder_error')}>
         {#snippet actions()}
-          <Button variant="secondary" onclick={() => void policiesQuery.refetch()}>{t('retry')}</Button>
+          <Button
+            variant="secondary"
+            onclick={() => {
+              void policiesQuery.refetch()
+              void carryQuery.refetch()
+            }}
+          >
+            {t('retry')}
+          </Button>
         {/snippet}
       </EmptyState>
     {:else}
       <EmptyState
         icon="git-branch"
         title={t('accr_ladder_none')}
-        description={livePolicies.length > 0 ? t('accr_ladder_none_desc') : t('accr_ladder_needs_policy')}
+        description={ladderPolicies.length > 0
+          ? t('accr_ladder_none_desc')
+          : t('accr_ladder_needs_policy')}
       >
         {#snippet actions()}
-          {#if manage && livePolicies.length > 0}
+          {#if manage && ladderPolicies.length > 0}
             <Button icon="user-plus" onclick={() => openAssign()}>{t('accr_assign')}</Button>
           {:else if manage}
             <Button icon="plus" onclick={openCreate}>{t('accr_new')}</Button>
@@ -1236,6 +1633,118 @@ const HEAD = 10
   {/snippet}
 </Dialog>
 
+<!-- ---------------------------------------------------------------- the carry-forward form -->
+<Dialog
+  open={carryDialog !== null}
+  title={carryDialog === 'edit' ? t('cf_edit_title') : t('cf_create_title')}
+  onOpenChange={(open) => {
+    if (!open) carryDialog = null
+  }}
+>
+  <div class="form">
+    {#if carryDialog === 'edit'}
+      <p class="note">{t('accr_edit_retroactive')}</p>
+    {/if}
+
+    {#if carrySeededFromUnreadable}
+      <p class="note warn">{t('accr_config_unreadable_form')}</p>
+    {/if}
+
+    <Field label={t('accr_name')} hint={t('accr_name_hint')} required>
+      {#snippet children(id)}
+        <Input {id} bind:value={carryName} maxlength={120} />
+      {/snippet}
+    </Field>
+
+    <Field label={t('accr_leave_type')} hint={t('cf_leave_type_hint')} required>
+      {#snippet children(id)}
+        <Select
+          {id}
+          value={carryTypeKey}
+          onValueChange={(v) => (carryTypeKey = v)}
+          placeholder={t('accr_leave_type_pick')}
+          ariaLabel={t('accr_leave_type')}
+          options={leaveTypes.map((type) => ({ value: type.key, label: type.name }))}
+        />
+      {/snippet}
+    </Field>
+
+    {#if leaveTypes.length === 0 && !leaveTypesQuery.isLoading}
+      <p class="note warn">
+        {t('accr_no_leave_types')}
+        {#if canHr('leaveManage')}
+          <a class="link" href={`/${workspaceSlug}/settings/hr/leave`}>{t('settings_leave')}</a>
+        {/if}
+      </p>
+    {/if}
+
+    <Field label={t('cf_cap')} hint={t('cf_cap_hint')}>
+      {#snippet children(id)}
+        <Input {id} type="number" min={0} max={365} step={0.5} bind:value={carryMaxDays} />
+      {/snippet}
+    </Field>
+
+    {#if carryCap === 0}
+      <!-- Not a disabled rule: a zero cap writes the whole closing balance off as an expiry entry,
+           which is the most drastic thing this form can save. -->
+      <p class="note warn">{t('cf_cap_zero')}</p>
+    {/if}
+
+    <!-- A switch and a number rather than an empty box meaning "never": both are real answers, and
+         a blank field does not say which of them it is. Nothing is disabled — the months field is
+         simply not there while there is no deadline to describe. -->
+    <Switch
+      checked={carryExpires}
+      onCheckedChange={(on) => (carryExpires = on)}
+      label={t('cf_expires')}
+      description={t('cf_expires_hint')}
+    />
+
+    {#if carryExpires}
+      <Field label={t('cf_months')} hint={t('cf_months_hint')}>
+        {#snippet children(id)}
+          <Input {id} type="number" min={1} max={24} bind:value={carryMonths} />
+        {/snippet}
+      </Field>
+    {/if}
+
+    <div class="pair">
+      <Field label={t('accr_effective_from')} hint={t('accr_effective_from_hint')} required>
+        {#snippet children(id)}
+          <Input {id} type="date" bind:value={carryFrom} disabled={carryDialog === 'edit'} />
+        {/snippet}
+      </Field>
+      <Field label={t('accr_effective_to')} hint={t('accr_effective_to_hint')}>
+        {#snippet children(id)}
+          <Input {id} type="date" bind:value={carryTo} />
+        {/snippet}
+      </Field>
+    </div>
+
+    <p class="note">{t('cf_needs_accrual_note')}</p>
+
+    {#if carryError}
+      <p class="note danger-note" role="alert">{carryError}</p>
+    {/if}
+  </div>
+
+  {#snippet footer()}
+    {#if carryProblem}
+      <span class="hint problem">{carryProblem}</span>
+    {/if}
+    <Button variant="secondary" onclick={() => (carryDialog = null)} disabled={saveCarry.isPending}>
+      {t('cancel')}
+    </Button>
+    <Button
+      loading={saveCarry.isPending}
+      disabled={!manage || carryProblem !== null}
+      onclick={() => once(() => saveCarry.mutate())}
+    >
+      {carryDialog === 'edit' ? t('common.save') : t('common.create')}
+    </Button>
+  {/snippet}
+</Dialog>
+
 <!-- ---------------------------------------------------------------- archive a policy -->
 <Dialog
   open={archiving !== null}
@@ -1289,7 +1798,13 @@ const HEAD = 10
           onValueChange={(v) => (assignPolicyId = v)}
           placeholder={t('accr_assign_policy_pick')}
           ariaLabel={t('accr_assign_policy')}
-          options={livePolicies.map((policy) => ({ value: policy.id, label: policy.name }))}
+          options={ladderPolicies.map((policy) => ({
+            value: policy.id,
+            label: policy.name,
+            // Grouped by kind rather than labelled with it: which rung a policy may sit on is the
+            // same question for both, but "5 days" means nothing until you know which it is.
+            group: kindLabel(policy.kind),
+          }))}
         />
       {/snippet}
     </Field>
@@ -1390,7 +1905,7 @@ const HEAD = 10
   open={unassigning !== null}
   size="sm"
   title={unassigning
-    ? t('accr_unassign_title', {
+    ? t(unassignIsCarry ? 'cf_unassign_title' : 'accr_unassign_title', {
         subject: subjectName(unassigning.assignment.subjectKind, unassigning.assignment.subjectId),
       })
     : ''}
@@ -1402,9 +1917,9 @@ const HEAD = 10
   {#if unassigning}
     <!-- What happens to the people underneath is the whole question, and it has two answers. -->
     <p class="body">
-      {workspaceDefault && unassigning.assignment.subjectKind !== 'workspace'
-        ? t('accr_unassign_falls_back', { name: workspaceDefault.name })
-        : t('accr_unassign_no_fallback')}
+      {unassignFallback
+        ? t('accr_unassign_falls_back', { name: unassignFallback.name })
+        : t(unassignIsCarry ? 'cf_unassign_no_fallback' : 'accr_unassign_no_fallback')}
     </p>
     <p class="body sub">{t('accr_unassign_keeps')}</p>
   {/if}
@@ -1562,10 +2077,21 @@ const HEAD = 10
   margin-block-end: 18px;
 }
 
+/* Notes, a table and a footnote in one section: one gap rather than a margin per element. */
+.stack {
+  display: grid;
+  gap: 12px;
+}
+
 /* One grid for the header and every row, so the columns line up down the page. */
 .table {
   width: 100%;
   --hr-accr-cols: minmax(150px, 1.4fr) minmax(120px, 1.2fr) minmax(110px, 1fr) 56px 32px;
+}
+/* The carry-forward table is the same anatomy with a narrower deadline column: it holds one chip,
+   where the accrual table's third column holds a badge and a line of settings under it. */
+.table.cf {
+  --hr-accr-cols: minmax(150px, 1.4fr) minmax(110px, 1fr) minmax(100px, 0.9fr) 56px 32px;
 }
 .thead,
 .trow {
@@ -1660,7 +2186,9 @@ const HEAD = 10
 }
 .rlist li {
   display: grid;
-  grid-template-columns: minmax(140px, 1.4fr) minmax(100px, 1fr) minmax(110px, 0.9fr) 32px;
+  /* The policy column carries a kind chip as well as the name now, so it is the wider of the two
+     text columns rather than the narrower. */
+  grid-template-columns: minmax(140px, 1.2fr) minmax(150px, 1.3fr) minmax(110px, 0.8fr) 32px;
   gap: 10px;
   align-items: center;
   min-height: 36px;
@@ -1678,6 +2206,12 @@ const HEAD = 10
   min-width: 0;
 }
 .rpolicy {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.rname {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1831,7 +2365,12 @@ const HEAD = 10
   .table {
     --hr-accr-cols: minmax(140px, 1fr) minmax(100px, 0.9fr) 32px;
   }
-  /* The frequency and the assignment count go; what a policy earns and who it names cannot. */
+  /* `.table.cf` outranks `.table` at any width, so the narrow layout has to be restated for it. */
+  .table.cf {
+    --hr-accr-cols: minmax(140px, 1fr) minmax(100px, 0.9fr) 32px;
+  }
+  /* The third and fourth columns of both tables go — the frequency or the deadline, and the
+     assignment count. What a policy is called and what it is worth cannot. */
   .thead > :nth-child(3),
   .trow > :nth-child(3),
   .thead > :nth-child(4),

@@ -65,13 +65,6 @@ export const hrEvents = {
     'hr.office.created',
     z.object({ officeId: z.uuid(), workspaceId: WorkspaceId, country: z.string() }),
   ),
-  /**
-   * A calendar's days changed — a holiday added, a pack applied.
-   *
-   * Everything derived from a calendar (working days, leave day counts, later the attendance day
-   * sheet) is stale from here. The payload names the date range touched so a consumer can recompute
-   * that window rather than everything.
-   */
   leaveRequested: defineEvent(
     'hr.leave.requested',
     z.object({
@@ -109,6 +102,18 @@ export const hrEvents = {
       deltaMinutes: z.number().int(),
     }),
   ),
+  /**
+   * Something needs signing off, and these are the people it is waiting on.
+   *
+   * Raised once per approval request, after the transaction that created the subject has committed —
+   * a rollback must not leave an approver holding a card for a leave request that does not exist.
+   * `approverIds` is the *first* step only: later steps are resolved at request time but nobody on
+   * them is waiting yet, and telling somebody to act before their turn is worse than telling them
+   * late. The step that becomes current later announces itself through `hr.approval.decided`.
+   *
+   * Nothing is emitted for a chain that resolved to nobody. Auto-approval is not a request, and an
+   * empty `approverIds` would only teach a subscriber to filter it back out.
+   */
   approvalRequested: defineEvent(
     'hr.approval.requested',
     z.object({
@@ -139,20 +144,19 @@ export const hrEvents = {
       businessDate: z.iso.date(),
     }),
   ),
+  // `hr.attendance.day_computed` was declared here and never emitted. It fires on every punch —
+  // four a day per person, every workday — so declaring it committed us to a stampede on behalf of
+  // nobody: nothing in the product subscribes, and a subscriber that appeared would have had to
+  // debounce it before doing anything useful. `hr.punch.recorded` already says a day is stale and
+  // costs the same. It comes back when something needs the derived totals *and* the emit can afford
+  // the fan-out — batched per day rather than per punch, most likely from the nightly job.
   /**
-   * A derived day changed. Carries the date so a consumer recomputes that window rather than
-   * everything — this fires on every punch, so a coarse payload would be a stampede.
+   * A calendar's days changed — a holiday added, a pack applied.
+   *
+   * Everything derived from a calendar (working days, leave day counts, the attendance day sheet)
+   * is stale from here. The payload names the date range touched so a consumer can recompute that
+   * window rather than everything.
    */
-  attendanceDayComputed: defineEvent(
-    'hr.attendance.day_computed',
-    z.object({
-      workspaceId: WorkspaceId,
-      personId: z.uuid(),
-      businessDate: z.iso.date(),
-      status: z.string(),
-      workedMinutes: z.number().int(),
-    }),
-  ),
   calendarChanged: defineEvent(
     'hr.calendar.changed',
     z.object({

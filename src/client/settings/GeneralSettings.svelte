@@ -30,13 +30,18 @@ import { t } from '../i18n.js'
  * `workspaces.modules.list` and written with `workspaces.modules.updateSettings` — the same
  * mechanism the capabilities screen uses, and the reason the module never needs a settings table.
  *
- * **The write carries the whole `HrSettings` object.** Core merges a partial write now, but this
- * page owns every field in that schema and sending it whole is what makes the round trip
- * self-evident: nothing here can be a field somebody forgot to carry forward.
+ * **Core merges a partial write; it does not replace the stored object.** `setModuleSettings` in
+ * core patches the incoming keys over what is stored — an omitted key is left exactly as it was,
+ * and only an explicit `null` removes one — and then parses the merged blob through this module's
+ * schema, so even a key that is somehow absent comes back as the schema's default rather than as
+ * nothing. A field this page never sends is therefore carried forward by the server; saving this
+ * form cannot drop it.
  *
- * `directoryVisibleToMembers` is in the schema and is deliberately *not* on this page. Nothing in
- * `src/server` reads it, so a switch for it would promise a rule the API does not enforce. It is
- * carried through the write unchanged until it is either enforced or removed.
+ * The write below still spreads `stored` before the three edited fields. Under those semantics it
+ * costs nothing — it re-sends values identical to the ones already held — and it is what keeps the
+ * round trip correct if core ever replaces instead of merges: whatever the schema gains goes back
+ * as it came, without this page having to grow a control for it first. `stored` is the *parsed*
+ * settings, so `$capabilities` is not in it and cannot be echoed back over the platform's own key.
  */
 const api = coreApi<CoreApi>()
 const queryClient = useQueryClient()
@@ -136,12 +141,10 @@ const save = createMutation(() => ({
       workspaceId,
       moduleId: 'hr',
       settings: {
+        ...stored,
         country,
         employeeNumberPrefix: prefix,
         employeeNumberNext: parsedNext,
-        // Not editable here, and carried through rather than dropped: omitting it would leave the
-        // stored value to core's merge, which is a fact about core rather than about this page.
-        directoryVisibleToMembers: stored.directoryVisibleToMembers,
       },
     }),
   onSuccess: () => {

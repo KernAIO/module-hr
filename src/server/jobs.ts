@@ -446,9 +446,18 @@ export function hrJobs(): JobDef[] {
        * So the ladder is walked once per business date rather than once per shift, which is the
        * batching `ResolveService` asks for and which a call per row quietly gave up.
        *
-       * The auto clock-out is written as a punch like any other, with `method: 'manual'` and a note,
-       * so the sheet shows that a machine closed the day rather than the person. That distinction is
-       * what a regularization request is later arguing about.
+       * The auto clock-out is written as a punch like any other, and `method: 'auto'` is what says a
+       * machine closed the day rather than the person. That distinction is what a regularization
+       * request is later arguing about, so it has to survive as far as the employee's own timeline:
+       * it used to be written as `'manual'` beside an English note, which the sheet rendered as
+       * "Entered by hand" in every locale — the exact opposite of the fact, aimed at the one reader
+       * with the most at stake in it.
+       *
+       * The note is gone with it. A sentence composed here is composed before anyone knows who will
+       * read it, so it can only ever be English on a Persian screen; `att_method_auto` carries "a
+       * machine closed this" in every locale the module ships, and the day's own `missing_clock_out`
+       * anomaly — already on this panel, already translated — carries "nothing clocked you out".
+       * Between them nothing is lost but the untranslatable half.
        */
       name: 'auto-clock-out',
       cron: '5 * * * *',
@@ -577,9 +586,8 @@ export function hrJobs(): JobDef[] {
                 at: new Date(row.at.getTime() + schedule.autoClockOutAfterMinutes * 60_000),
                 businessDate: row.businessDate,
                 timezone,
-                method: 'manual',
+                method: 'auto',
                 trust: 'trusted',
-                note: 'Closed automatically: no clock-out recorded',
               })
               await attendance.recomputeDay(
                 tx,

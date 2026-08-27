@@ -60,6 +60,17 @@ export const Person = z.object({
   /** Overrides the primary office's zone for somebody who genuinely works elsewhere. */
   timezone: TimeZone.nullable(),
   custom: z.record(z.string(), z.unknown()),
+  /**
+   * The server withheld the personnel fields on this record — `personalEmail`, `phone`, `hiredOn`
+   * and `terminatedOn` are null because the reader may not see them, not because they are empty.
+   *
+   * Without this the two are indistinguishable, and they are different facts: an empty phone field
+   * reads as "this person has no phone number". The client cannot work it out for itself, because
+   * *which* people fall inside a reader's team or office is resolved server-side from the org chart
+   * — headship over an ltree subtree, office headship, and `manager_person_id`, all as of today —
+   * from data the directory does not even fetch. So the one place that does the nulling says so.
+   */
+  personnelHidden: z.boolean().default(false),
   createdAt: Timestamp,
   updatedAt: Timestamp,
 })

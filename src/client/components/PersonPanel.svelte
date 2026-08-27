@@ -7,6 +7,7 @@ import {
   EmptyState,
   Field,
   formatDate,
+  Icon,
   Input,
   navigation,
   RightPanel,
@@ -21,6 +22,7 @@ import { hrKeys, isoDate } from '../query.js'
 import PersonDocumentsSection from './PersonDocumentsSection.svelte'
 import PersonJobSection from './PersonJobSection.svelte'
 import PersonSensitiveSection from './PersonSensitiveSection.svelte'
+import { personnelVisibility } from './redaction.js'
 import { explainRefusal } from './refusal.js'
 
 /**
@@ -188,7 +190,29 @@ function officeTime(timezone: string): string {
 
 const canManage = $derived(canHr('personManage'))
 const left = $derived(person?.status === 'terminated')
+
+/**
+ * Whether the server withheld this person's personnel fields from this reader.
+ *
+ * The four it nulls arrive as nulls, so an empty phone row on this panel says "no phone number" —
+ * a different and wrong fact. `personnelVisibility` says which of the two it is, or says it cannot
+ * tell; only a certain `withheld` is marked, and the panel then explains itself once below the
+ * list rather than once per field.
+ */
+const withheld = $derived(person ? personnelVisibility(person) === 'withheld' : false)
+/**
+ * And only where something on *this* panel is actually blank because of it. The two are the same
+ * thing while the client and the server agree about the reader's keys; tying the sentence to what
+ * is on screen means a disagreement leaves a stale sentence over nothing rather than over a value
+ * the reader can plainly see.
+ */
+const hiddenHere = $derived(withheld && (!person?.phone || !person?.hiredOn))
 </script>
+
+{#snippet hiddenValue()}
+  <!-- A value in its own right, not an absence: the row stays, and says what it is. -->
+  <span class="withheld"><Icon name="eye-off" size={12} strokeWidth={1.8} />{t('person_hidden')}</span>
+{/snippet}
 
 {#snippet footerActions()}
   <div class="actions">
@@ -225,7 +249,7 @@ const left = $derived(person?.status === 'terminated')
       </div>
     </div>
 
-    <dl>
+    <dl class:tight={hiddenHere}>
       {#if resolution?.primaryOfficeName}
         <dt>{t('office')}</dt>
         <dd>{resolution.primaryOfficeName}</dd>
@@ -241,13 +265,22 @@ const left = $derived(person?.status === 'terminated')
         <dt>{t('employee_no')}</dt>
         <dd>{person.employeeNo}</dd>
       {/if}
-      {#if person.hiredOn}
+      <!--
+        Two of the four fields the server redacts. A withheld one keeps its row and is marked, so
+        that "we are not showing you this" cannot be read as "there is nothing here"; one that is
+        merely empty keeps the behaviour it had, and drops out of the list.
+      -->
+      {#if person.hiredOn || withheld}
         <dt>{t('started')}</dt>
-        <dd>{formatDate(`${person.hiredOn}T00:00:00`)}</dd>
+        <dd>
+          {#if person.hiredOn}{formatDate(`${person.hiredOn}T00:00:00`)}{:else}{@render hiddenValue()}{/if}
+        </dd>
       {/if}
-      {#if person.phone}
+      {#if person.phone || withheld}
         <dt>{t('phone')}</dt>
-        <dd>{person.phone}</dd>
+        <dd>
+          {#if person.phone}{person.phone}{:else}{@render hiddenValue()}{/if}
+        </dd>
       {/if}
       {#if resolution?.orgUnitPath}
         <dt>{t('department')}</dt>
@@ -258,6 +291,14 @@ const left = $derived(person?.status === 'terminated')
         <dd>{managerQuery.data.displayName}</dd>
       {/if}
     </dl>
+
+    <!--
+      Once for the panel, never once per field. The same sentence beside every marked row is a
+      lecture; the marks say *which* fields, and this says why, once, under all of them.
+    -->
+    {#if hiddenHere}
+      <p class="hint">{t('person_hidden_hint')}</p>
+    {/if}
 
     <Badge tone={person.status === 'active' ? 'active' : person.status === 'on_leave' ? 'upcoming' : 'grey'}
       >{person.status === 'active'
@@ -389,12 +430,32 @@ dl {
   gap: 8px 16px;
   margin: 0 0 16px;
 }
+/* The sentence below the list belongs to it, so the list gives up its own gap to keep them one
+   block rather than two things that happen to follow each other. */
+dl.tight {
+  margin-block-end: 8px;
+}
 dt {
   color: var(--kern-ink-500);
   font-size: 12px;
 }
 dd {
   margin: 0;
+}
+/* A colour and a smaller size, never opacity — a faded value is unreadable whatever token it
+   names, and this one has to be read to be believed. */
+.withheld {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--kern-ink-500);
+  font-size: 12px;
+}
+.hint {
+  margin: 0 0 16px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--kern-ink-500);
 }
 .actions {
   display: flex;

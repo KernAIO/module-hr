@@ -109,20 +109,38 @@ const directionLabel = (direction: string) =>
         ? t('att_punch_break_start')
         : t('att_punch_break_end')
 
-const methodLabel = (method: string) =>
-  method === 'web'
-    ? t('att_method_web')
-    : method === 'mobile'
-      ? t('att_method_mobile')
-      : method === 'kiosk'
-        ? t('att_method_kiosk')
-        : method === 'qr'
-          ? t('att_method_qr')
-          : method === 'device'
-            ? t('att_method_device')
-            : method === 'import'
-              ? t('att_method_import')
-              : t('att_method_manual')
+/**
+ * What recorded the punch, in words.
+ *
+ * Keyed by the method the contract names, and `auto` is the machine's own — the job that closes a
+ * shift nobody clocked out of. Every method used to be a rung on a ternary ending in
+ * `att_method_manual`, so `auto`, and anything else the contract might add, landed on **"Entered by
+ * hand"**: the one badge on this panel that names a culprit, telling somebody arguing about their
+ * own timesheet that a person had typed a punch no person touched.
+ *
+ * So the fallback no longer claims anything. A method with no string here is a build behind the
+ * server, and it renders the raw code — the same bargain `anomalyLabel` below makes, and the same
+ * reasoning: a code somebody can quote in a question beats a confident wrong sentence about who
+ * touched their record.
+ */
+const METHOD_KEYS: Record<string, string> = {
+  web: 'hr.att_method_web',
+  mobile: 'hr.att_method_mobile',
+  kiosk: 'hr.att_method_kiosk',
+  qr: 'hr.att_method_qr',
+  device: 'hr.att_method_device',
+  import: 'hr.att_method_import',
+  manual: 'hr.att_method_manual',
+  auto: 'hr.att_method_auto',
+}
+const methodLabel = (method: string): string => {
+  // Namespaced keys, because `t()` answers a miss with the key it was **given**: a bare
+  // `att_method_auto` comes back as `hr.att_method_auto`, which never equals what was passed, so a
+  // missing string would test as present and render the key at somebody.
+  const key = METHOD_KEYS[method]
+  const text = key ? t(key) : undefined
+  return text && text !== key ? text : method
+}
 
 /**
  * The time, with the date added only when it is not this day's.

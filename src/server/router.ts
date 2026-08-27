@@ -71,6 +71,7 @@ import {
   scheduleAssignments,
   schedules,
 } from './schema.js'
+import { forViewer, HrAccessService, seesRecordOf, visibleSet } from './services/access.js'
 import { ApprovalService } from './services/approvals.js'
 import { AttendanceService } from './services/attendance.js'
 import { inForceOn, todayIso } from './services/db.js'
@@ -188,6 +189,7 @@ export function implement_(kernel: Kernel) {
   const cap = (id: string) => requiresCapability(MODULE_ID, id)
   const resolve = new ResolveService()
   const svc = new PeopleService(kernel)
+  const access = new HrAccessService(kernel)
   const ledger = new LedgerService()
   const approvals = new ApprovalService(kernel)
   const policySvc = new PolicyService(resolve)
@@ -201,8 +203,19 @@ export function implement_(kernel: Kernel) {
   return os.router({
     // ================================================================= people
     people: {
-      list: scoped.people.list.use(requires('hr.person.view')).handler(({ input }) =>
+      /**
+       * The directory: every person in the workspace, and as much of each as the reader may have.
+       *
+       * `hr.person.view` is a `member` default and stays one — a staff directory a colleague cannot
+       * open is a worse product, not a safer one. What the three widening keys decide is how much
+       * of each row comes back: `HrAccessService` resolves the people whose *personnel record* this
+       * reader may see, and everybody else arrives as a card with the four personnel fields nulled.
+       * The filters, the count and the cursor are unaffected — the page is the same page for
+       * everybody, which is what keeps `total` honest.
+       */
+      list: scoped.people.list.use(requires('hr.person.view')).handler(({ input, context }) =>
         db.withWorkspace(input.workspaceId, async (tx) => {
+          const visible = visibleSet(await access.visiblePersonIds(tx, input.workspaceId, context.principal))
           const where = [eq(people.workspaceId, input.workspaceId)]
           if (input.q) where.push(ilike(people.displayName, `%${input.q}%`))
           if (input.status?.length) where.push(inArray(people.status, input.status))
@@ -302,27 +315,41 @@ export function implement_(kernel: Kernel) {
           const officeBy = new Map(assignments.map((a) => [a.personId, a]))
 
           return {
-            items: rows.map((r) => ({
-              ...PeopleService.toPerson(r),
-              // Spreading into a fresh literal drops the branded WorkspaceId that flowed through
-              // `toPerson`, so it is restored rather than widened to `string`.
-              workspaceId: r.workspaceId as WorkspaceId,
-              officeId: officeBy.get(r.id)?.officeId ?? null,
-              officeName: officeBy.get(r.id)?.name ?? null,
-            })),
+            items: rows.map((r) =>
+              forViewer(
+                {
+                  ...PeopleService.toPerson(r),
+                  // Spreading into a fresh literal drops the branded WorkspaceId that flowed through
+                  // `toPerson`, so it is restored rather than widened to `string`.
+                  workspaceId: r.workspaceId as WorkspaceId,
+                  officeId: officeBy.get(r.id)?.officeId ?? null,
+                  officeName: officeBy.get(r.id)?.name ?? null,
+                },
+                visible,
+              ),
+            ),
             nextCursor,
             total: total?.n ?? 0,
           }
         }),
       ),
 
-      get: scoped.people.get
-        .use(requires('hr.person.view'))
-        .handler(({ input }) =>
-          db.withWorkspace(input.workspaceId, async (tx) =>
+      /**
+       * One person, at the width `people.list` would have shown them.
+       *
+       * Not a 404 for somebody outside the reader's record scope: the person exists, the directory
+       * says so, and answering "no such person" to a colleague looking up a work email would be a
+       * lie the whole product contradicts. They get the card.
+       */
+      get: scoped.people.get.use(requires('hr.person.view')).handler(({ input, context }) =>
+        db.withWorkspace(input.workspaceId, async (tx) => {
+          const visible = visibleSet(await access.visiblePersonIds(tx, input.workspaceId, context.principal))
+          return forViewer(
             PeopleService.toPerson(await svc.load(tx, input.workspaceId, input.personId)),
-          ),
-        ),
+            visible,
+          )
+        }),
+      ),
 
       /**
        * No permission check: everybody may read their own record, and a permission nobody can lack
@@ -476,8 +503,19 @@ export function implement_(kernel: Kernel) {
           return PeopleService.toPerson(row.updated)
         }),
 
-      history: scoped.people.history.use(requires('hr.person.view')).handler(({ input }) =>
+      /**
+       * The audit trail, and the reason redacting the record alone would have been theatre.
+       *
+       * Every row carries the old and new *value* of a field — so `personalEmail`, `phone` and
+       * `hiredOn` are all in here, in plain sight, for anybody who can list the history. It is a
+       * personnel read however narrow the query looks, and it is refused for somebody whose record
+       * the reader may not see. No permission is named on the refusal: three different keys would
+       * each have opened it, and naming one of them would send the reader to ask for the wrong one.
+       */
+      history: scoped.people.history.use(requires('hr.person.view')).handler(({ input, context }) =>
         db.withWorkspace(input.workspaceId, async (tx) => {
+          const visible = visibleSet(await access.visiblePersonIds(tx, input.workspaceId, context.principal))
+          if (!seesRecordOf(visible, input.personId)) throw KernError.forbidden()
           const where = [
             eq(personHistory.workspaceId, input.workspaceId),
             eq(personHistory.personId, input.personId),
@@ -1025,16 +1063,28 @@ export function implement_(kernel: Kernel) {
       people: scoped.offices.people
         .use(cap('offices'))
         .use(requires('hr.office.view'))
-        .handler(({ input }) =>
+        .handler(({ input, context }) =>
           db.withWorkspace(input.workspaceId, async (tx) => {
+            // An office roster is the directory filtered to one place, so it is read at the same
+            // width — `hr.office.view` is a `member` default too, and returning whole records here
+            // would be a way round `people.list` rather than a different question.
+            const visible = visibleSet(
+              await access.visiblePersonIds(tx, input.workspaceId, context.principal),
+            )
             const here = and(
               eq(people.id, officeAssignments.personId),
               eq(people.workspaceId, officeAssignments.workspaceId),
             )
+            // As of today, not "the row with no end date" — the same predicate `HrAccessService`
+            // uses, and they have to agree because both answer this one screen. An office move and
+            // an offboarding are both *dated*: `people.offboard` writes a last working day that is
+            // normally in the future, so a null-end-date test drops somebody the moment their
+            // leaving is recorded, while a future-dated transfer adds them weeks early. The roster
+            // showed one set and the record scope another, on the same response.
             const where = [
               eq(officeAssignments.workspaceId, input.workspaceId),
               eq(officeAssignments.officeId, input.officeId),
-              isNull(officeAssignments.effectiveTo),
+              inForceOn(officeAssignments.effectiveFrom, officeAssignments.effectiveTo, todayIso()),
             ]
             if (input.primaryOnly) where.push(eq(officeAssignments.isPrimary, true))
 
@@ -1059,12 +1109,17 @@ export function implement_(kernel: Kernel) {
             )
 
             return {
-              items: rows.map((r) => ({
-                ...PeopleService.toPerson(r.person),
-                // Migration 0001 allows one open assignment per person per office, so the join
-                // cannot produce a person twice and this flag cannot disagree with itself.
-                isPrimaryHere: r.isPrimary,
-              })),
+              items: rows.map((r) =>
+                forViewer(
+                  {
+                    ...PeopleService.toPerson(r.person),
+                    // Migration 0001 allows one open assignment per person per office, so the join
+                    // cannot produce a person twice and this flag cannot disagree with itself.
+                    isPrimaryHere: r.isPrimary,
+                  },
+                  visible,
+                ),
+              ),
               nextCursor,
               total: total?.n ?? 0,
             }
@@ -2421,7 +2476,7 @@ export function implement_(kernel: Kernel) {
           .use(cap('attendance'))
           .use(requires('hr.attendance.punch'))
           .handler(async ({ input, context }) => {
-            const row = await db.withWorkspace(input.workspaceId, async (tx) => {
+            const filed = await db.withWorkspace(input.workspaceId, async (tx) => {
               const personId = await personFor(tx, input.workspaceId, context, input.personId)
               const [created] = await tx
                 .insert(regularizations)
@@ -2458,10 +2513,26 @@ export function implement_(kernel: Kernel) {
                 .select()
                 .from(regularizations)
                 .where(eq(regularizations.id, created!.id))
-              return fresh!
+              // Same reason as leave: the approvers are told after this commits, never inside it.
+              return {
+                row: fresh!,
+                approval: { requestId: raised.request.id, approverIds: raised.firstStepApprovers },
+              }
             })
-            await changed(input.workspaceId, 'regularization', row.id, 'created')
-            return toRegularization(row)
+            if (filed.approval.approverIds.length)
+              await kernel.emit(
+                hrEvents.approvalRequested,
+                {
+                  requestId: filed.approval.requestId,
+                  workspaceId: input.workspaceId,
+                  subjectType: 'regularization',
+                  subjectId: filed.row.id,
+                  approverIds: filed.approval.approverIds,
+                },
+                { workspaceId: input.workspaceId, actorId: context.principal.userId },
+              )
+            await changed(input.workspaceId, 'regularization', filed.row.id, 'created')
+            return toRegularization(filed.row)
           }),
       },
     },
@@ -2813,7 +2884,15 @@ export function implement_(kernel: Kernel) {
                 await applyApproval(tx, input.workspaceId, request!.id, context.principal.userId ?? null)
 
               const [fresh] = await tx.select().from(leaveRequests).where(eq(leaveRequests.id, request!.id))
-              return { request: fresh!, personId, replay: false as const }
+              // Carried out of the transaction rather than emitted here: an approver must not be
+              // handed a card for a request a rollback is about to erase. `firstStepApprovers` is
+              // empty exactly when the chain resolved to nobody — the auto-approval above.
+              return {
+                request: fresh!,
+                personId,
+                replay: false as const,
+                approval: { requestId: raised.request.id, approverIds: raised.firstStepApprovers },
+              }
             })
 
             const result = await filing.catch(async (err: unknown) => {
@@ -2846,6 +2925,22 @@ export function implement_(kernel: Kernel) {
               },
               { workspaceId: input.workspaceId, actorId: context.principal.userId },
             )
+            // Second, and only when somebody is actually waiting: the request exists, and these are
+            // the people the *first* step is on. Nothing for a chain that resolved to nobody — that
+            // was approved on the way in and is not waiting on anyone. The ids are person ids, the
+            // same identity the rest of `hr.*` carries.
+            if (result.approval.approverIds.length)
+              await kernel.emit(
+                hrEvents.approvalRequested,
+                {
+                  requestId: result.approval.requestId,
+                  workspaceId: input.workspaceId,
+                  subjectType: 'leave',
+                  subjectId: result.request.id,
+                  approverIds: result.approval.approverIds,
+                },
+                { workspaceId: input.workspaceId, actorId: context.principal.userId },
+              )
             await changed(input.workspaceId, 'leave_request', result.request.id, 'created')
             return toLeaveRequest(result.request)
           }),
@@ -3266,6 +3361,14 @@ export function implement_(kernel: Kernel) {
 
     // ================================================================= custom fields
     fields: {
+      /**
+       * Deliberately not narrowed by the record scope, unlike everything else on `hr.person.view`.
+       *
+       * These are field *definitions* — a workspace's shape, not anybody's data. Every screen that
+       * renders a person has to know what "hire_buddy" is called and whether it is a date before it
+       * can draw a single row, and a reader who may see one person's record needs the whole schema
+       * to read that one person. There is nothing here to scope to a person.
+       */
       list: scoped.fields.list.use(requires('hr.person.view')).handler(({ input }) =>
         db.withWorkspace(input.workspaceId, async (tx) => {
           const where = [eq(customFieldDefs.workspaceId, input.workspaceId)]

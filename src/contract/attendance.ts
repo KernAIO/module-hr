@@ -19,8 +19,34 @@ const ws = { workspaceId: WorkspaceId }
 export const PunchDirection = z.enum(['in', 'out', 'break_start', 'break_end'])
 export type PunchDirection = z.infer<typeof PunchDirection>
 
-export const PunchMethod = z.enum(['web', 'mobile', 'kiosk', 'qr', 'device', 'import', 'manual'])
+/**
+ * What recorded the punch.
+ *
+ * `manual` means **a person typed it** — a void carrying the reason somebody wrote, or an approved
+ * regularization. `auto` is the machine's own: the `auto-clock-out` job closing a shift nobody
+ * clocked out of, at an instant it computed rather than observed. They are different facts about
+ * whose hand is on somebody's timesheet, and for a while the job wrote `manual`, so an employee
+ * reading their own day was told a colleague had entered a punch that no colleague had touched.
+ *
+ * **Widening this is additive for parsing and not for reading.** Every already-stored punch still
+ * validates, and a client built before `auto` existed has no label for it — it falls through to
+ * whatever its unknown-method default is, which is the sentence above. So the value lands in the
+ * contract, and in a reader that knows what to call it, before anything writes one.
+ */
+export const PunchMethod = z.enum(['web', 'mobile', 'kiosk', 'qr', 'device', 'import', 'manual', 'auto'])
 export type PunchMethod = z.infer<typeof PunchMethod>
+
+/**
+ * The methods a **caller** may claim, which is every one except `auto`.
+ *
+ * `clockIn` and `clockOut` take the method out of the request and store it unread, so widening
+ * `PunchMethod` widens the input alongside the output: without this, anybody holding
+ * `attendancePunch` could post `method: 'auto'` and have a punch they made themselves presented as
+ * the machine's. `auto` is written by the `auto-clock-out` job and by nothing else, and this is the
+ * schema the two punch inputs take so that stays true.
+ */
+export const ClientPunchMethod = PunchMethod.exclude(['auto'])
+export type ClientPunchMethod = z.infer<typeof ClientPunchMethod>
 
 /**
  * How much the recorded instant can be trusted.

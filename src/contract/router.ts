@@ -9,10 +9,10 @@ import {
 } from './approvals.js'
 import {
   AttendanceDay,
+  ClientPunchMethod,
   ClockState,
   Punch,
   PunchDirection,
-  PunchMethod,
   Regularization,
   Schedule,
   ScheduleAssignment,
@@ -769,7 +769,11 @@ export const hrContract = {
       .input(
         ws.extend({
           personId: z.uuid().optional(),
-          method: PunchMethod.default('web'),
+          // `ClientPunchMethod`, which is `PunchMethod` minus `auto`: `auto` means "the nightly
+          // sweep closed a shift nobody clocked out of", and it is the one value a caller must not
+          // be able to claim for itself. The employee's timeline labels it "Closed automatically",
+          // so accepting it here would let a punch dressed as the machine's disown a person's own.
+          method: ClientPunchMethod.default('web'),
           clientReportedAt: z.iso.datetime({ offset: true }).nullish(),
           geo: z.object({ lat: z.number(), lng: z.number(), accuracyM: z.number().optional() }).nullish(),
           note: z.string().max(500).nullish(),
@@ -782,7 +786,11 @@ export const hrContract = {
       .input(
         ws.extend({
           personId: z.uuid().optional(),
-          method: PunchMethod.default('web'),
+          // `ClientPunchMethod`, which is `PunchMethod` minus `auto`: `auto` means "the nightly
+          // sweep closed a shift nobody clocked out of", and it is the one value a caller must not
+          // be able to claim for itself. The employee's timeline labels it "Closed automatically",
+          // so accepting it here would let a punch dressed as the machine's disown a person's own.
+          method: ClientPunchMethod.default('web'),
           clientReportedAt: z.iso.datetime({ offset: true }).nullish(),
           geo: z.object({ lat: z.number(), lng: z.number(), accuracyM: z.number().optional() }).nullish(),
           note: z.string().max(500).nullish(),
