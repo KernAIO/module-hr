@@ -1,5 +1,6 @@
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import type { core } from '@kernhq/contracts'
 import { defineModule, defineServerModule, type Kernel, packageVersion, uuidv7 } from '@kernhq/kernel'
 import { eq } from 'drizzle-orm'
 import {
@@ -15,6 +16,57 @@ import { COUNTRY_PACKS, packDays } from './packs/index.js'
 import { implement_ } from './router.js'
 import { calendarDays, calendars, offices, people, schema } from './schema.js'
 
+/**
+ * What HR will interrupt somebody about.
+ *
+ * All four are approvals, and all four are already sent — three by `ApprovalService.deliverNotices`
+ * from the timeout sweep, and `requested` by the router when a request is raised. A type declared
+ * here and never sent is the same lie as a permission nothing checks, and the reverse costs a
+ * reader something concrete: until this existed, every one of these was delivered on core's
+ * defaults and could not be muted per type, so somebody who wanted the deadline reminders and not
+ * the "you have been auto-approved" card had to switch off HR entirely.
+ *
+ * `hr.approval.requested` is `urgent` and reaches email; the other three are not. The test is
+ * whether it names something the reader has to *do*: a request waiting on your signature does,
+ * while a reminder about that same request is the system's second attempt at the first card — it
+ * collapses onto it through `groupKey`, so treating it as urgent would ring a second bell for one
+ * piece of work. `auto_approved` is a fact you may want to know and never a thing to act on.
+ *
+ * The keys are the ones already on the wire — `ApprovalNotice['type']` and the router's own call —
+ * and they are also the keys a person's preferences are stored under, so renaming one silently
+ * resets everybody who had switched it off.
+ */
+const hrNotificationTypes: core.NotificationTypeDef[] = [
+  {
+    type: 'hr.approval.requested',
+    label: 'Your approval is requested',
+    description: 'Somebody filed leave or a timesheet correction that is waiting on your signature.',
+    defaults: { inapp: true, push: true, email: true },
+    urgent: true,
+  },
+  {
+    type: 'hr.approval.reminder',
+    label: 'An approval is past its deadline',
+    description: 'A request you have to sign off has passed the deadline its chain sets.',
+    defaults: { inapp: true, push: true, email: false },
+    urgent: false,
+  },
+  {
+    type: 'hr.approval.escalated',
+    label: 'An approval was escalated',
+    description: 'A deadline passed and the request was widened to whoever is above its approvers.',
+    defaults: { inapp: true, push: true, email: false },
+    urgent: false,
+  },
+  {
+    type: 'hr.approval.auto_approved',
+    label: 'An approval was granted by its deadline',
+    description: 'Nobody decided in time and the chain says a timeout approves.',
+    defaults: { inapp: true, push: false, email: false },
+    urgent: false,
+  },
+]
+
 export const hrModule = defineServerModule({
   definition: defineModule({
     id: MODULE_ID,
@@ -25,6 +77,7 @@ export const hrModule = defineServerModule({
     permissions: hrPermissions,
     capabilities: hrCapabilities,
     events: hrEvents,
+    notificationTypes: hrNotificationTypes,
     settings: HrSettings,
     objectTypes: [
       { type: 'person', label: 'Person', icon: 'user', channelable: false },

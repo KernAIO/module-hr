@@ -72,7 +72,7 @@ import {
   schedules,
 } from './schema.js'
 import { forViewer, HrAccessService, seesRecordOf, visibleSet } from './services/access.js'
-import { ApprovalService } from './services/approvals.js'
+import { ApprovalService, type SubjectAppliers } from './services/approvals.js'
 import { AttendanceService } from './services/attendance.js'
 import { inForceOn, todayIso } from './services/db.js'
 import { LedgerService, MINUTES_PER_DAY, yearOf } from './services/ledger.js'
@@ -172,6 +172,400 @@ function paginate<R>(
   return { items, nextCursor: encodeCursor(key, id) }
 }
 
+async function loadCalendar(tx: Tx, workspaceId: string, calendarId: string) {
+  const [row] = await tx
+    .select()
+    .from(calendars)
+    .where(and(eq(calendars.workspaceId, workspaceId), eq(calendars.id, calendarId)))
+    .limit(1)
+  if (!row) throw KernError.notFound('Calendar')
+  return row
+}
+
+/** The chain nearest-first: this calendar, then whatever it extends. */
+async function calendarChain(tx: Tx, workspaceId: string, calendarId: string) {
+  const chain: Array<typeof calendars.$inferSelect> = []
+  let cursor: string | null = calendarId
+  for (let depth = 0; depth < 4 && cursor; depth++) {
+    const row = await loadCalendar(tx, workspaceId, cursor)
+    chain.push(row)
+    cursor = row.extendsId
+  }
+  return chain
+}
+
+/**
+ * The composed calendar over a range: this calendar's days over the ones it extends.
+ *
+ * Nearest wins per date and kind, and a day that shadows one from a calendar further down is
+ * marked `overrides` so the editor can show what it is replacing — which is what makes "we work
+ * through this national holiday" legible rather than looking like a missing holiday.
+ *
+ * At module scope, because it never needed the router's closure — only a `tx`. That is what lets
+ * `hrSubjects` below reach it, so the leave calculation a deadline runs reads the same calendar as
+ * the one a person runs.
+ */
+async function composedDays(tx: Tx, workspaceId: string, calendarId: string, from: string, to: string) {
+  const chain = await calendarChain(tx, workspaceId, calendarId)
+  const rows = await tx
+    .select()
+    .from(calendarDays)
+    .where(
+      and(
+        eq(calendarDays.workspaceId, workspaceId),
+        inArray(
+          calendarDays.calendarId,
+          chain.map((c) => c.id),
+        ),
+        gte(calendarDays.date, from),
+        lte(calendarDays.date, to),
+      ),
+    )
+  const nameById = new Map(chain.map((c) => [c.id, c.name]))
+  const seen = new Map<string, ReturnType<typeof toResolvedDay>>()
+  const datesFromNearest = new Set<string>()
+  for (const cal of chain) {
+    for (const row of rows.filter((r) => r.calendarId === cal.id)) {
+      const key = `${row.date}:${row.kind}`
+      if (seen.has(key)) continue
+      const overrides = cal.id !== calendarId ? false : datesFromNearest.has(row.date)
+      seen.set(key, toResolvedDay(row, cal.id, nameById.get(cal.id) ?? '', overrides))
+      if (cal.id === calendarId) datesFromNearest.add(row.date)
+    }
+  }
+  // Second pass: a nearest-calendar day covering a date the base also has *is* an override, and
+  // the first pass cannot know that until the base has been read.
+  const baseDates = new Set(rows.filter((r) => r.calendarId !== calendarId).map((r) => r.date))
+  return [...seen.values()]
+    .map((d) => ({ ...d, overrides: d.fromCalendarId === calendarId && baseDates.has(d.date) }))
+    .sort((a, b) => a.date.localeCompare(b.date))
+}
+
+/**
+ * What a *decided* request does to its subject, and the calculation both halves of that stand on.
+ *
+ * These lived inside `implement_`'s closure, and that is the whole reason `ApprovalService` had
+ * appliers only when a person was on the other end of the call: a job cannot reach into a router's
+ * closure, so `sweepTimeouts` would advance an intermediate step and then refuse the step that
+ * *completes* a request — logging that it had reminded instead. A deadline an administrator set,
+ * believed, and told their staff about did nothing on the one step that mattered.
+ *
+ * So it is a factory both callers can reach: `implement_` below, and `hrJobs` in `jobs.ts`. It is a
+ * factory rather than a class because the closure is the point — `applyApproval` needs `simulate`,
+ * `simulate` needs the ledger and the composed calendar, and threading those through method
+ * arguments would buy nothing.
+ *
+ * The alternative was a second `simulate` in the job, and it is worth naming why not: two copies of
+ * a leave calculation drift, both of them type-check while they drift, and the first sign of it is
+ * an employee whose balance disagrees with the days they were granted.
+ *
+ * Services are passed in rather than constructed here so a caller keeps one instance of each — two
+ * `AttendanceService`s is not a bug today and is one cache away from being one.
+ */
+export function hrSubjects(deps: {
+  resolve: ResolveService
+  ledger: LedgerService
+  attendance: AttendanceService
+}) {
+  const { resolve, ledger, attendance } = deps
+
+  async function loadRequest(tx: Tx, workspaceId: string, requestId: string) {
+    const [row] = await tx
+      .select()
+      .from(leaveRequests)
+      .where(and(eq(leaveRequests.workspaceId, workspaceId), eq(leaveRequests.id, requestId)))
+      .limit(1)
+    if (!row) throw KernError.notFound('Leave request')
+    return row
+  }
+
+  /**
+   * What a request would cost, and every reason it would be refused.
+   *
+   * Used by `simulate` *and* by `create`, deliberately: a preview that runs different code from the
+   * submission is a preview that eventually lies. The blockers are returned rather than thrown here
+   * so the screen can show all of them at once instead of one per round trip.
+   */
+  async function simulate(
+    tx: Tx,
+    workspaceId: string,
+    personId: string,
+    input: {
+      leaveTypeId: string
+      startsOn: string
+      endsOn: string
+      startPart: 'full' | 'morning' | 'afternoon'
+      endPart: 'full' | 'morning' | 'afternoon'
+      hours?: number | null
+    },
+  ) {
+    const blockers: Array<{ code: string; message: string }> = []
+    if (input.endsOn < input.startsOn)
+      blockers.push({ code: 'range', message: 'The end date is before the start date.' })
+
+    const [type] = await tx
+      .select()
+      .from(leaveTypes)
+      .where(and(eq(leaveTypes.workspaceId, workspaceId), eq(leaveTypes.id, input.leaveTypeId)))
+      .limit(1)
+    if (!type) throw KernError.notFound('Leave type')
+    if (type.archivedAt) blockers.push({ code: 'archived', message: `${type.name} is no longer available.` })
+
+    const resolution = await resolve.forPerson(tx, workspaceId, personId, input.startsOn)
+    const calendarDaysInRange = resolution.calendarId
+      ? await composedDays(tx, workspaceId, resolution.calendarId, input.startsOn, input.endsOn)
+      : []
+
+    const results = workingDays(
+      input.startsOn,
+      input.endsOn,
+      resolution.workingWeek,
+      type.countsWorkingDaysOnly
+        ? calendarDaysInRange.map((d) => ({
+            date: d.date,
+            name: d.name,
+            workingFraction: d.workingFraction,
+          }))
+        : [],
+    )
+
+    // Half-days trim the ends. Applied after the calendar, so asking for a half day on a public
+    // holiday still costs nothing rather than costing half of nothing.
+    const days = results.map((r) => {
+      let fraction = r.fraction
+      if (r.date === input.startsOn && input.startPart === 'afternoon') fraction = Math.min(fraction, 0.5)
+      if (r.date === input.endsOn && input.endPart === 'morning') fraction = Math.min(fraction, 0.5)
+      return { date: r.date, fraction, counted: fraction > 0, reason: r.reason }
+    })
+
+    const workingDaysTotal = Math.round(days.reduce((sum, d) => sum + d.fraction, 0) * 100) / 100
+    const minutes =
+      type.unit === 'hour' && input.hours
+        ? Math.round(input.hours * 60)
+        : Math.round(workingDaysTotal * MINUTES_PER_DAY)
+
+    if (minutes <= 0)
+      blockers.push({
+        code: 'empty',
+        message: 'That range contains no working days.',
+      })
+
+    const year = yearOf(input.startsOn)
+    const balances = await ledger.balances(tx, workspaceId, personId, year)
+    const balance = balances.find((b) => b.leaveTypeId === input.leaveTypeId)
+    const before = balance?.availableMinutes ?? 0
+    const after = before - minutes
+    if (after < 0 && !type.allowNegative)
+      blockers.push({
+        code: 'insufficient',
+        message: `Not enough ${type.name}: this would leave ${Math.round((after / MINUTES_PER_DAY) * 100) / 100} days.`,
+      })
+    if (after < 0 && type.allowNegative && Math.abs(after) > type.maxNegativeMinutes)
+      blockers.push({
+        code: 'below_floor',
+        message: `${type.name} cannot go further than ${Math.round(type.maxNegativeMinutes / MINUTES_PER_DAY)} days negative.`,
+      })
+
+    // Overlap is refused by a unique index as well; checking here turns a constraint violation into
+    // a sentence naming the dates.
+    const counted = days.filter((d) => d.counted).map((d) => d.date)
+    if (counted.length) {
+      const clash = await tx
+        .select({ date: leaveRequestDays.date })
+        .from(leaveRequestDays)
+        .where(
+          and(
+            eq(leaveRequestDays.workspaceId, workspaceId),
+            eq(leaveRequestDays.personId, personId),
+            eq(leaveRequestDays.counted, true),
+            inArray(leaveRequestDays.status, ['pending', 'approved']),
+            inArray(leaveRequestDays.date, counted),
+          ),
+        )
+        .limit(3)
+      if (clash.length)
+        blockers.push({
+          code: 'overlap',
+          message: `You already have leave booked on ${clash.map((c) => c.date).join(', ')}.`,
+        })
+    }
+
+    if (type.requiresDocumentAfterDays !== null && workingDaysTotal > type.requiresDocumentAfterDays)
+      blockers.push({
+        code: 'document_required',
+        message: `${type.name} longer than ${type.requiresDocumentAfterDays} days needs a document.`,
+      })
+
+    return {
+      workingDays: workingDaysTotal,
+      minutes,
+      days,
+      balanceBeforeMinutes: before,
+      balanceAfterMinutes: after,
+      blockers,
+    }
+  }
+
+  /**
+   * Turn an approved request into a ledger consumption.
+   *
+   * The working days are **recomputed here** rather than trusted from submission time: a holiday
+   * can be added to the calendar between asking and approving, and the number that costs somebody
+   * balance should be the one that was true when it was granted.
+   */
+  async function applyApproval(tx: Tx, workspaceId: string, leaveRequestId: string, actorId: string | null) {
+    const request = await loadRequest(tx, workspaceId, leaveRequestId)
+    if (request.status === 'approved') return
+
+    const sim = await simulate(tx, workspaceId, request.personId, {
+      leaveTypeId: request.leaveTypeId,
+      startsOn: request.startsOn,
+      endsOn: request.endsOn,
+      startPart: request.startPart as 'full' | 'morning' | 'afternoon',
+      endPart: request.endPart as 'full' | 'morning' | 'afternoon',
+      hours: request.hours === null ? null : Number.parseFloat(request.hours),
+    })
+
+    await ledger.append(tx, workspaceId, {
+      personId: request.personId,
+      leaveTypeId: request.leaveTypeId,
+      kind: 'consumption',
+      amountMinutes: -sim.minutes,
+      effectiveOn: request.startsOn,
+      periodYear: yearOf(request.startsOn),
+      requestId: request.id,
+      reason: null,
+      createdBy: actorId,
+    })
+
+    await tx
+      .update(leaveRequestDays)
+      .set({ status: 'approved' })
+      .where(eq(leaveRequestDays.requestId, request.id))
+    await tx
+      .update(leaveRequests)
+      .set({
+        status: 'approved',
+        minutes: sim.minutes,
+        workingDays: String(sim.workingDays),
+        decidedAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .where(eq(leaveRequests.id, request.id))
+  }
+
+  /**
+   * Everything a punch needs about a person: their zone, and the schedule that shapes their day.
+   *
+   * The zone comes from the resolution ladder — their primary office unless they have an override —
+   * so a punch made on a business trip still counts towards the month they are employed in.
+   *
+   * Everything here is resolved **as of today**, which is what a punch is about. It is therefore
+   * not the place to answer a question about a past date: this used to hand out today's legal
+   * entity as well, and three callers applied it to business dates months back — so a person who
+   * transferred entity had a filed month recomputed against the one they are in now. `recomputeDay`
+   * asks that question of the day it is rebuilding.
+   */
+  async function personContext(tx: Tx, workspaceId: string, personId: string) {
+    const today = todayIso()
+    const resolution = await resolve.forPerson(tx, workspaceId, personId, today)
+    const schedule = await attendance.scheduleFor(tx, workspaceId, personId, today)
+    return { timezone: resolution.timezone, schedule, resolution }
+  }
+
+  /**
+   * Apply an approved correction: write the proposed punches, void what they replace, rebuild.
+   *
+   * Nothing is edited. The original punch keeps its row and gains a pointer to what superseded it,
+   * so a corrected timesheet and an edited one stay distinguishable — which is the entire reason
+   * regularization exists rather than an update statement.
+   */
+  async function applyRegularization(tx: Tx, workspaceId: string, regularizationId: string) {
+    const [row] = await tx
+      .select()
+      .from(regularizations)
+      .where(and(eq(regularizations.workspaceId, workspaceId), eq(regularizations.id, regularizationId)))
+      .limit(1)
+    if (!row || row.status === 'approved') return
+
+    if (row.punchId) await attendance.voidPunch(tx, workspaceId, row.punchId, 'Regularized', null)
+
+    const { timezone, schedule } = await personContext(tx, workspaceId, row.personId)
+    for (const proposal of row.proposed as Array<{ direction: string; at: string }>)
+      await tx.insert(punches).values({
+        id: uuidv7(),
+        workspaceId,
+        personId: row.personId,
+        direction: proposal.direction,
+        at: new Date(proposal.at),
+        businessDate: row.businessDate,
+        timezone,
+        method: 'manual',
+        trust: 'trusted',
+        note: `Regularization ${row.id}`,
+      })
+
+    await attendance.recomputeDay(tx, workspaceId, row.personId, row.businessDate, timezone, schedule)
+    await tx
+      .update(regularizations)
+      .set({ status: 'approved', appliedAt: new Date() })
+      .where(eq(regularizations.id, row.id))
+  }
+
+  /** A rejected request costs no balance and writes no punches; it just stops being live. */
+  async function applyLeaveDecision(
+    tx: Tx,
+    workspaceId: string,
+    leaveRequestId: string,
+    status: 'approved' | 'rejected',
+    actorId: string | null,
+  ) {
+    if (status === 'approved') return applyApproval(tx, workspaceId, leaveRequestId, actorId)
+    await tx
+      .update(leaveRequests)
+      .set({ status: 'rejected', decidedAt: new Date(), updatedAt: new Date() })
+      .where(eq(leaveRequests.id, leaveRequestId))
+  }
+
+  /** The same, for a correction. */
+  async function applyRegularizationDecision(
+    tx: Tx,
+    workspaceId: string,
+    regularizationId: string,
+    status: 'approved' | 'rejected',
+  ) {
+    if (status === 'approved') return applyRegularization(tx, workspaceId, regularizationId)
+    await tx
+      .update(regularizations)
+      .set({ status: 'rejected' })
+      .where(eq(regularizations.id, regularizationId))
+  }
+
+  return {
+    loadRequest,
+    simulate,
+    applyApproval,
+    applyRegularization,
+    personContext,
+    /**
+     * The same two functions in the shape `ApprovalService` calls them in, keyed by `subjectType` —
+     * the only thing the engine knows about a subject.
+     *
+     * Parameterised by the actor because that is the one thing the two callers genuinely disagree
+     * about: a person approving leave is written onto the ledger entry as `created_by`, and a
+     * deadline running out is written as nobody. Passing the approver's id for a timeout would put
+     * a name against a decision that person did not make, which is exactly what
+     * `TIMEOUT_APPROVER_ID` exists to avoid one table over.
+     */
+    appliersFor: (actorId: string | null): SubjectAppliers => ({
+      leave: (tx, workspaceId, request, status) =>
+        applyLeaveDecision(tx, workspaceId, request.subjectId, status, actorId),
+      regularization: (tx, workspaceId, request, status) =>
+        applyRegularizationDecision(tx, workspaceId, request.subjectId, status),
+    }),
+  }
+}
+
 /**
  * The router.
  *
@@ -191,9 +585,16 @@ export function implement_(kernel: Kernel) {
   const svc = new PeopleService(kernel)
   const access = new HrAccessService(kernel)
   const ledger = new LedgerService()
-  const approvals = new ApprovalService(kernel)
   const policySvc = new PolicyService(resolve)
   const attendance = new AttendanceService(resolve, policySvc)
+  const subjects = hrSubjects({ resolve, ledger, attendance })
+  const { applyApproval, applyRegularization, loadRequest, personContext, simulate } = subjects
+  /**
+   * The engine gets the appliers here as well as in `jobs.ts`, so the two constructions read the
+   * same and stay the same. A sweep started from a request is still nobody's decision, which is why
+   * this one is built for no actor — the per-request actor arrives at `decide` below.
+   */
+  const approvals = new ApprovalService(kernel, subjects.appliersFor(null))
   const db = kernel.database
   const settingsOf = (workspaceId: string) => kernel.settings.module(workspaceId, MODULE_ID, HrSettings)
 
@@ -2516,10 +2917,17 @@ export function implement_(kernel: Kernel) {
               // Same reason as leave: the approvers are told after this commits, never inside it.
               return {
                 row: fresh!,
-                approval: { requestId: raised.request.id, approverIds: raised.firstStepApprovers },
+                approval: {
+                  requestId: raised.request.id,
+                  approverIds: raised.firstStepApprovers,
+                  userIds: await accountsOf(tx, input.workspaceId, raised.firstStepApprovers),
+                  summary: raised.request.summary,
+                  summaryParams: raised.request.summaryParams,
+                  actorId: raised.request.requestedBy,
+                },
               }
             })
-            if (filed.approval.approverIds.length)
+            if (filed.approval.approverIds.length) {
               await kernel.emit(
                 hrEvents.approvalRequested,
                 {
@@ -2531,6 +2939,16 @@ export function implement_(kernel: Kernel) {
                 },
                 { workspaceId: input.workspaceId, actorId: context.principal.userId },
               )
+              await notifyApprovers({
+                workspaceId: input.workspaceId,
+                requestId: filed.approval.requestId,
+                subjectType: 'regularization',
+                summary: filed.approval.summary,
+                summaryParams: filed.approval.summaryParams,
+                userIds: filed.approval.userIds,
+                actorId: filed.approval.actorId,
+              })
+            }
             await changed(input.workspaceId, 'regularization', filed.row.id, 'created')
             return toRegularization(filed.row)
           }),
@@ -2891,7 +3309,17 @@ export function implement_(kernel: Kernel) {
                 request: fresh!,
                 personId,
                 replay: false as const,
-                approval: { requestId: raised.request.id, approverIds: raised.firstStepApprovers },
+                approval: {
+                  requestId: raised.request.id,
+                  approverIds: raised.firstStepApprovers,
+                  // Resolved here because it needs `tx`, delivered outside because a notification
+                  // cannot be rolled back. Person ids are HR's identity and accounts are core's, so
+                  // the translation happens once, on the way out.
+                  userIds: await accountsOf(tx, input.workspaceId, raised.firstStepApprovers),
+                  summary: raised.request.summary,
+                  summaryParams: raised.request.summaryParams,
+                  actorId: raised.request.requestedBy,
+                },
               }
             })
 
@@ -2929,7 +3357,7 @@ export function implement_(kernel: Kernel) {
             // the people the *first* step is on. Nothing for a chain that resolved to nobody — that
             // was approved on the way in and is not waiting on anyone. The ids are person ids, the
             // same identity the rest of `hr.*` carries.
-            if (result.approval.approverIds.length)
+            if (result.approval.approverIds.length) {
               await kernel.emit(
                 hrEvents.approvalRequested,
                 {
@@ -2941,6 +3369,18 @@ export function implement_(kernel: Kernel) {
                 },
                 { workspaceId: input.workspaceId, actorId: context.principal.userId },
               )
+              // And then the approvers themselves. The event is for other modules; this is for the
+              // people whose signature the request is now waiting on.
+              await notifyApprovers({
+                workspaceId: input.workspaceId,
+                requestId: result.approval.requestId,
+                subjectType: 'leave',
+                summary: result.approval.summary,
+                summaryParams: result.approval.summaryParams,
+                userIds: result.approval.userIds,
+                actorId: result.approval.actorId,
+              })
+            }
             await changed(input.workspaceId, 'leave_request', result.request.id, 'created')
             return toLeaveRequest(result.request)
           }),
@@ -3143,23 +3583,15 @@ export function implement_(kernel: Kernel) {
           // The approval engine knows nothing about leave. Applying the decision to the subject is
           // the caller's job, which is what keeps the engine reusable for regularization and
           // overtime later.
+          //
+          // Through the same appliers the timeout sweep is given, rather than a branch of its own:
+          // this used to be a `switch` on `subjectType` here and nothing at all in the job, which is
+          // how a deadline could approve a request and leave its leave unbooked. One table of
+          // subject types, and adding overtime means adding a line to it and nothing here.
           const request = result.request
-          if (request.subjectType === 'leave') {
-            if (result.status === 'approved')
-              await applyApproval(tx, input.workspaceId, request.subjectId, context.principal.userId ?? null)
-            else if (result.status === 'rejected')
-              await tx
-                .update(leaveRequests)
-                .set({ status: 'rejected', decidedAt: new Date(), updatedAt: new Date() })
-                .where(eq(leaveRequests.id, request.subjectId))
-          } else if (request.subjectType === 'regularization') {
-            if (result.status === 'approved')
-              await applyRegularization(tx, input.workspaceId, request.subjectId)
-            else if (result.status === 'rejected')
-              await tx
-                .update(regularizations)
-                .set({ status: 'rejected' })
-                .where(eq(regularizations.id, request.subjectId))
+          if (result.status !== 'pending') {
+            const apply = subjects.appliersFor(context.principal.userId ?? null)[request.subjectType]
+            await apply?.(tx, input.workspaceId, request, result.status)
           }
 
           const [fresh] = await tx
@@ -3443,16 +3875,6 @@ export function implement_(kernel: Kernel) {
     return row
   }
 
-  async function loadCalendar(tx: Tx, workspaceId: string, calendarId: string) {
-    const [row] = await tx
-      .select()
-      .from(calendars)
-      .where(and(eq(calendars.workspaceId, workspaceId), eq(calendars.id, calendarId)))
-      .limit(1)
-    if (!row) throw KernError.notFound('Calendar')
-    return row
-  }
-
   /** The workspace's calendar for a country pack, created on first use so offices can share one. */
   async function packCalendar(tx: Tx, workspaceId: string, country: string) {
     const [existing] = await tx
@@ -3523,61 +3945,6 @@ export function implement_(kernel: Kernel) {
       cursor = row?.extendsId ?? null
     }
     throw KernError.badRequest('Calendars may only be built on three levels.')
-  }
-
-  /** The chain nearest-first: this calendar, then whatever it extends. */
-  async function calendarChain(tx: Tx, workspaceId: string, calendarId: string) {
-    const chain: Array<typeof calendars.$inferSelect> = []
-    let cursor: string | null = calendarId
-    for (let depth = 0; depth < 4 && cursor; depth++) {
-      const row = await loadCalendar(tx, workspaceId, cursor)
-      chain.push(row)
-      cursor = row.extendsId
-    }
-    return chain
-  }
-
-  /**
-   * The composed calendar over a range: this calendar's days over the ones it extends.
-   *
-   * Nearest wins per date and kind, and a day that shadows one from a calendar further down is
-   * marked `overrides` so the editor can show what it is replacing — which is what makes "we work
-   * through this national holiday" legible rather than looking like a missing holiday.
-   */
-  async function composedDays(tx: Tx, workspaceId: string, calendarId: string, from: string, to: string) {
-    const chain = await calendarChain(tx, workspaceId, calendarId)
-    const rows = await tx
-      .select()
-      .from(calendarDays)
-      .where(
-        and(
-          eq(calendarDays.workspaceId, workspaceId),
-          inArray(
-            calendarDays.calendarId,
-            chain.map((c) => c.id),
-          ),
-          gte(calendarDays.date, from),
-          lte(calendarDays.date, to),
-        ),
-      )
-    const nameById = new Map(chain.map((c) => [c.id, c.name]))
-    const seen = new Map<string, ReturnType<typeof toResolvedDay>>()
-    const datesFromNearest = new Set<string>()
-    for (const cal of chain) {
-      for (const row of rows.filter((r) => r.calendarId === cal.id)) {
-        const key = `${row.date}:${row.kind}`
-        if (seen.has(key)) continue
-        const overrides = cal.id !== calendarId ? false : datesFromNearest.has(row.date)
-        seen.set(key, toResolvedDay(row, cal.id, nameById.get(cal.id) ?? '', overrides))
-        if (cal.id === calendarId) datesFromNearest.add(row.date)
-      }
-    }
-    // Second pass: a nearest-calendar day covering a date the base also has *is* an override, and
-    // the first pass cannot know that until the base has been read.
-    const baseDates = new Set(rows.filter((r) => r.calendarId !== calendarId).map((r) => r.date))
-    return [...seen.values()]
-      .map((d) => ({ ...d, overrides: d.fromCalendarId === calendarId && baseDates.has(d.date) }))
-      .sort((a, b) => a.date.localeCompare(b.date))
   }
 
   /**
@@ -3740,189 +4107,89 @@ export function implement_(kernel: Kernel) {
     return row
   }
 
-  async function loadRequest(tx: Tx, workspaceId: string, requestId: string) {
-    const [row] = await tx
-      .select()
-      .from(leaveRequests)
-      .where(and(eq(leaveRequests.workspaceId, workspaceId), eq(leaveRequests.id, requestId)))
-      .limit(1)
-    if (!row) throw KernError.notFound('Leave request')
-    return row
+  /**
+   * The Kern accounts behind a set of people.
+   *
+   * An employee need not have an account, and one removed from the workspace has had the link
+   * cleared on purpose by the `core.member.removed` subscription. Both are "nothing to deliver",
+   * not an error — the same rule `sweepTimeouts` applies to the people it has to reach.
+   */
+  async function accountsOf(tx: Tx, workspaceId: string, personIds: string[]): Promise<string[]> {
+    if (!personIds.length) return []
+    const rows = await tx
+      .select({ userId: people.userId })
+      .from(people)
+      .where(and(eq(people.workspaceId, workspaceId), inArray(people.id, personIds)))
+    return [...new Set(rows.map((r) => r.userId).filter((id): id is string => !!id))]
   }
 
   /**
-   * What a request would cost, and every reason it would be refused.
+   * Tell the people a newly raised request is waiting on.
    *
-   * Used by `simulate` *and* by `create`, deliberately: a preview that runs different code from the
-   * submission is a preview that eventually lies. The blockers are returned rather than thrown here
-   * so the screen can show all of them at once instead of one per round trip.
+   * `hr.approval.requested` has always been *emitted*, and an event is not a notification: nothing
+   * subscribes to it, so the first thing an approver ever heard about a request was the timeout
+   * sweep reminding them about something they had never been told about in the first place.
+   *
+   * The route is the sweep's own, deliberately and to the letter: `core.notifications.create`, the
+   * same `groupKey` so one request stays one card however often it is later reminded about, the
+   * same `url`, and a catch per notification — by the time this runs the request is committed, so a
+   * notification that fails must not become an error for the person who filed it. What they would
+   * lose is a card; what a throw would cost them is the request.
+   *
+   * **After the transaction, never inside it.** Core writes on its own connection, so a
+   * notification sent inside a transaction that then rolls back has already been delivered, and an
+   * approver is holding a card for a request that does not exist.
+   *
+   * No sentence is composed here beyond the English fallback, for the reason the sweep gives: a
+   * title built on the server is built before anyone knows who will read it, so it can only ever be
+   * English on a Persian screen. `data` carries the subject type and the request's own
+   * `summaryParams`, which is what a localised renderer needs to write the sentence itself.
    */
-  async function simulate(
-    tx: Tx,
-    workspaceId: string,
-    personId: string,
-    input: {
-      leaveTypeId: string
-      startsOn: string
-      endsOn: string
-      startPart: 'full' | 'morning' | 'afternoon'
-      endPart: 'full' | 'morning' | 'afternoon'
-      hours?: number | null
-    },
-  ) {
-    const blockers: Array<{ code: string; message: string }> = []
-    if (input.endsOn < input.startsOn)
-      blockers.push({ code: 'range', message: 'The end date is before the start date.' })
-
-    const [type] = await tx
-      .select()
-      .from(leaveTypes)
-      .where(and(eq(leaveTypes.workspaceId, workspaceId), eq(leaveTypes.id, input.leaveTypeId)))
-      .limit(1)
-    if (!type) throw KernError.notFound('Leave type')
-    if (type.archivedAt) blockers.push({ code: 'archived', message: `${type.name} is no longer available.` })
-
-    const resolution = await resolve.forPerson(tx, workspaceId, personId, input.startsOn)
-    const calendarDaysInRange = resolution.calendarId
-      ? await composedDays(tx, workspaceId, resolution.calendarId, input.startsOn, input.endsOn)
-      : []
-
-    const results = workingDays(
-      input.startsOn,
-      input.endsOn,
-      resolution.workingWeek,
-      type.countsWorkingDaysOnly
-        ? calendarDaysInRange.map((d) => ({
-            date: d.date,
-            name: d.name,
-            workingFraction: d.workingFraction,
-          }))
-        : [],
-    )
-
-    // Half-days trim the ends. Applied after the calendar, so asking for a half day on a public
-    // holiday still costs nothing rather than costing half of nothing.
-    const days = results.map((r) => {
-      let fraction = r.fraction
-      if (r.date === input.startsOn && input.startPart === 'afternoon') fraction = Math.min(fraction, 0.5)
-      if (r.date === input.endsOn && input.endPart === 'morning') fraction = Math.min(fraction, 0.5)
-      return { date: r.date, fraction, counted: fraction > 0, reason: r.reason }
-    })
-
-    const workingDaysTotal = Math.round(days.reduce((sum, d) => sum + d.fraction, 0) * 100) / 100
-    const minutes =
-      type.unit === 'hour' && input.hours
-        ? Math.round(input.hours * 60)
-        : Math.round(workingDaysTotal * MINUTES_PER_DAY)
-
-    if (minutes <= 0)
-      blockers.push({
-        code: 'empty',
-        message: 'That range contains no working days.',
-      })
-
-    const year = yearOf(input.startsOn)
-    const balances = await ledger.balances(tx, workspaceId, personId, year)
-    const balance = balances.find((b) => b.leaveTypeId === input.leaveTypeId)
-    const before = balance?.availableMinutes ?? 0
-    const after = before - minutes
-    if (after < 0 && !type.allowNegative)
-      blockers.push({
-        code: 'insufficient',
-        message: `Not enough ${type.name}: this would leave ${Math.round((after / MINUTES_PER_DAY) * 100) / 100} days.`,
-      })
-    if (after < 0 && type.allowNegative && Math.abs(after) > type.maxNegativeMinutes)
-      blockers.push({
-        code: 'below_floor',
-        message: `${type.name} cannot go further than ${Math.round(type.maxNegativeMinutes / MINUTES_PER_DAY)} days negative.`,
-      })
-
-    // Overlap is refused by a unique index as well; checking here turns a constraint violation into
-    // a sentence naming the dates.
-    const counted = days.filter((d) => d.counted).map((d) => d.date)
-    if (counted.length) {
-      const clash = await tx
-        .select({ date: leaveRequestDays.date })
-        .from(leaveRequestDays)
-        .where(
-          and(
-            eq(leaveRequestDays.workspaceId, workspaceId),
-            eq(leaveRequestDays.personId, personId),
-            eq(leaveRequestDays.counted, true),
-            inArray(leaveRequestDays.status, ['pending', 'approved']),
-            inArray(leaveRequestDays.date, counted),
-          ),
+  async function notifyApprovers(notice: {
+    workspaceId: string
+    requestId: string
+    subjectType: string
+    summary: string
+    summaryParams: Record<string, string | number> | null
+    userIds: string[]
+    actorId: string | null
+  }) {
+    for (const userId of notice.userIds)
+      try {
+        await kernel.call(
+          'core.notifications.create',
+          {
+            userId,
+            workspaceId: notice.workspaceId,
+            module: MODULE_ID,
+            type: 'hr.approval.requested',
+            title: 'Your approval is requested',
+            body: notice.summary || null,
+            object: null,
+            url: '/hr/approvals',
+            data: {
+              subjectType: notice.subjectType,
+              requestId: notice.requestId,
+              params: notice.summaryParams ?? {},
+            },
+            groupKey: `hr.approval:${notice.requestId}`,
+            // Whoever filed it, which is not always the person it is about — HR files leave for
+            // somebody often enough that `requestedBy` exists as its own column.
+            actorId: notice.actorId,
+          },
+          kernel.system,
         )
-        .limit(3)
-      if (clash.length)
-        blockers.push({
-          code: 'overlap',
-          message: `You already have leave booked on ${clash.map((c) => c.date).join(', ')}.`,
-        })
-    }
-
-    if (type.requiresDocumentAfterDays !== null && workingDaysTotal > type.requiresDocumentAfterDays)
-      blockers.push({
-        code: 'document_required',
-        message: `${type.name} longer than ${type.requiresDocumentAfterDays} days needs a document.`,
-      })
-
-    return {
-      workingDays: workingDaysTotal,
-      minutes,
-      days,
-      balanceBeforeMinutes: before,
-      balanceAfterMinutes: after,
-      blockers,
-    }
-  }
-
-  /**
-   * Turn an approved request into a ledger consumption.
-   *
-   * The working days are **recomputed here** rather than trusted from submission time: a holiday
-   * can be added to the calendar between asking and approving, and the number that costs somebody
-   * balance should be the one that was true when it was granted.
-   */
-  async function applyApproval(tx: Tx, workspaceId: string, leaveRequestId: string, actorId: string | null) {
-    const request = await loadRequest(tx, workspaceId, leaveRequestId)
-    if (request.status === 'approved') return
-
-    const sim = await simulate(tx, workspaceId, request.personId, {
-      leaveTypeId: request.leaveTypeId,
-      startsOn: request.startsOn,
-      endsOn: request.endsOn,
-      startPart: request.startPart as 'full' | 'morning' | 'afternoon',
-      endPart: request.endPart as 'full' | 'morning' | 'afternoon',
-      hours: request.hours === null ? null : Number.parseFloat(request.hours),
-    })
-
-    await ledger.append(tx, workspaceId, {
-      personId: request.personId,
-      leaveTypeId: request.leaveTypeId,
-      kind: 'consumption',
-      amountMinutes: -sim.minutes,
-      effectiveOn: request.startsOn,
-      periodYear: yearOf(request.startsOn),
-      requestId: request.id,
-      reason: null,
-      createdBy: actorId,
-    })
-
-    await tx
-      .update(leaveRequestDays)
-      .set({ status: 'approved' })
-      .where(eq(leaveRequestDays.requestId, request.id))
-    await tx
-      .update(leaveRequests)
-      .set({
-        status: 'approved',
-        minutes: sim.minutes,
-        workingDays: String(sim.workingDays),
-        decidedAt: new Date(),
-        updatedAt: new Date(),
-      })
-      .where(eq(leaveRequests.id, request.id))
+      } catch (err) {
+        kernel.log.warn(
+          {
+            module: 'hr',
+            workspaceId: notice.workspaceId,
+            requestId: notice.requestId,
+            err: (err as Error).message,
+          },
+          'approval notification not delivered',
+        )
+      }
   }
 
   async function clearDefaultChain(tx: Tx, workspaceId: string, subjectType: string) {
@@ -3986,25 +4253,6 @@ export function implement_(kernel: Kernel) {
           })),
       })),
     }
-  }
-
-  /**
-   * Everything a punch needs about a person: their zone, and the schedule that shapes their day.
-   *
-   * The zone comes from the resolution ladder — their primary office unless they have an override —
-   * so a punch made on a business trip still counts towards the month they are employed in.
-   *
-   * Everything here is resolved **as of today**, which is what a punch is about. It is therefore
-   * not the place to answer a question about a past date: this used to hand out today's legal
-   * entity as well, and three callers applied it to business dates months back — so a person who
-   * transferred entity had a filed month recomputed against the one they are in now. `recomputeDay`
-   * asks that question of the day it is rebuilding.
-   */
-  async function personContext(tx: Tx, workspaceId: string, personId: string) {
-    const today = todayIso()
-    const resolution = await resolve.forPerson(tx, workspaceId, personId, today)
-    const schedule = await attendance.scheduleFor(tx, workspaceId, personId, today)
-    return { timezone: resolution.timezone, schedule, resolution }
   }
 
   /**
@@ -4142,45 +4390,6 @@ export function implement_(kernel: Kernel) {
     )
     await changed(input.workspaceId, 'attendance_day', row.personId, 'updated')
     return toPunch(row)
-  }
-
-  /**
-   * Apply an approved correction: write the proposed punches, void what they replace, rebuild.
-   *
-   * Nothing is edited. The original punch keeps its row and gains a pointer to what superseded it,
-   * so a corrected timesheet and an edited one stay distinguishable — which is the entire reason
-   * regularization exists rather than an update statement.
-   */
-  async function applyRegularization(tx: Tx, workspaceId: string, regularizationId: string) {
-    const [row] = await tx
-      .select()
-      .from(regularizations)
-      .where(and(eq(regularizations.workspaceId, workspaceId), eq(regularizations.id, regularizationId)))
-      .limit(1)
-    if (!row || row.status === 'approved') return
-
-    if (row.punchId) await attendance.voidPunch(tx, workspaceId, row.punchId, 'Regularized', null)
-
-    const { timezone, schedule } = await personContext(tx, workspaceId, row.personId)
-    for (const proposal of row.proposed as Array<{ direction: string; at: string }>)
-      await tx.insert(punches).values({
-        id: uuidv7(),
-        workspaceId,
-        personId: row.personId,
-        direction: proposal.direction,
-        at: new Date(proposal.at),
-        businessDate: row.businessDate,
-        timezone,
-        method: 'manual',
-        trust: 'trusted',
-        note: `Regularization ${row.id}`,
-      })
-
-    await attendance.recomputeDay(tx, workspaceId, row.personId, row.businessDate, timezone, schedule)
-    await tx
-      .update(regularizations)
-      .set({ status: 'approved', appliedAt: new Date() })
-      .where(eq(regularizations.id, row.id))
   }
 
   async function loadPolicy(tx: Tx, workspaceId: string, policyId: string) {

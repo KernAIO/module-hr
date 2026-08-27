@@ -5,6 +5,9 @@ import { alias } from 'drizzle-orm/pg-core'
 import { hrEvents, MODULE_ID } from '../contract/index.js'
 import { accrueForPeriod, carryExpiryDate, carryForward, carryHasLapsed } from '../policy/accrual.js'
 import { daysInMonth } from '../policy/calendar.js'
+// The appliers, not the router: `hrSubjects` is a module-level factory in `router.ts` precisely so
+// a job can reach what used to live inside `implement_`'s closure. Nothing here builds a router.
+import { hrSubjects } from './router.js'
 import {
   attendanceDays,
   employments,
@@ -621,6 +624,10 @@ export function hrJobs(): JobDef[] {
        * none, which is the worst kind of setting — one an administrator saves, believes, and tells
        * their staff about. `ApprovalService.sweepTimeouts` is what answers it.
        *
+       * It **completes** a request rather than only advancing one, which for a while it could not:
+       * the engine is handed the same appliers the router uses, so an auto-approved last step books
+       * the leave it granted in the same transaction as the decision.
+       *
        * Hourly, and **not** fanned out per office: an SLA is an elapsed duration, so its boundary
        * is the same instant everywhere. At :45 rather than on the hour, so it is not queued behind
        * the two calendar jobs and `auto-clock-out` on a small instance.
@@ -634,18 +641,50 @@ export function hrJobs(): JobDef[] {
       name: 'approval-timeouts',
       cron: '45 * * * *',
       handler: async (_input, { kernel }) => {
-        // No appliers, and that is the honest state of it: turning an approved request into booked
-        // leave lives in the router's closure (`applyApproval`, `applyRegularization`) where a job
-        // cannot reach it. So the sweep will escalate and remind, and it will auto-approve a step
-        // that only advances the request — but it refuses to *complete* a request it cannot apply,
-        // and reminds instead. Passing those two functions in here is the whole of what is missing.
-        const approvals = new ApprovalService(kernel)
+        // The same appliers the router hands the engine, from the same factory: `hrSubjects` exists
+        // because these two functions used to live in the router's closure, where a job could not
+        // reach them — so a timeout could advance an intermediate step and then refuse the step
+        // that *completed* a request, logging that it had reminded instead. A deadline that worked
+        // on every step but the last is a deadline nobody can rely on.
+        //
+        // No actor, and that is the same statement `TIMEOUT_APPROVER_ID` makes on the decision row:
+        // a clock ran out, so nothing here may put a person's name against the ledger entry it
+        // writes.
+        const resolve = new ResolveService()
+        const subjects = hrSubjects({
+          resolve,
+          ledger: new LedgerService(),
+          attendance: new AttendanceService(resolve, new PolicyService(resolve)),
+        })
+        const approvals = new ApprovalService(kernel, subjects.appliersFor(null))
         const now = new Date()
 
         for (const workspaceId of await activeWorkspaces(kernel)) {
-          const sweep = await kernel.database.withWorkspace(workspaceId, (tx) =>
-            approvals.sweepTimeouts(tx, workspaceId, now),
-          )
+          /**
+           * One tenant's failure stays one tenant's failure.
+           *
+           * The appliers run *inside* the sweep's transaction, which is what makes a decision and
+           * the leave it books atomic — and it is also what lets one unbookable request abort the
+           * whole transaction. Until they were passed in, nothing in this handler could throw for a
+           * reason belonging to a single workspace's data; now it can, and an unguarded loop would
+           * let that workspace stop every other workspace's deadlines, hourly, indefinitely.
+           *
+           * Nothing is swallowed by this: the sweep is one transaction, so a workspace that throws
+           * has changed nothing and is swept again on the next tick, and the error is logged rather
+           * than counted.
+           */
+          let sweep: Awaited<ReturnType<typeof approvals.sweepTimeouts>>
+          try {
+            sweep = await kernel.database.withWorkspace(workspaceId, (tx) =>
+              approvals.sweepTimeouts(tx, workspaceId, now),
+            )
+          } catch (err) {
+            kernel.log.error(
+              { module: 'hr', workspaceId, err: (err as Error).message },
+              'approval deadline sweep failed; other workspaces continue',
+            )
+            continue
+          }
           if (!sweep.touchedRequestIds.length) continue
 
           for (const decision of sweep.decided)
