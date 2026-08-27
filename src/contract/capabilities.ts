@@ -123,6 +123,18 @@ export const hrCapabilities = defineCapabilities([
     level: 1,
   },
   {
+    id: 'rosters',
+    label: 'Shift rosters',
+    description: 'Rotating shifts on a calendar, and who covers which office-day',
+    // Depends on attendance rather than on core: a roster is what the clock and the day sheet are
+    // judged against, and rostering a workspace that never clocks anybody in is a planning grid
+    // nothing reads. Off by default and level 3 — most companies work a week that repeats, and for
+    // them a rotation editor is a screen full of settings that change nothing.
+    dependsOn: ['attendance'],
+    defaultEnabled: false,
+    level: 3,
+  },
+  {
     id: 'documents',
     label: 'Employee documents',
     description: 'Contracts, identity documents and certificates against a person',
@@ -247,6 +259,23 @@ export const hrCapabilityProcedures: Record<string, readonly string[]> = {
     'reports.attendance',
     'reports.overtime',
     'reports.absence',
+  ],
+  rosters: [
+    'rosters.shifts.list',
+    'rosters.shifts.create',
+    'rosters.shifts.update',
+    'rosters.shifts.archive',
+    'rosters.patterns.list',
+    'rosters.patterns.create',
+    'rosters.patterns.update',
+    'rosters.patterns.archive',
+    'rosters.assignments',
+    'rosters.assign',
+    'rosters.unassign',
+    'rosters.days',
+    'rosters.set',
+    'rosters.clear',
+    'rosters.coverage',
   ],
   leave_accrual: [
     'policies.list',

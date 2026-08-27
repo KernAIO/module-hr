@@ -52,6 +52,7 @@ import {
   RegionCode,
   ResolvedCalendarDay,
   TimeZone,
+  WallClock,
   WorkingWeek,
 } from './models.js'
 import {
@@ -77,6 +78,14 @@ import {
   OvertimeReport,
   ReportSliceBy,
 } from './reports.js'
+import {
+  RosterAssignment,
+  RosterCoverageDay,
+  RosterCycleDay,
+  RosterDay,
+  RosterPattern,
+  RosterShift,
+} from './rosters.js'
 
 const ws = z.object({ workspaceId: WorkspaceId })
 const t = ['hr'] as const
@@ -972,6 +981,180 @@ export const hrContract = {
         )
         .output(Regularization),
     },
+  },
+
+  // ---------------------------------------------------------------- rosters
+  /**
+   * Who works which shift on which **date**.
+   *
+   * Separate from `attendance.schedules` rather than folded into it, because the two answer
+   * different questions and only one of them has a weekly period. A schedule is a week that repeats
+   * for ever; a rotation is a cycle of any length anchored to a date, which is the only shape
+   * 4-on-4-off has. Nothing here recomputes hours — grace, rounding, overnight attribution and the
+   * auto-close sweep all stay in attendance, and a roster only decides what the day was meant to be.
+   */
+  rosters: {
+    shifts: {
+      list: baseContract
+        .route({ method: 'GET', path: '/rosters/shifts', tags: t })
+        .input(ws.extend({ includeArchived: z.boolean().default(false) }))
+        .output(z.array(RosterShift)),
+      create: baseContract
+        .route({ method: 'POST', path: '/rosters/shifts', tags: t })
+        .input(
+          ws.extend({
+            name: z.string().min(1).max(80),
+            code: z.string().max(8).nullish(),
+            start: WallClock,
+            end: WallClock,
+            breakMinutes: z.number().int().min(0).max(480).default(0),
+            graceInMinutes: z.number().int().min(0).max(240).default(0),
+            graceOutMinutes: z.number().int().min(0).max(240).default(0),
+            color: z.string().max(32).nullish(),
+          }),
+        )
+        .output(RosterShift),
+      update: baseContract
+        .route({ method: 'PATCH', path: '/rosters/shifts/{shiftId}', tags: t })
+        .input(
+          ws.extend({
+            shiftId: z.uuid(),
+            name: z.string().min(1).max(80).optional(),
+            code: z.string().max(8).nullish(),
+            start: WallClock.optional(),
+            end: WallClock.optional(),
+            breakMinutes: z.number().int().min(0).max(480).optional(),
+            graceInMinutes: z.number().int().min(0).max(240).optional(),
+            graceOutMinutes: z.number().int().min(0).max(240).optional(),
+            color: z.string().max(32).nullish(),
+          }),
+        )
+        .output(RosterShift),
+      /**
+       * Archive, never delete. Patterns and stored overrides point at a shift by id, so deleting
+       * one would empty out every day it appears on — past days included.
+       */
+      archive: baseContract
+        .route({ method: 'DELETE', path: '/rosters/shifts/{shiftId}', tags: t })
+        .input(ws.extend({ shiftId: z.uuid() }))
+        .output(ok),
+    },
+
+    patterns: {
+      list: baseContract
+        .route({ method: 'GET', path: '/rosters/patterns', tags: t })
+        .input(ws.extend({ includeArchived: z.boolean().default(false) }))
+        .output(z.array(RosterPattern)),
+      create: baseContract
+        .route({ method: 'POST', path: '/rosters/patterns', tags: t })
+        .input(
+          ws.extend({
+            name: z.string().min(1).max(120),
+            anchorDate: IsoDate,
+            days: z.array(RosterCycleDay).min(1).max(56),
+          }),
+        )
+        .output(RosterPattern),
+      /**
+       * Editing a rotation moves every crew on it, on every date, at once — which is the point of a
+       * rotation being computed rather than generated, and worth saying out loud on the screen that
+       * does it.
+       */
+      update: baseContract
+        .route({ method: 'PATCH', path: '/rosters/patterns/{patternId}', tags: t })
+        .input(
+          ws.extend({
+            patternId: z.uuid(),
+            name: z.string().min(1).max(120).optional(),
+            anchorDate: IsoDate.optional(),
+            days: z.array(RosterCycleDay).min(1).max(56).optional(),
+          }),
+        )
+        .output(RosterPattern),
+      archive: baseContract
+        .route({ method: 'DELETE', path: '/rosters/patterns/{patternId}', tags: t })
+        .input(ws.extend({ patternId: z.uuid() }))
+        .output(ok),
+    },
+
+    /** Who is on which rotation, and when. `attendance.schedules` has no equivalent and should. */
+    assignments: baseContract
+      .route({ method: 'GET', path: '/rosters/assignments', tags: t })
+      .input(ws.extend({ personId: z.uuid().optional(), patternId: z.uuid().optional() }))
+      .output(z.array(RosterAssignment)),
+
+    /**
+     * Put a crew on a rotation.
+     *
+     * Takes a list of people because a rotation is a crew's, not a person's — assigning eleven
+     * people one at a time is eleven chances to get the offset wrong. The previous assignment is
+     * closed the day before, so "which rotation was she on in March" stays answerable.
+     */
+    assign: baseContract
+      .route({ method: 'POST', path: '/rosters/assign', tags: t })
+      .input(
+        ws.extend({
+          patternId: z.uuid(),
+          personIds: z.array(z.uuid()).min(1).max(200),
+          effectiveFrom: IsoDate,
+          /** The last day covered, inclusive. Null leaves the assignment open. */
+          effectiveTo: IsoDate.nullish(),
+          /** Which position of the cycle `effectiveFrom` starts at — how two crews run out of phase. */
+          cycleOffset: z.number().int().min(0).max(55).default(0),
+        }),
+      )
+      .output(z.array(RosterAssignment)),
+
+    /** Take a crew off its rotation, from the day after `effectiveTo`. Nothing is deleted. */
+    unassign: baseContract
+      .route({ method: 'POST', path: '/rosters/unassign', tags: t })
+      .input(
+        ws.extend({
+          personIds: z.array(z.uuid()).min(1).max(200),
+          /** The last day the rotation still applies. */
+          effectiveTo: IsoDate,
+        }),
+      )
+      .output(z.object({ closed: z.number().int() })),
+
+    /** One person's roster over a range, rotation and overrides already resolved. */
+    days: baseContract
+      .route({ method: 'GET', path: '/rosters/days', tags: t })
+      .input(ws.extend({ personId: z.uuid().optional(), from: IsoDate, to: IsoDate }))
+      .output(z.array(RosterDay)),
+
+    /**
+     * Change one day, leaving the rotation alone.
+     *
+     * An empty `shiftIds` is "off that day" and is stored — a planned rest day and a day nothing
+     * rosters at all are different facts, and only one of them is somebody's decision.
+     */
+    set: baseContract
+      .route({ method: 'POST', path: '/rosters/days', tags: t })
+      .input(
+        ws.extend({
+          personId: z.uuid(),
+          businessDate: IsoDate,
+          shiftIds: RosterCycleDay,
+          note: z.string().max(500).nullish(),
+        }),
+      )
+      .output(RosterDay),
+
+    /** Drop the exception and let the rotation speak for that day again. */
+    clear: baseContract
+      .route({ method: 'DELETE', path: '/rosters/days', tags: t })
+      .input(ws.extend({ personId: z.uuid(), businessDate: IsoDate }))
+      .output(ok),
+
+    /**
+     * Who is on which shift, per day — the question a roster exists for and the one a set of weekly
+     * schedules cannot be asked without walking everybody's week.
+     */
+    coverage: baseContract
+      .route({ method: 'GET', path: '/rosters/coverage', tags: t })
+      .input(ws.extend({ from: IsoDate, to: IsoDate, officeId: z.uuid().optional() }))
+      .output(z.array(RosterCoverageDay)),
   },
 
   // ---------------------------------------------------------------- leave

@@ -79,6 +79,10 @@ import {
   positions,
   punches,
   regularizations,
+  rosterAssignments,
+  rosterOverrides,
+  rosterPatterns,
+  rosterShifts,
   scheduleAssignments,
   schedules,
 } from './schema.js'
@@ -117,6 +121,7 @@ import {
   round2,
 } from './services/reports.js'
 import { DEFAULT_WORKING_WEEK, ResolveService } from './services/resolve.js'
+import { type ResolvedRosterDay, RosterService, rosterRefusal } from './services/rosters.js'
 
 const os = implement(hrContract).$context<RequestContext>()
 
@@ -644,6 +649,7 @@ export function implement_(kernel: Kernel) {
   const approvals = new ApprovalService(kernel, subjects.appliersFor(null))
   const privacy = new PrivacyService()
   const reports = new ReportsService(resolve)
+  const rosters = new RosterService()
   const payroll = new PayrollExportService(reports)
   const audit = new HrAuditService(kernel, access)
   const db = kernel.database
@@ -3012,6 +3018,491 @@ export function implement_(kernel: Kernel) {
       },
     },
 
+    // ================================================================= rosters
+    rosters: {
+      shifts: {
+        list: scoped.rosters.shifts.list
+          .use(cap('rosters'))
+          .use(requires('hr.attendance.view'))
+          .handler(({ input }) =>
+            db.withWorkspace(input.workspaceId, async (tx) => {
+              const where = [eq(rosterShifts.workspaceId, input.workspaceId)]
+              if (!input.includeArchived) where.push(isNull(rosterShifts.archivedAt))
+              const rows = await tx
+                .select()
+                .from(rosterShifts)
+                .where(and(...where))
+                .orderBy(asc(rosterShifts.startTime), asc(rosterShifts.name))
+              return rows.map(toRosterShift)
+            }),
+          ),
+        create: scoped.rosters.shifts.create
+          .use(cap('rosters'))
+          .use(requires('hr.attendance.manage'))
+          .handler(async ({ input }) => {
+            const row = await db.withWorkspace(input.workspaceId, async (tx) => {
+              const [created] = await tx
+                .insert(rosterShifts)
+                .values({
+                  id: uuidv7(),
+                  workspaceId: input.workspaceId,
+                  name: input.name,
+                  code: input.code ?? null,
+                  startTime: input.start,
+                  endTime: input.end,
+                  breakMinutes: input.breakMinutes,
+                  graceInMinutes: input.graceInMinutes,
+                  graceOutMinutes: input.graceOutMinutes,
+                  color: input.color ?? null,
+                })
+                .returning()
+              return created!
+            })
+            await changed(input.workspaceId, 'roster_shift', row.id, 'created')
+            return toRosterShift(row)
+          }),
+        update: scoped.rosters.shifts.update
+          .use(cap('rosters'))
+          .use(requires('hr.attendance.manage'))
+          .handler(async ({ input }) => {
+            const row = await db.withWorkspace(input.workspaceId, async (tx) => {
+              // Written out rather than looped over the patch, because two of the fields are named
+              // differently in the contract and in the table: `start`/`end` read well on a shift and
+              // are `start_time`/`end_time` in SQL, where `end` is a keyword.
+              const set: Record<string, unknown> = { updatedAt: new Date() }
+              if (input.name !== undefined) set.name = input.name
+              if (input.code !== undefined) set.code = input.code ?? null
+              if (input.start !== undefined) set.startTime = input.start
+              if (input.end !== undefined) set.endTime = input.end
+              if (input.breakMinutes !== undefined) set.breakMinutes = input.breakMinutes
+              if (input.graceInMinutes !== undefined) set.graceInMinutes = input.graceInMinutes
+              if (input.graceOutMinutes !== undefined) set.graceOutMinutes = input.graceOutMinutes
+              if (input.color !== undefined) set.color = input.color ?? null
+              const [updated] = await tx
+                .update(rosterShifts)
+                .set(set)
+                .where(
+                  and(eq(rosterShifts.workspaceId, input.workspaceId), eq(rosterShifts.id, input.shiftId)),
+                )
+                .returning()
+              if (!updated) throw KernError.notFound('Shift')
+              return updated
+            })
+            await changed(input.workspaceId, 'roster_shift', row.id, 'updated')
+            return toRosterShift(row)
+          }),
+        archive: scoped.rosters.shifts.archive
+          .use(cap('rosters'))
+          .use(requires('hr.attendance.manage'))
+          .handler(async ({ input }) => {
+            // Archived, not deleted. Rotations and stored overrides point at a shift by id, and a
+            // deleted one would empty out every day it has ever appeared on — history included.
+            await db.withWorkspace(input.workspaceId, (tx) =>
+              tx
+                .update(rosterShifts)
+                .set({ archivedAt: new Date(), updatedAt: new Date() })
+                .where(
+                  and(eq(rosterShifts.workspaceId, input.workspaceId), eq(rosterShifts.id, input.shiftId)),
+                ),
+            )
+            await changed(input.workspaceId, 'roster_shift', input.shiftId, 'deleted')
+            return { ok: true as const }
+          }),
+      },
+
+      patterns: {
+        list: scoped.rosters.patterns.list
+          .use(cap('rosters'))
+          .use(requires('hr.attendance.view'))
+          .handler(({ input }) =>
+            db.withWorkspace(input.workspaceId, async (tx) => {
+              const where = [eq(rosterPatterns.workspaceId, input.workspaceId)]
+              if (!input.includeArchived) where.push(isNull(rosterPatterns.archivedAt))
+              const rows = await tx
+                .select()
+                .from(rosterPatterns)
+                .where(and(...where))
+                .orderBy(asc(rosterPatterns.name))
+              return rows.map(toRosterPattern)
+            }),
+          ),
+        create: scoped.rosters.patterns.create
+          .use(cap('rosters'))
+          .use(requires('hr.attendance.manage'))
+          .handler(async ({ input }) => {
+            const row = await db.withWorkspace(input.workspaceId, async (tx) => {
+              await rosters.assertShiftsExist(tx, input.workspaceId, input.days.flat())
+              const [created] = await tx
+                .insert(rosterPatterns)
+                .values({
+                  id: uuidv7(),
+                  workspaceId: input.workspaceId,
+                  name: input.name,
+                  anchorDate: input.anchorDate,
+                  days: input.days.map((d) => [...d]),
+                })
+                .returning()
+              return created!
+            })
+            await changed(input.workspaceId, 'roster_pattern', row.id, 'created')
+            return toRosterPattern(row)
+          }),
+        update: scoped.rosters.patterns.update
+          .use(cap('rosters'))
+          .use(requires('hr.attendance.manage'))
+          .handler(async ({ input }) => {
+            const row = await db.withWorkspace(input.workspaceId, async (tx) => {
+              if (input.days) await rosters.assertShiftsExist(tx, input.workspaceId, input.days.flat())
+              const set: Record<string, unknown> = { updatedAt: new Date() }
+              if (input.name !== undefined) set.name = input.name
+              if (input.anchorDate !== undefined) set.anchorDate = input.anchorDate
+              if (input.days !== undefined) set.days = input.days.map((d) => [...d])
+              const [updated] = await tx
+                .update(rosterPatterns)
+                .set(set)
+                .where(
+                  and(
+                    eq(rosterPatterns.workspaceId, input.workspaceId),
+                    eq(rosterPatterns.id, input.patternId),
+                  ),
+                )
+                .returning()
+              if (!updated) throw KernError.notFound('Rotation')
+              return updated
+            })
+            await changed(input.workspaceId, 'roster_pattern', row.id, 'updated')
+            return toRosterPattern(row)
+          }),
+        archive: scoped.rosters.patterns.archive
+          .use(cap('rosters'))
+          .use(requires('hr.attendance.manage'))
+          .handler(async ({ input }) => {
+            // Hidden from the pickers, still read by everybody already on it. Archiving a rotation
+            // people are working is not the same as taking them off it, and silently emptying their
+            // roster would be a worse answer than leaving it visible until somebody unassigns them.
+            await db.withWorkspace(input.workspaceId, (tx) =>
+              tx
+                .update(rosterPatterns)
+                .set({ archivedAt: new Date(), updatedAt: new Date() })
+                .where(
+                  and(
+                    eq(rosterPatterns.workspaceId, input.workspaceId),
+                    eq(rosterPatterns.id, input.patternId),
+                  ),
+                ),
+            )
+            await changed(input.workspaceId, 'roster_pattern', input.patternId, 'deleted')
+            return { ok: true as const }
+          }),
+      },
+
+      assignments: scoped.rosters.assignments
+        .use(cap('rosters'))
+        .use(requires('hr.attendance.view_team'))
+        .handler(({ input }) =>
+          db.withWorkspace(input.workspaceId, async (tx) => {
+            const where = [eq(rosterAssignments.workspaceId, input.workspaceId)]
+            if (input.personId) where.push(eq(rosterAssignments.personId, input.personId))
+            if (input.patternId) where.push(eq(rosterAssignments.patternId, input.patternId))
+            const rows = await tx
+              .select()
+              .from(rosterAssignments)
+              .where(and(...where))
+              .orderBy(desc(rosterAssignments.effectiveFrom), asc(rosterAssignments.id))
+            return rows.map(toRosterAssignment)
+          }),
+        ),
+
+      assign: scoped.rosters.assign
+        .use(cap('rosters'))
+        .use(requires('hr.attendance.manage'))
+        .handler(async ({ input }) => {
+          const rows = await db.withWorkspace(input.workspaceId, async (tx) => {
+            const [pattern] = await tx
+              .select()
+              .from(rosterPatterns)
+              .where(
+                and(
+                  eq(rosterPatterns.workspaceId, input.workspaceId),
+                  eq(rosterPatterns.id, input.patternId),
+                ),
+              )
+              .limit(1)
+            if (!pattern) throw KernError.notFound('Rotation')
+
+            const personIds = [...new Set(input.personIds)]
+            const known = await tx
+              .select({ id: people.id, displayName: people.displayName })
+              .from(people)
+              .where(and(eq(people.workspaceId, input.workspaceId), inArray(people.id, personIds)))
+            if (known.length !== personIds.length)
+              throw KernError.badRequest('This list names somebody who is not in this workspace.')
+            const nameOf = new Map(known.map((p) => [p.id, p.displayName]))
+
+            // An assignment already running when this one starts is closed the day before, which is
+            // how "which rotation was she on in March" stays answerable.
+            await tx
+              .update(rosterAssignments)
+              .set({ effectiveTo: sql`${input.effectiveFrom}::date - 1` })
+              .where(
+                and(
+                  eq(rosterAssignments.workspaceId, input.workspaceId),
+                  inArray(rosterAssignments.personId, personIds),
+                  lte(rosterAssignments.effectiveFrom, sql`${input.effectiveFrom}::date - 1`),
+                  or(
+                    isNull(rosterAssignments.effectiveTo),
+                    gte(rosterAssignments.effectiveTo, input.effectiveFrom),
+                  ),
+                ),
+              )
+
+            // One that starts *later* cannot be trimmed backwards without deleting somebody's plan,
+            // so it is refused by name instead. The exclusion constraint would refuse it too, as
+            // `23P01` — a Postgres error code is not something the person at the screen can act on.
+            const clashWhere = [
+              eq(rosterAssignments.workspaceId, input.workspaceId),
+              inArray(rosterAssignments.personId, personIds),
+              gte(rosterAssignments.effectiveFrom, input.effectiveFrom),
+            ]
+            if (input.effectiveTo) clashWhere.push(lte(rosterAssignments.effectiveFrom, input.effectiveTo))
+            const clashes = await tx
+              .select()
+              .from(rosterAssignments)
+              .where(and(...clashWhere))
+              .orderBy(asc(rosterAssignments.effectiveFrom))
+              .limit(3)
+            if (clashes.length) {
+              const first = clashes[0]!
+              const who = nameOf.get(first.personId) ?? 'Somebody in this list'
+              throw KernError.badRequest(
+                `${who} already starts a rotation on ${first.effectiveFrom}. End that one first, or give this assignment an end date before it.`,
+              )
+            }
+
+            await tx.insert(rosterAssignments).values(
+              personIds.map((personId) => ({
+                id: uuidv7(),
+                workspaceId: input.workspaceId,
+                personId,
+                patternId: input.patternId,
+                effectiveFrom: input.effectiveFrom,
+                effectiveTo: input.effectiveTo ?? null,
+                cycleOffset: input.cycleOffset,
+              })),
+            )
+            return tx
+              .select()
+              .from(rosterAssignments)
+              .where(
+                and(
+                  eq(rosterAssignments.workspaceId, input.workspaceId),
+                  inArray(rosterAssignments.personId, personIds),
+                ),
+              )
+              .orderBy(desc(rosterAssignments.effectiveFrom), asc(rosterAssignments.id))
+          })
+          await changed(input.workspaceId, 'roster_assignment', input.patternId, 'updated')
+          return rows.map(toRosterAssignment)
+        }),
+
+      unassign: scoped.rosters.unassign
+        .use(cap('rosters'))
+        .use(requires('hr.attendance.manage'))
+        .handler(async ({ input }) => {
+          const closed = await db.withWorkspace(input.workspaceId, async (tx) => {
+            // Only assignments that have actually started by that date. Ending one before it begins
+            // is a deletion wearing an end date, and this procedure never deletes: an assignment
+            // somebody set up for next month is left for them to remove deliberately.
+            const rows = await tx
+              .update(rosterAssignments)
+              .set({ effectiveTo: input.effectiveTo })
+              .where(
+                and(
+                  eq(rosterAssignments.workspaceId, input.workspaceId),
+                  inArray(rosterAssignments.personId, [...new Set(input.personIds)]),
+                  isNull(rosterAssignments.effectiveTo),
+                  lte(rosterAssignments.effectiveFrom, input.effectiveTo),
+                ),
+              )
+              .returning({ id: rosterAssignments.id })
+            return rows.length
+          })
+          for (const personId of new Set(input.personIds))
+            await changed(input.workspaceId, 'roster_assignment', personId, 'updated')
+          return { closed }
+        }),
+
+      days: scoped.rosters.days
+        .use(cap('rosters'))
+        .use(requires('hr.attendance.view'))
+        .handler(({ input, context }) =>
+          db.withWorkspace(input.workspaceId, async (tx) => {
+            const personId = await rosterPersonFor(tx, input.workspaceId, context, input.personId)
+            const refusal = rosterRefusal({ from: input.from, to: input.to, coverage: false })
+            if (refusal) throw KernError.badRequest(refusal)
+            const days = await rosters.forPerson(tx, input.workspaceId, personId, input.from, input.to)
+            return days.map((day) => toRosterDay(personId, day))
+          }),
+        ),
+
+      set: scoped.rosters.set
+        .use(cap('rosters'))
+        .use(requires('hr.attendance.manage'))
+        .handler(async ({ input, context }) => {
+          const day = await db.withWorkspace(input.workspaceId, async (tx) => {
+            const [person] = await tx
+              .select({ id: people.id })
+              .from(people)
+              .where(and(eq(people.workspaceId, input.workspaceId), eq(people.id, input.personId)))
+              .limit(1)
+            if (!person) throw KernError.notFound('Employee')
+            await rosters.assertShiftsExist(tx, input.workspaceId, input.shiftIds)
+            const me = await svc.byUserId(tx, input.workspaceId, context.principal.userId ?? '')
+            await tx
+              .insert(rosterOverrides)
+              .values({
+                id: uuidv7(),
+                workspaceId: input.workspaceId,
+                personId: input.personId,
+                businessDate: input.businessDate,
+                shiftIds: [...input.shiftIds],
+                note: input.note ?? null,
+                createdBy: me?.id ?? null,
+              })
+              // One override per person-day, so a second edit of the same Tuesday replaces the
+              // first rather than adding a row nothing would ever choose between.
+              .onConflictDoUpdate({
+                target: [rosterOverrides.workspaceId, rosterOverrides.personId, rosterOverrides.businessDate],
+                set: {
+                  shiftIds: [...input.shiftIds],
+                  note: input.note ?? null,
+                  createdBy: me?.id ?? null,
+                  updatedAt: new Date(),
+                },
+              })
+            const [resolved] = await rosters.forPerson(
+              tx,
+              input.workspaceId,
+              input.personId,
+              input.businessDate,
+              input.businessDate,
+            )
+            return resolved!
+          })
+          await changed(input.workspaceId, 'roster_day', input.personId, 'updated')
+          return toRosterDay(input.personId, day)
+        }),
+
+      clear: scoped.rosters.clear
+        .use(cap('rosters'))
+        .use(requires('hr.attendance.manage'))
+        .handler(async ({ input }) => {
+          await db.withWorkspace(input.workspaceId, (tx) =>
+            tx
+              .delete(rosterOverrides)
+              .where(
+                and(
+                  eq(rosterOverrides.workspaceId, input.workspaceId),
+                  eq(rosterOverrides.personId, input.personId),
+                  eq(rosterOverrides.businessDate, input.businessDate),
+                ),
+              ),
+          )
+          await changed(input.workspaceId, 'roster_day', input.personId, 'updated')
+          return { ok: true as const }
+        }),
+
+      coverage: scoped.rosters.coverage
+        .use(cap('rosters'))
+        .use(requires('hr.attendance.view_team'))
+        .handler(({ input }) =>
+          db.withWorkspace(input.workspaceId, async (tx) => {
+            const shape = rosterRefusal({ from: input.from, to: input.to, coverage: true })
+            if (shape) throw KernError.badRequest(shape)
+
+            // The population is whoever a rotation covers — narrowed to one office when asked. A
+            // grid over people no rotation touches is a page of empty rows.
+            const rostered = await tx
+              .selectDistinct({ personId: rosterAssignments.personId })
+              .from(rosterAssignments)
+              .where(
+                and(
+                  eq(rosterAssignments.workspaceId, input.workspaceId),
+                  lte(rosterAssignments.effectiveFrom, input.to),
+                  or(isNull(rosterAssignments.effectiveTo), gte(rosterAssignments.effectiveTo, input.from)),
+                ),
+              )
+            let personIds = rostered.map((r) => r.personId)
+            if (input.officeId) {
+              const here = await tx
+                .select({ personId: officeAssignments.personId })
+                .from(officeAssignments)
+                .where(
+                  and(
+                    eq(officeAssignments.workspaceId, input.workspaceId),
+                    eq(officeAssignments.officeId, input.officeId),
+                    isNull(officeAssignments.effectiveTo),
+                  ),
+                )
+              const inOffice = new Set(here.map((h) => h.personId))
+              personIds = personIds.filter((id) => inOffice.has(id))
+            }
+
+            const dates = datesBetween(input.from, input.to)
+            if (!personIds.length) return dates.map((businessDate) => ({ businessDate, slots: [], off: [] }))
+
+            const tooWide = rosterRefusal({
+              from: input.from,
+              to: input.to,
+              coverage: true,
+              population: personIds.length,
+            })
+            if (tooWide) throw KernError.badRequest(tooWide)
+
+            const plan = await rosters.plan(tx, input.workspaceId, personIds, dates)
+            const named = await tx
+              .select({ personId: people.id, displayName: people.displayName })
+              .from(people)
+              .where(and(eq(people.workspaceId, input.workspaceId), inArray(people.id, personIds)))
+            const nameOf = new Map(named.map((p) => [p.personId, p.displayName]))
+            const person = (personId: string) => ({
+              personId,
+              displayName: nameOf.get(personId) ?? '',
+            })
+
+            return dates.map((businessDate, index) => {
+              const slots = new Map<string, { shift: ReturnType<typeof toRosterShift>; people: string[] }>()
+              const off: string[] = []
+              for (const personId of personIds) {
+                const day = plan.get(personId)?.[index]
+                // `none` means nothing rosters this person on this date, which is not the same as a
+                // planned day off and does not belong in either column.
+                if (!day || day.source === 'none') continue
+                if (!day.shifts.length) {
+                  off.push(personId)
+                  continue
+                }
+                for (const shift of day.shifts) {
+                  const slot = slots.get(shift.id) ?? { shift: toRosterShift(shift), people: [] }
+                  slot.people.push(personId)
+                  slots.set(shift.id, slot)
+                }
+              }
+              return {
+                businessDate,
+                slots: [...slots.values()]
+                  .sort(
+                    (a, b) =>
+                      a.shift.start.localeCompare(b.shift.start) || a.shift.name.localeCompare(b.shift.name),
+                  )
+                  .map((slot) => ({ shift: slot.shift, people: slot.people.map(person) })),
+                off: off.map(person),
+              }
+            })
+          }),
+        ),
+    },
+
     // ================================================================= leave
     leave: {
       types: {
@@ -4982,6 +5473,34 @@ export function implement_(kernel: Kernel) {
     return personId
   }
 
+  /**
+   * The same rule as `personFor`, asking for the attendance key rather than the leave one.
+   *
+   * A roster is what somebody is expected to turn up for, which is an attendance fact — reusing
+   * `personFor` here would mean a manager needed permission to read a colleague's *leave balance*
+   * before they could see who is on Tuesday's late shift. Reading your own needs nothing beyond
+   * being an employee, exactly as `attendance.days.list` already decides it.
+   */
+  async function rosterPersonFor(
+    tx: Tx,
+    workspaceId: string,
+    context: RequestContext,
+    personId: string | undefined,
+  ): Promise<string> {
+    const me = await svc.byUserId(tx, workspaceId, context.principal.userId ?? '')
+    if (!personId) {
+      if (!me) throw KernError.notFound('Your employee record')
+      return me.id
+    }
+    if (me && me.id === personId) return personId
+    await kernel.authz.require(context.principal, 'hr.attendance.view_team', {
+      kind: 'workspace',
+      id: workspaceId,
+      workspaceId,
+    })
+    return personId
+  }
+
   // ------------------------------------------------------------------ reports
 
   /** What the caller asked to narrow to, refusing a slice with nothing to narrow *to*. */
@@ -5765,6 +6284,40 @@ const toSchedule = (r: typeof schedules.$inferSelect) => ({
 const toScheduleAssignment = (r: typeof scheduleAssignments.$inferSelect) => ({
   ...r,
   createdAt: r.createdAt.toISOString(),
+})
+
+/**
+ * `start_time` / `end_time` in the table, `start` / `end` on the wire.
+ *
+ * The column names carry the suffix because `end` is a SQL keyword and a quoted keyword in every
+ * hand-written query is a trap for whoever writes the next one; the contract does not, because a
+ * shift reads as "start 06:00, end 14:00". The spread leaves both spellings on the object and zod
+ * strips the ones the schema does not name.
+ */
+const toRosterShift = (r: typeof rosterShifts.$inferSelect) => ({
+  ...r,
+  start: r.startTime,
+  end: r.endTime,
+  archivedAt: r.archivedAt?.toISOString() ?? null,
+})
+
+const toRosterPattern = (r: typeof rosterPatterns.$inferSelect) => ({
+  ...r,
+  days: r.days ?? [],
+  archivedAt: r.archivedAt?.toISOString() ?? null,
+})
+
+const toRosterAssignment = (r: typeof rosterAssignments.$inferSelect) => ({
+  ...r,
+  createdAt: r.createdAt.toISOString(),
+})
+
+const toRosterDay = (personId: string, day: ResolvedRosterDay) => ({
+  personId,
+  businessDate: day.businessDate,
+  shifts: day.shifts.map(toRosterShift),
+  source: day.source,
+  note: day.note,
 })
 
 const toRegularization = (r: typeof regularizations.$inferSelect) => ({

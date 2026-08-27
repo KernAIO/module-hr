@@ -78,6 +78,13 @@
       "when": 1787858088123,
       "tag": "0011_privacy",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1787864979651,
+      "tag": "0012_rosters",
+      "breakpoints": true
     }
   ]
 }

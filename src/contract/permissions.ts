@@ -252,8 +252,11 @@ export const hrPermissions = definePermissions([
   },
   {
     key: 'hr.attendance.manage',
-    label: 'Correct punches, schedules and day sheets',
-    description: 'Voids punches and recomputes days. Every change leaves the original visible.',
+    label: 'Correct punches and set schedules, rosters and day sheets',
+    description:
+      'Voids punches and recomputes days. Every change leaves the original visible. Also edits ' +
+      'shifts and rotations and puts people on them, which decides what a shift worker is ' +
+      'expected to turn up for.',
     scope: 'workspace',
     defaultRoles: ['owner', 'admin'],
     dangerous: true,
@@ -262,6 +265,14 @@ export const hrPermissions = definePermissions([
   // nothing asks a question these keys could answer — a role checkbox that gates nothing teaches an
   // administrator the same lesson a dead capability switch does. They come back with the approval
   // flow that needs them.
+  //
+  // No `hr.roster.*` either, for the same reason and after weighing it. Rostering is `manage`:
+  // deciding what somebody was meant to work is the same authority as correcting what they did, and
+  // both feed the same day sheet. Reading a roster is `hr.attendance.view` for your own and
+  // `hr.attendance.view_team` for anybody else's — the coverage grid asks for the second, which is
+  // already what `attendance.days.list` costs to read a whole office. Four new keys would gate
+  // nothing the three existing ones do not already gate, which is how `hr.overtime.*` came to be
+  // deleted. They arrive if a workspace ever needs a planner who may roster and may not correct.
 
   // ---------------------------------------------------------------- reports
   {

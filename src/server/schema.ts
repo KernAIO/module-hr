@@ -985,6 +985,128 @@ export const regularizations = schema.table(
 )
 
 // =====================================================================================
+// rosters — a shift on a date, where a schedule is a week that repeats
+// =====================================================================================
+
+/**
+ * A named shift. Early, Late, Night.
+ *
+ * Named rather than inlined into every rotation because coverage groups by it: "Early" in two
+ * patterns has to be one column of one grid, which a wall-clock pair repeated in two jsonb blobs
+ * cannot promise. Archived, never deleted — a pattern and a stored override both point at one by
+ * id, and a deleted shift would leave a roster row referring to nothing.
+ */
+export const rosterShifts = schema.table(
+  'roster_shifts',
+  {
+    id: id(),
+    workspaceId: ws(),
+    name: text('name').notNull(),
+    /** One or two letters, for a grid too dense to carry a name. */
+    code: text('code'),
+    /** Wall clocks, never instants — a shift is a rule, exactly as a schedule's week is. */
+    startTime: text('start_time').notNull(),
+    /** Earlier than `start_time` for a shift that ends the next morning. */
+    endTime: text('end_time').notNull(),
+    breakMinutes: integer('break_minutes').notNull().default(0),
+    graceInMinutes: integer('grace_in_minutes').notNull().default(0),
+    graceOutMinutes: integer('grace_out_minutes').notNull().default(0),
+    color: text('color'),
+    archivedAt: ts('archived_at'),
+    createdAt: created(),
+    updatedAt: updated(),
+  },
+  (t) => [index('hr_roster_shifts_ws_idx').on(t.workspaceId, t.archivedAt)],
+)
+
+/**
+ * A rotation: a cycle of days, and the date the cycle starts from.
+ *
+ * `days` is an array of arrays of `roster_shifts.id` — one entry per day of the cycle, each holding
+ * the shifts worked that day. An empty entry is a planned rest day. The cycle length is
+ * `jsonb_array_length(days)` and is deliberately not a second column: two numbers that have to
+ * agree is one number and a bug waiting for somebody to edit one of them.
+ *
+ * **Nothing here is expanded into rows.** A year of generated shifts per person is what makes a
+ * roster impossible to change: moving a crew forward one day becomes a bulk rewrite with no way to
+ * tell which rows a human had already corrected. What somebody works on a date is arithmetic from
+ * `anchor_date`, the assignment's `cycle_offset` and this array.
+ */
+export const rosterPatterns = schema.table(
+  'roster_patterns',
+  {
+    id: id(),
+    workspaceId: ws(),
+    name: text('name').notNull(),
+    /** The date `days[0]` applies to. Moving it rotates every crew on this pattern at once. */
+    anchorDate: date('anchor_date').notNull(),
+    days: jsonb('days').$type<string[][]>().notNull().default(sql`'[]'::jsonb`),
+    archivedAt: ts('archived_at'),
+    createdAt: created(),
+    updatedAt: updated(),
+  },
+  (t) => [index('hr_roster_patterns_ws_idx').on(t.workspaceId, t.archivedAt)],
+)
+
+/**
+ * A person on a rotation, over a period.
+ *
+ * Effective-dated like `schedule_assignments`, and with the same exclusion constraint from the day
+ * the table exists rather than five migrations later: the resolver picks the assignment in force
+ * with `limit 1`, so two in force is a roster that answers differently depending on which row the
+ * executor hands back first.
+ *
+ * `cycle_offset` is what puts two crews on one pattern out of phase — crew B at offset 4 on a
+ * 4-on-4-off cycle works exactly the days crew A is off. Without it each crew needs its own copy of
+ * the rotation, and a change to the rotation has to be made once per copy.
+ */
+export const rosterAssignments = schema.table(
+  'roster_assignments',
+  {
+    id: id(),
+    workspaceId: ws(),
+    personId: uuid('person_id').notNull(),
+    patternId: uuid('pattern_id').notNull(),
+    effectiveFrom: date('effective_from').notNull(),
+    effectiveTo: date('effective_to'),
+    cycleOffset: integer('cycle_offset').notNull().default(0),
+    createdAt: created(),
+  },
+  (t) => [index('hr_roster_assign_idx').on(t.workspaceId, t.personId, t.effectiveFrom)],
+)
+
+/**
+ * One day that differs from the rotation, and nothing else.
+ *
+ * The whole reason a roster is not a schedule: a schedule change is effective-dated and rewrites
+ * every day after it, while somebody covering one Tuesday needs one Tuesday changed.
+ *
+ * `shift_ids` is an array for the same reason a cycle day is — a split shift is two entries, not
+ * something the model forbids. An empty array is "this person is off that day", which is why the
+ * row exists at all: without it, "off" and "no override" would be the same absence of a row.
+ *
+ * The unique index is on the *record*, one per person-day, not on the shift. That distinction is
+ * the whole of the split-shift question: a unique index on `(workspace, person, business_date,
+ * shift)` would allow two shifts and forbid two overrides, and one on the person-day with a scalar
+ * shift column would do the reverse. Neither is what an override means.
+ */
+export const rosterOverrides = schema.table(
+  'roster_overrides',
+  {
+    id: id(),
+    workspaceId: ws(),
+    personId: uuid('person_id').notNull(),
+    businessDate: date('business_date').notNull(),
+    shiftIds: jsonb('shift_ids').$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+    note: text('note'),
+    createdBy: uuid('created_by'),
+    createdAt: created(),
+    updatedAt: updated(),
+  },
+  (t) => [uniqueIndex('hr_roster_override_uq').on(t.workspaceId, t.personId, t.businessDate)],
+)
+
+// =====================================================================================
 // policies and periods
 // =====================================================================================
 
@@ -1137,6 +1259,10 @@ export const TENANT_TABLES = [
   'punches',
   'attendance_days',
   'regularizations',
+  'roster_shifts',
+  'roster_patterns',
+  'roster_assignments',
+  'roster_overrides',
   'policies',
   'policy_assignments',
   'periods',
