@@ -64,6 +64,13 @@
       "when": 1787759372069,
       "tag": "0009_beyond_cap_minutes",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1787851246006,
+      "tag": "0010_approval_timeouts",
+      "breakpoints": true
     }
   ]
 }

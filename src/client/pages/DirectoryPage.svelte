@@ -276,7 +276,7 @@ const balancesQuery = createQuery(() => ({
 const inboxQuery = createQuery(() => ({
   queryKey: hrKeys.approvalInbox(workspaceId),
   enabled: Boolean(workspaceId),
-  queryFn: () => api.approvals.inbox({ workspaceId, limit: 6, includeDecided: false }),
+  queryFn: () => api.approvals.inbox({ workspaceId, limit: 6, status: 'pending' }),
 }))
 const waiting = $derived(inboxQuery.data?.items ?? [])
 

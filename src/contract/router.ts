@@ -1132,10 +1132,19 @@ export const hrContract = {
 
   // ---------------------------------------------------------------- approvals
   approvals: {
-    /** Everything waiting on the caller, across every subject type. */
+    /**
+     * Everything waiting on the caller, across every subject type — or everything they have
+     * already settled.
+     *
+     * `status` rather than the `includeDecided` boolean it replaces. That flag was *inclusive*
+     * ("also give me the decided ones") while every caller used it as an exclusive two-tab switch,
+     * so the screen's "Decided" tab asked for decided-as-well and got pending rows listed under a
+     * heading that said somebody had decided them. Both halves read correctly on their own, which
+     * is why it survived: an enum makes the two tabs exactly what they say.
+     */
     inbox: baseContract
       .route({ method: 'GET', path: '/approvals/inbox', tags: t })
-      .input(ws.extend({ ...PageInput.shape, includeDecided: z.boolean().default(false) }))
+      .input(ws.extend({ ...PageInput.shape, status: z.enum(['pending', 'decided']).default('pending') }))
       .output(page(ApprovalRequest)),
     get: baseContract
       .route({ method: 'GET', path: '/approvals/{requestId}', tags: t })

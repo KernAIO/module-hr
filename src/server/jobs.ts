@@ -1,6 +1,8 @@
+import type { WorkspaceId } from '@kernhq/contracts'
 import type { JobDef, Kernel, Tx } from '@kernhq/kernel'
 import { and, eq, gt, gte, inArray, isNull, lte, notExists, sql } from 'drizzle-orm'
 import { alias } from 'drizzle-orm/pg-core'
+import { hrEvents, MODULE_ID } from '../contract/index.js'
 import { accrueForPeriod, carryExpiryDate, carryForward, carryHasLapsed } from '../policy/accrual.js'
 import { daysInMonth } from '../policy/calendar.js'
 import {
@@ -13,6 +15,7 @@ import {
   punches,
   schedules,
 } from './schema.js'
+import { ApprovalService } from './services/approvals.js'
 import { AttendanceService } from './services/attendance.js'
 import { todayIn } from './services/db.js'
 import { LedgerService } from './services/ledger.js'
@@ -45,8 +48,11 @@ const AUTO_CLOCK_OUT_LOOKBACK_DAYS = 3
  * each is idempotent by construction rather than by scheduling: the ledger is asked what it already
  * holds before anything is written.
  *
- * `auto-clock-out` is the exception, and says so where it lives: an elapsed hour is the same hour in
- * every zone, so an office decides which *zone* its punch is stamped in, not when the sweep fires.
+ * `auto-clock-out` and `approval-timeouts` are the exceptions, and each says so where it lives: both
+ * are counting an **elapsed duration**, and an hour is the same hour in every zone. An office
+ * decides which *zone* a punch is stamped in, not when the sweep fires, and a 24-hour SLA is 24
+ * hours in Tehran and in New York. Fanning those out per office would not make them more correct,
+ * only slower — the fan-out is for boundaries that are a date in a calendar.
  */
 export function hrJobs(): JobDef[] {
   return [
@@ -608,6 +614,81 @@ export function hrJobs(): JobDef[] {
 
     {
       /**
+       * Make a step's `slaHours` deadline mean something.
+       *
+       * The chain editor has offered a deadline and an `onTimeout` since the day it shipped, and
+       * nothing read either one: a step with a 24-hour SLA waited exactly as long as a step with
+       * none, which is the worst kind of setting — one an administrator saves, believes, and tells
+       * their staff about. `ApprovalService.sweepTimeouts` is what answers it.
+       *
+       * Hourly, and **not** fanned out per office: an SLA is an elapsed duration, so its boundary
+       * is the same instant everywhere. At :45 rather than on the hour, so it is not queued behind
+       * the two calendar jobs and `auto-clock-out` on a small instance.
+       *
+       * The transaction ends before anything leaves the process. A notification is written by core
+       * on its own connection, so one sent inside a transaction that then rolls back has already
+       * arrived — telling an approver about a reminder that was undone, or a requester their leave
+       * was granted when it was not. Everything the sweep decided is therefore reported, emitted
+       * and delivered afterwards, out of what it returns.
+       */
+      name: 'approval-timeouts',
+      cron: '45 * * * *',
+      handler: async (_input, { kernel }) => {
+        // No appliers, and that is the honest state of it: turning an approved request into booked
+        // leave lives in the router's closure (`applyApproval`, `applyRegularization`) where a job
+        // cannot reach it. So the sweep will escalate and remind, and it will auto-approve a step
+        // that only advances the request — but it refuses to *complete* a request it cannot apply,
+        // and reminds instead. Passing those two functions in here is the whole of what is missing.
+        const approvals = new ApprovalService(kernel)
+        const now = new Date()
+
+        for (const workspaceId of await activeWorkspaces(kernel)) {
+          const sweep = await kernel.database.withWorkspace(workspaceId, (tx) =>
+            approvals.sweepTimeouts(tx, workspaceId, now),
+          )
+          if (!sweep.touchedRequestIds.length) continue
+
+          for (const decision of sweep.decided)
+            await kernel.emit(
+              hrEvents.approvalDecided,
+              {
+                requestId: decision.requestId,
+                workspaceId,
+                subjectType: decision.subjectType,
+                subjectId: decision.subjectId,
+                status: decision.status,
+              },
+              // No actor, which is the point: the event stream is the other half of the audit trail
+              // and it must not name somebody who did not decide this.
+              { workspaceId, actorId: null },
+            )
+
+          for (const requestId of sweep.touchedRequestIds)
+            await kernel.realtime.change(workspaceId, {
+              module: MODULE_ID,
+              entity: 'approval',
+              id: requestId,
+              op: 'updated',
+            })
+
+          const delivered = await approvals.deliverNotices(sweep.notices)
+          kernel.log.info(
+            {
+              module: 'hr',
+              workspaceId,
+              reminded: sweep.reminded,
+              escalated: sweep.escalated,
+              autoApproved: sweep.autoApproved,
+              delivered,
+            },
+            'approval deadlines swept',
+          )
+        }
+      },
+    },
+
+    {
+      /**
        * Rebuild every recent day a period does not close.
        *
        * Punches recompute their own day inline, so this exists for what that path cannot see: a
@@ -677,11 +758,13 @@ export function hrJobs(): JobDef[] {
  * Read from this module's own tables rather than asked of core on every tick: a workspace with an
  * office has HR enabled, and one job run should not be N broker calls.
  */
-async function activeWorkspaces(kernel: Kernel): Promise<string[]> {
+async function activeWorkspaces(kernel: Kernel): Promise<WorkspaceId[]> {
   const { rows } = await kernel.database.pool.query<{ workspace_id: string }>(
     `select distinct workspace_id from mod_hr.offices where archived_at is null`,
   )
-  return rows.map((r) => r.workspace_id)
+  // Branded once here rather than at each call. A driver hands back a string; the column *is* a
+  // workspace id, and an event payload will not take one that has not said so.
+  return rows.map((r) => r.workspace_id as WorkspaceId)
 }
 
 /** An office and the date it is currently standing on. */

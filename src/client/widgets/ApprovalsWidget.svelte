@@ -22,7 +22,7 @@ const queryClient = useQueryClient()
 const inboxQuery = createQuery(() => ({
   queryKey: hrKeys.approvalInbox(workspaceId),
   enabled: Boolean(workspaceId),
-  queryFn: () => api.approvals.inbox({ workspaceId, limit: 5, includeDecided: false }),
+  queryFn: () => api.approvals.inbox({ workspaceId, limit: 5, status: 'pending' }),
 }))
 const items = $derived(inboxQuery.data?.items ?? [])
 

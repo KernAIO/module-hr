@@ -35,8 +35,8 @@ export const hrKeys = {
    * pending on, the decided one is history — so sharing a key would show one tab the other's
    * contents for as long as the refetch takes.
    */
-  approvalInbox: (ws: string, includeDecided = false) =>
-    ['hr', 'approvals', ws, includeDecided ? 'decided' : 'waiting'] as const,
+  approvalInbox: (ws: string, status: 'pending' | 'decided' = 'pending') =>
+    ['hr', 'approvals', ws, status] as const,
   delegations: (ws: string) => ['hr', 'delegations', ws] as const,
   calendar: (ws: string, id: string) => ['hr', 'calendar', ws, id] as const,
   calendarWorkingDays: (ws: string, calendarId: string, from: string, to: string) =>

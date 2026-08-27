@@ -918,11 +918,11 @@ describe('delegation', () => {
 
     // Before any delegation the request belongs to the manager alone — not to whoever happens to
     // sit nearby.
-    const before = await run((tx) => approvals.inboxFor(tx, WS_A, deputy, false, 50))
+    const before = await run((tx) => approvals.inboxFor(tx, WS_A, deputy, 'pending', 50))
     expect(before.some((r) => r.id === raised.request.id)).toBe(false)
 
     await delegateManagerTo(deputy, -1, 365)
-    const after = await run((tx) => approvals.inboxFor(tx, WS_A, deputy, false, 50))
+    const after = await run((tx) => approvals.inboxFor(tx, WS_A, deputy, 'pending', 50))
     expect(after.some((r) => r.id === raised.request.id)).toBe(true)
   })
 

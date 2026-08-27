@@ -45,7 +45,11 @@ import type { Period, Policy, PolicyAssignment, PolicySubjectKind } from '../con
  * Every sentence below is copied from `src/server/router.ts`, because the widget renders the
  * server's own words rather than a translated string.
  */
-function refuse(code: 'CONFLICT' | 'NOT_FOUND' | 'BAD_REQUEST', message: string, reason?: string): never {
+function refuse(
+  code: 'CONFLICT' | 'NOT_FOUND' | 'BAD_REQUEST' | 'FORBIDDEN',
+  message: string,
+  reason?: string,
+): never {
   // A declaration, not a `const` arrow: TypeScript only narrows on a `never` return for one of
   // those, so an arrow would leave every caller believing the row after the guard is still optional.
   //
@@ -1495,7 +1499,87 @@ export function createMockHrApi() {
     }
   }
 
-  const delegations: Array<Record<string, unknown>> = []
+  /**
+   * One live delegation, so a delegate deciding in somebody's place is visible at all.
+   *
+   * Sanne has handed her approvals to Ayşe — who is `people.me` — for a fortnight around today. The
+   * pending leave request below names Sanne and *not* Ayşe on its first step, so the only way that
+   * row can be decided is through this delegation. Without both halves the feature degrades to
+   * "decide as yourself", which is indistinguishable from the feature not existing.
+   */
+  const delegations: Array<Record<string, unknown>> = [
+    {
+      id: id('de01'),
+      fromPersonId: people[1]!.id,
+      toPersonId: people[0]!.id,
+      subjectType: null,
+      startsOn: day(-4),
+      endsOn: day(10),
+      reason: 'Parental leave',
+      createdAt: iso(5 * 86_400_000),
+    },
+    // The narrow one, and the reason both are here. `subjectType: null` above delegates everything;
+    // this delegates *time off only*, so the same deputy can decide Mehmet's leave and must not
+    // touch his attendance corrections. With only a wildcard seeded, the scope check has nothing to
+    // be wrong about and the fix that added it would look like it did nothing.
+    {
+      id: id('de02'),
+      fromPersonId: people[2]!.id,
+      toPersonId: people[0]!.id,
+      subjectType: 'leave',
+      startsOn: day(-2),
+      endsOn: day(14),
+      reason: 'Covering time off only',
+      createdAt: iso(3 * 86_400_000),
+    },
+  ]
+
+  /**
+   * Whether the reader may act on a step, given what the request is about.
+   *
+   * A set per delegator, not a single value: somebody may hold two delegations from the same person
+   * with different scopes, and taking the last row would silently drop the other grant.
+   */
+  const mayDecide = (approverIds: string[], subjectType: string) => {
+    const me = people[0]!.id
+    if (approverIds.includes(me)) return true
+    return delegations.some(
+      (d) =>
+        d.toPersonId === me &&
+        approverIds.includes(d.fromPersonId as string) &&
+        (d.subjectType === null || d.subjectType === subjectType) &&
+        String(d.startsOn) <= day(0) &&
+        String(d.endsOn) >= day(0),
+    )
+  }
+
+  let stepCounter = 0
+  const step = (
+    requestId: string,
+    stepIndex: number,
+    name: string,
+    approverIds: string[],
+    over: Record<string, unknown> = {},
+  ) => {
+    const row = {
+      id: id(`5e${(++stepCounter).toString(16).padStart(4, '0')}`),
+      requestId,
+      stepIndex,
+      name,
+      mode: 'any' as const,
+      minApprovals: 1,
+      approverIds,
+      status: 'pending' as string,
+      dueAt: null as string | null,
+      escalatedAt: null,
+      decisions: [] as Array<Record<string, unknown>>,
+      ...over,
+    }
+    // The factory owns the id, so it owns the link back to it. Writing `stepId` in the seed instead
+    // would make every decision depend on the order these are constructed in.
+    for (const decision of row.decisions) decision.stepId = row.id
+    return row
+  }
 
   const approvalRequests = [
     {
@@ -1512,7 +1596,8 @@ export function createMockHrApi() {
       requesterName: people[1]!.displayName,
       requestedAt: iso(3600_000),
       decidedAt: null as string | null,
-      steps: [] as Array<Record<string, unknown>>,
+      // Named on this step: Sanne's manager, who is Ayşe — reachable directly.
+      steps: [step(id('f001'), 0, 'Manager', [people[0]!.id])] as Array<Record<string, unknown>>,
     },
     {
       id: id('f002'),
@@ -1522,13 +1607,39 @@ export function createMockHrApi() {
       summary: `Correction for ${WD[1]}`,
       summaryParams: { date: WD[1]! } as Record<string, string | number> | null,
       status: 'pending' as string,
-      currentStep: 0,
+      // On the *second* step, because the first is already decided below. A request parked on a
+      // step it has finished would offer the caller a decision they have already made.
+      currentStep: 1,
       requestedBy: null,
       requesterPersonId: people[2]!.id,
       requesterName: people[2]!.displayName,
       requestedAt: iso(7200_000),
       decidedAt: null as string | null,
-      steps: [{ stepIndex: 0 }, { stepIndex: 1 }] as Array<Record<string, unknown>>,
+      /**
+       * Two steps, and the reason this request is the interesting one.
+       *
+       * Step 0 is decided, so the step counter has something to count. Step 1 names **Sanne** and
+       * not the caller, so the only route to a decision on it is the delegation she left — which is
+       * what makes the row read "on behalf of Sanne de Vries" rather than offering the caller's own
+       * name and quietly proving nothing.
+       */
+      steps: [
+        step(id('f002'), 0, 'Manager', [people[0]!.id], {
+          status: 'approved',
+          decisions: [
+            {
+              id: id('dec01'),
+              stepId: '',
+              approverId: people[0]!.id,
+              onBehalfOfId: null,
+              decision: 'approve',
+              comment: null,
+              at: iso(5400_000),
+            },
+          ],
+        }),
+        step(id('f002'), 1, 'HR', [people[1]!.id]),
+      ] as Array<Record<string, unknown>>,
     },
     {
       id: id('f003'),
@@ -1544,9 +1655,66 @@ export function createMockHrApi() {
       requesterName: people[0]!.displayName,
       requestedAt: iso(20 * 86_400_000),
       decidedAt: iso(19 * 86_400_000) as string | null,
-      steps: [] as Array<Record<string, unknown>>,
+      steps: [
+        step(id('f003'), 0, 'Manager', [people[1]!.id], {
+          status: 'approved',
+          decisions: [
+            {
+              id: id('dec02'),
+              stepId: '',
+              approverId: people[1]!.id,
+              onBehalfOfId: null,
+              decision: 'approve',
+              comment: null,
+              at: iso(19 * 86_400_000),
+            },
+          ],
+        }),
+      ] as Array<Record<string, unknown>>,
     },
   ]
+
+  /**
+   * The pair that makes the narrow delegation observable.
+   *
+   * Both name Mehmet, who has delegated **time off only**. So his deputy sees the leave request and
+   * does not see the correction — and the difference between the two rows is the only thing on
+   * screen that shows a scoped delegation is scoped.
+   */
+  approvalRequests.push(
+    {
+      id: id('f004'),
+      workspaceId: '',
+      subjectType: 'leave' as const,
+      subjectId: id('c005'),
+      summary: `2 day(s) from ${day(21)}`,
+      summaryParams: { days: 2, from: day(21), to: day(22) } as Record<string, string | number> | null,
+      status: 'pending' as string,
+      currentStep: 0,
+      requestedBy: null,
+      requesterPersonId: people[3]!.id,
+      requesterName: people[3]!.displayName,
+      requestedAt: iso(1800_000),
+      decidedAt: null as string | null,
+      steps: [step(id('f004'), 0, 'Manager', [people[2]!.id])] as Array<Record<string, unknown>>,
+    },
+    {
+      id: id('f005'),
+      workspaceId: '',
+      subjectType: 'regularization' as const,
+      subjectId: id('c006'),
+      summary: `Correction for ${WD[3]}`,
+      summaryParams: { date: WD[3]! } as Record<string, string | number> | null,
+      status: 'pending' as string,
+      currentStep: 0,
+      requestedBy: null,
+      requesterPersonId: people[3]!.id,
+      requesterName: people[3]!.displayName,
+      requestedAt: iso(2400_000),
+      decidedAt: null as string | null,
+      steps: [step(id('f005'), 0, 'Manager', [people[2]!.id])] as Array<Record<string, unknown>>,
+    },
+  )
 
   const leaveRequests: Array<Record<string, unknown>> = [
     {
@@ -3197,7 +3365,10 @@ export function createMockHrApi() {
             requesterName: people.find((x) => x.id === who)?.displayName ?? '',
             requestedAt: iso(),
             decidedAt: null,
-            steps: [],
+            // A step, not an empty array: a request raised through the mock has to be decidable the
+            // same way a seeded one is, or the newest row in the inbox is the one that behaves
+            // differently from every other.
+            steps: [step(created.approvalRequestId!, 0, 'Manager', [people[0]!.id])],
           })
           return { ...created, workspaceId: input.workspaceId }
         },
@@ -3579,18 +3750,34 @@ export function createMockHrApi() {
        * A demo whose "Decided" tab is empty looks like a broken filter rather than an empty
        * history, and the two-step request is what shows the step counter at all.
        */
+      /**
+       * Everything waiting on this reader — including what they may decide by delegation — or,
+       * with `status: 'decided'`, everything already settled. The two are exclusive.
+       *
+       * The scope check is the half that is easy to miss: a delegation may be narrower than the
+       * person who granted it, so whether a step is actionable depends on the *request's* subject
+       * type and cannot be answered from the step alone.
+       */
       inbox: async ({
         workspaceId,
-        includeDecided = false,
+        status = 'pending',
+        limit = 50,
       }: {
         workspaceId: string
-        includeDecided?: boolean
-      }) => ({
-        items: approvalRequests
-          .filter((r) => (includeDecided ? r.status !== 'pending' : r.status === 'pending'))
-          .map((r) => ({ ...r, workspaceId })),
-        nextCursor: null,
-      }),
+        status?: 'pending' | 'decided'
+        limit?: number
+      }) => {
+        const items = approvalRequests
+          .filter((r) => (status === 'pending' ? r.status === 'pending' : r.status !== 'pending'))
+          .filter((r) =>
+            mayDecide(
+              (r.steps as Array<{ approverIds?: string[] }>).flatMap((st) => st.approverIds ?? []),
+              r.subjectType,
+            ),
+          )
+          .map((r) => ({ ...r, workspaceId }))
+        return { items: items.slice(0, limit), nextCursor: null }
+      },
 
       get: async ({ workspaceId, requestId }: { workspaceId: string; requestId: string }) => {
         const found = approvalRequests.find((r) => r.id === requestId)
@@ -3598,17 +3785,71 @@ export function createMockHrApi() {
         return { ...found, workspaceId }
       },
 
+      /**
+       * Records who decided, and in whose place.
+       *
+       * The two ids mean opposite things on the two sides, which is easy to get backwards: on the
+       * way in, `onBehalfOfId` is *whose place you are taking*; on the stored row, `approverId` is
+       * the person the step actually names and `onBehalfOfId` is *whose hands it was*. That is what
+       * lets the decided row read "decided by Ayşe for Sanne" rather than losing one of the two
+       * names. `approvals.ts` does the same swap.
+       */
       decide: async ({
         workspaceId,
         requestId,
         decision,
+        comment = null,
+        onBehalfOfId = null,
       }: {
         workspaceId: string
         requestId: string
         decision: 'approve' | 'reject'
+        comment?: string | null
+        onBehalfOfId?: string | null
       }) => {
         const found = approvalRequests.find((r) => r.id === requestId)
         if (!found) refuse('NOT_FOUND', 'Approval request not found')
+        const me = people[0]!.id
+        const actingAs = onBehalfOfId ?? me
+        const current = found.steps[found.currentStep] as
+          | { id: string; approverIds?: string[]; status?: string; decisions?: unknown[] }
+          | undefined
+        // The same two refusals the service raises, in its words: being on the step is not the same
+        // question as holding a delegation from somebody who is.
+        if (current?.approverIds && !current.approverIds.includes(actingAs)) {
+          refuse('FORBIDDEN', 'You are not an approver on this step')
+        }
+        if (
+          onBehalfOfId &&
+          !delegations.some(
+            (d) =>
+              d.fromPersonId === onBehalfOfId &&
+              d.toPersonId === me &&
+              // Null is the wildcard — a delegation scoped to another subject type does not cover
+              // this request, and one scoped to nothing covers everything. `mayActFor` matches the
+              // null explicitly for the same reason.
+              (d.subjectType === null || d.subjectType === found.subjectType) &&
+              String(d.startsOn) <= day(0) &&
+              String(d.endsOn) >= day(0),
+          )
+        ) {
+          refuse('FORBIDDEN', 'You do not hold a delegation from that person for this')
+        }
+        if (current) {
+          current.decisions = [
+            ...(current.decisions ?? []),
+            {
+              id: crypto.randomUUID(),
+              stepId: current.id,
+              approverId: actingAs,
+              onBehalfOfId: onBehalfOfId ? me : null,
+              decision,
+              comment,
+              at: iso(),
+            },
+          ]
+          current.status = decision === 'approve' ? 'approved' : 'rejected'
+        }
         // A middle step advances rather than settling: the inbox has to be able to show that.
         const last = found.currentStep >= Math.max(found.steps.length - 1, 0)
         if (decision === 'reject' || last) found.status = decision === 'approve' ? 'approved' : 'rejected'

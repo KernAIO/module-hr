@@ -3101,13 +3101,7 @@ export function implement_(kernel: Kernel) {
         db.withWorkspace(input.workspaceId, async (tx) => {
           const me = await svc.byUserId(tx, input.workspaceId, context.principal.userId ?? '')
           if (!me) return { items: [], nextCursor: null }
-          const rows = await approvals.inboxFor(
-            tx,
-            input.workspaceId,
-            me.id,
-            input.includeDecided,
-            input.limit,
-          )
+          const rows = await approvals.inboxFor(tx, input.workspaceId, me.id, input.status, input.limit)
           const items = []
           for (const r of rows) items.push(await hydrateApproval(tx, r))
           return { items, nextCursor: null }

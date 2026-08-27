@@ -641,6 +641,28 @@ export const approvalSteps = schema.table(
     status: text('status').notNull().default('pending'),
     dueAt: ts('due_at'),
     escalatedAt: ts('escalated_at'),
+    /**
+     * What the chain said to do when `dueAt` passes, copied onto the row when the request is raised.
+     *
+     * It cannot be read back out of the snapshot in `approval_requests.chain`: a step whose
+     * approvers resolve to nobody is dropped rather than stored, so `step_index` counts the steps
+     * that survived and the spec's array counts the steps that were written — the two drift apart
+     * the moment one is dropped, and matching them up again would mean re-resolving "who is the
+     * manager" as of a date that has passed. The step carries its own deadline policy instead.
+     */
+    onTimeout: text('on_timeout').notNull().default('remind'),
+    /** The window in hours, kept for the same reason: a step's deadline is set when it *starts*. */
+    slaHours: integer('sla_hours'),
+    /**
+     * When the deadline was acted on, and what was done.
+     *
+     * The sweep runs hourly against a deadline that stays passed, so this is what stops one step
+     * being reminded every hour for ever. Reading the pair beside `on_timeout` is also how a
+     * degraded outcome is visible without a log: `on_timeout = 'escalate'` with
+     * `timeout_action = 'remind'` is an escalation that had nobody to go to.
+     */
+    timeoutHandledAt: ts('timeout_handled_at'),
+    timeoutAction: text('timeout_action'),
   },
   (t) => [
     uniqueIndex('hr_approval_steps_uq').on(t.requestId, t.stepIndex),
@@ -667,6 +689,16 @@ export const approvalDecisions = schema.table(
     onBehalfOfId: uuid('on_behalf_of_id'),
     decision: text('decision').notNull(),
     comment: text('comment'),
+    /**
+     * What decided this — `human`, or `timeout` for a step the deadline decided.
+     *
+     * An auto-approval is a decision and has to be recorded as one, but it is not a person's, and a
+     * row that cannot say so is one somebody eventually reads as "her manager approved it". The
+     * column carries that; `approver_id` carries the nil UUID, which no `uuidv7()` can ever be. It
+     * is deliberately not nullable: the contract types `approverId` as a uuid, so a null would fail
+     * the inbox's own output schema on every request that had ever timed out.
+     */
+    source: text('source').notNull().default('human'),
     at: created(),
   },
   (t) => [uniqueIndex('hr_approval_decisions_uq').on(t.stepId, t.approverId)],
