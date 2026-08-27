@@ -1270,7 +1270,8 @@ export const en: Record<string, Message> = {
   'hr.sensitive_contact_hint': 'Who to call if something happens at work.',
   'hr.sensitive_contact_name': 'Emergency contact',
   'hr.sensitive_contact_partial': 'A name and a number, or neither.',
-  'hr.sensitive_edit_body': 'Stored encrypted. The record says these changed, never what they say.',
+  'hr.sensitive_edit_body':
+    'The identity number and bank details are encrypted. Everything here is restricted, and the record says these changed, never what they say.',
   'hr.sensitive_edit_title': 'Personal details for {name}',
   'hr.sensitive_emergency': 'In an emergency, call',
   'hr.sensitive_emergency_none': 'No emergency contact recorded',
@@ -2739,7 +2740,8 @@ export const ar: Record<string, Message> = {
   'hr.sensitive_contact_hint': 'من يُتَّصل به إذا وقع شيء في العمل.',
   'hr.sensitive_contact_name': 'جهة اتصال للطوارئ',
   'hr.sensitive_contact_partial': 'اسم ورقم معًا، أو لا شيء منهما.',
-  'hr.sensitive_edit_body': 'تُحفَظ مشفَّرة، ويُسجَّل أنها تغيّرت لا ما تحتويه.',
+  'hr.sensitive_edit_body':
+    'رقم الهوية والبيانات المصرفية تُحفَظ مشفَّرة. وكل ما هنا مقيَّد الوصول، ويُسجَّل أنها تغيّرت لا ما تحتويه.',
   'hr.sensitive_edit_title': 'البيانات الشخصية لـ {name}',
   'hr.sensitive_emergency': 'في حالة الطوارئ، اتصل بـ',
   'hr.sensitive_emergency_none': 'لا توجد جهة اتصال للطوارئ',
@@ -4097,7 +4099,7 @@ export const de: Record<string, Message> = {
   'hr.sensitive_contact_name': 'Notfallkontakt',
   'hr.sensitive_contact_partial': 'Name und Nummer zusammen — oder beides leer.',
   'hr.sensitive_edit_body':
-    'Verschlüsselt gespeichert. Protokolliert wird, dass sich diese Angaben geändert haben — nie ihr Inhalt.',
+    'Ausweisnummer und Bankverbindung werden verschlüsselt gespeichert. Alles hier ist zugriffsbeschränkt, und protokolliert wird, dass sich diese Angaben geändert haben — nie ihr Inhalt.',
   'hr.sensitive_edit_title': 'Persönliche Angaben von {name}',
   'hr.sensitive_emergency': 'Im Notfall anrufen',
   'hr.sensitive_emergency_none': 'Kein Notfallkontakt hinterlegt',
@@ -5397,7 +5399,8 @@ export const fa: Record<string, Message> = {
   'hr.sensitive_contact_hint': 'اگر سرِ کار اتفاقی افتاد، با چه کسی تماس بگیریم.',
   'hr.sensitive_contact_name': 'تماس اضطراری',
   'hr.sensitive_contact_partial': 'هم نام و هم شماره، یا هیچ‌کدام.',
-  'hr.sensitive_edit_body': 'رمزگذاری‌شده نگهداری می‌شود. سابقه می‌گوید این‌ها عوض شده‌اند، نه اینکه چه بوده‌اند.',
+  'hr.sensitive_edit_body':
+    'شمارهٔ ملی و اطلاعات بانکی رمزگذاری‌شده نگهداری می‌شوند. دسترسی به همهٔ این‌ها محدود است و سابقه می‌گوید این‌ها عوض شده‌اند، نه اینکه چه بوده‌اند.',
   'hr.sensitive_edit_title': 'اطلاعات شخصی {name}',
   'hr.sensitive_emergency': 'در وضعیت اضطراری، تماس با',
   'hr.sensitive_emergency_none': 'تماس اضطراری ثبت نشده است',
@@ -6704,7 +6707,8 @@ export const tr: Record<string, Message> = {
   'hr.sensitive_contact_hint': 'İşyerinde bir şey olursa aranacak kişi.',
   'hr.sensitive_contact_name': 'Acil durum kişisi',
   'hr.sensitive_contact_partial': 'Ya ad ve numara, ya da hiçbiri.',
-  'hr.sensitive_edit_body': 'Şifreli saklanır. Kayıt, bunların değiştiğini söyler; ne yazdığını asla.',
+  'hr.sensitive_edit_body':
+    'Kimlik numarası ve banka bilgileri şifreli saklanır. Buradaki her şeye erişim kısıtlıdır ve kayıt, bunların değiştiğini söyler; ne yazdığını asla.',
   'hr.sensitive_edit_title': '{name} için kişisel bilgiler',
   'hr.sensitive_emergency': 'Acil durumda arayın',
   'hr.sensitive_emergency_none': 'Kayıtlı acil durum kişisi yok',
