@@ -1,5 +1,11 @@
 # @kernhq/module-hr
 
+## 0.13.2
+
+### Patch Changes
+
+- fix(hr): make the screens and the API tell the truth
+
 ## 0.13.1
 
 ### Patch Changes
