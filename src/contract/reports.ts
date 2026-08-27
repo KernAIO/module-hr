@@ -171,12 +171,22 @@ export const AttendanceSummaryRow = z.object({
   /** Day sheets counted. Not the length of the range — a day nobody punched has no sheet. */
   days: z.number().int(),
   scheduledMinutes: z.number().int(),
+  /** Everything worked, including on days no schedule was in force. */
   workedMinutes: z.number().int(),
+  /**
+   * The part of `workedMinutes` that fell on a day a schedule *was* in force.
+   *
+   * Published because it is `workedRatio`'s numerator and dividing the two columns above would give
+   * a different, wrong number. Mixing unscheduled work into a ratio whose denominator excludes those
+   * days is how an attendance report reads 121% for a team that turned up exactly as asked: one
+   * colleague clocking in on a day nobody rostered them adds to the top and nothing to the bottom.
+   */
+  scheduledWorkedMinutes: z.number().int(),
   breakMinutes: z.number().int(),
   lateMinutes: z.number().int(),
   earlyLeaveMinutes: z.number().int(),
   /**
-   * `worked ÷ scheduled`, 0–1 — **null when nothing was scheduled**.
+   * `scheduledWorked ÷ scheduled`, 0–1 — **null when nothing was scheduled**.
    *
    * Somebody with no schedule assignment owes no hours, so the denominator is zero and the answer
    * is unknown rather than 0% or 100%. In a workspace that clocks in only part of its staff, that

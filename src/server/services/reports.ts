@@ -185,7 +185,7 @@ export function rangeRefusal(input: {
   population?: number
 }): string | null {
   const days = rangeDays(input.from, input.to)
-  if (days === 0) return `${input.to} is before ${input.from}.`
+  if (days === 0) return `The end date ${input.to} is before the start date ${input.from}.`
   const max = input.perDay ? MAX_SLICED_REPORT_DAYS : MAX_REPORT_DAYS
   if (days > max)
     return input.perDay
@@ -515,6 +515,12 @@ export class ReportsService {
         days: sql<string>`count(*)`,
         scheduledMinutes: sql<string>`coalesce(sum(${attendanceDays.scheduledMinutes}), 0)`,
         workedMinutes: sql<string>`coalesce(sum(${attendanceDays.workedMinutes}), 0)`,
+        // `workedRatio`'s numerator, and it is not `workedMinutes`. Work on a day no schedule was in
+        // force adds to the top of that fraction and nothing to the bottom, so a team that turned up
+        // exactly as asked reports 121% because one colleague clocked in on a day nobody rostered
+        // them. A row with no stamp at all is counted here: it has scheduled minutes, so it is in the
+        // denominator, and leaving it out of the numerator would understate the same fraction.
+        scheduledWorkedMinutes: sql<string>`coalesce(sum(${attendanceDays.workedMinutes}) filter (where ${attendanceDays.policyHash} is null or ${attendanceDays.policyHash} not like 'none:%'), 0)`,
         breakMinutes: sql<string>`coalesce(sum(${attendanceDays.breakMinutes}), 0)`,
         lateMinutes: sql<string>`coalesce(sum(${attendanceDays.lateMinutes}), 0)`,
         earlyLeaveMinutes: sql<string>`coalesce(sum(${attendanceDays.earlyLeaveMinutes}), 0)`,
@@ -543,6 +549,7 @@ export class ReportsService {
       days: int(r.days),
       scheduledMinutes: int(r.scheduledMinutes),
       workedMinutes: int(r.workedMinutes),
+      scheduledWorkedMinutes: int(r.scheduledWorkedMinutes),
       breakMinutes: int(r.breakMinutes),
       lateMinutes: int(r.lateMinutes),
       earlyLeaveMinutes: int(r.earlyLeaveMinutes),
@@ -588,10 +595,10 @@ export class ReportsService {
 
     const scheduled = sql`
       (select distinct sa.person_id as person_id, e.d as d, e.f as f
-         from unnest(${dates}::date[], ${fractions}::numeric[]) as e(d, f)
+         from unnest(${pgArray(dates, 'date[]')}, ${pgArray(fractions, 'numeric[]')}) as e(d, f)
          join ${scheduleAssignments} sa
            on sa.workspace_id = ${workspaceId}
-          and sa.person_id = any(${personIds}::uuid[])
+          and sa.person_id = any(${pgArray(personIds, 'uuid[]')})
           and sa.effective_from <= e.d
           and (sa.effective_to is null or sa.effective_to >= e.d)) s`
 
@@ -651,7 +658,7 @@ export class ReportsService {
       .where(
         and(
           eq(scheduleAssignments.workspaceId, workspaceId),
-          sql`${scheduleAssignments.personId} = any(${personIds}::uuid[])`,
+          inArray(scheduleAssignments.personId, personIds),
           lte(scheduleAssignments.effectiveFrom, to),
           or(isNull(scheduleAssignments.effectiveTo), gte(scheduleAssignments.effectiveTo, from)),
         ),
@@ -700,7 +707,7 @@ export class ReportsService {
         and(
           eq(leaveLedger.workspaceId, workspaceId),
           eq(leaveLedger.periodYear, periodYear),
-          sql`${leaveLedger.personId} = any(${personIds}::uuid[])`,
+          inArray(leaveLedger.personId, personIds),
         ),
       )
       .groupBy(leaveLedger.personId, leaveLedger.leaveTypeId)
@@ -716,7 +723,7 @@ export class ReportsService {
       .where(
         and(
           eq(leaveRequests.workspaceId, workspaceId),
-          sql`${leaveRequests.personId} = any(${personIds}::uuid[])`,
+          inArray(leaveRequests.personId, personIds),
           inArray(leaveRequests.status, ['pending', 'approved']),
         ),
       )
@@ -773,7 +780,7 @@ export class ReportsService {
     const rows = await tx
       .select({ id: people.id, displayName: people.displayName })
       .from(people)
-      .where(and(eq(people.workspaceId, workspaceId), sql`${people.id} = any(${personIds}::uuid[])`))
+      .where(and(eq(people.workspaceId, workspaceId), inArray(people.id, personIds)))
     return new Map(rows.map((r) => [r.id, r.displayName]))
   }
 }
@@ -783,6 +790,8 @@ export interface DayAggregateRow {
   days: number
   scheduledMinutes: number
   workedMinutes: number
+  /** Worked minutes on days a schedule was in force — `workedRatio`'s numerator, not `workedMinutes`. */
+  scheduledWorkedMinutes: number
   breakMinutes: number
   lateMinutes: number
   earlyLeaveMinutes: number

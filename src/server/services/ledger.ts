@@ -69,16 +69,40 @@ export class LedgerService {
 
     // Pending requests are not spent, but they are not available either — showing a balance that
     // ignores them is how somebody books the same day twice and only finds out at approval.
+    /**
+     * One row per *request*, not per day.
+     *
+     * This joined `leave_request_days` to `leave_requests` and summed `lr.minutes` — the whole
+     * request's total — once for every day the request explodes into. A five-day request counted
+     * five times, so `available = balance − pending` was short by four days of somebody's leave and
+     * the error grew with the length of the booking. It is the number an employee reads before
+     * deciding whether they can take a fortnight off.
+     *
+     * The days table is still what scopes it to the year, through `exists` rather than a join: the
+     * ledger above is filtered by `period_year` and a pending total that silently spanned every year
+     * on record would not be comparable with it. The old query had no year filter at all.
+     *
+     * Known and deliberate: a request straddling 31 December is counted whole in both years. Halving
+     * it needs the per-day share (`fraction` over the request's counted total), which is a change to
+     * what `minutes` means rather than to this query, and over-reserving at a year boundary is the
+     * safe direction — it refuses a booking that would have been allowed, rather than allowing one
+     * that should have been refused.
+     */
     const pending = await tx
       .select({
         leaveTypeId: sql<string>`lr.leave_type_id`,
         status: sql<string>`lr.status`,
         minutes: sql<number>`coalesce(sum(lr.minutes), 0)::int`,
       })
-      .from(sql`${leaveRequestDays} d join mod_hr.leave_requests lr on lr.id = d.request_id`)
+      .from(sql`mod_hr.leave_requests lr`)
       .where(
-        sql`d.workspace_id = ${workspaceId} and d.person_id = ${personId}
-            and lr.status in ('pending','approved')`,
+        sql`lr.workspace_id = ${workspaceId} and lr.person_id = ${personId}
+            and lr.status in ('pending','approved')
+            and exists (
+              select 1 from ${leaveRequestDays} d
+              where d.request_id = lr.id and d.counted
+                and extract(year from d.date) = ${periodYear}
+            )`,
       )
       .groupBy(sql`lr.leave_type_id, lr.status`)
 

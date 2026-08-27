@@ -278,7 +278,11 @@ describe('expected working days come from the calendar in force on each day', ()
 
 describe('a report refuses rather than running for minutes', () => {
   it('refuses a reversed range', () => {
-    expect(rangeRefusal({ from: '2026-10-31', to: '2026-10-01', perDay: false })).toContain('is before')
+    // Both dates are named, and labelled: "2026-10-01 is before 2026-10-31" is true of a reversed
+    // range and of a correct one read the other way round, which is no help to whoever typed it.
+    expect(rangeRefusal({ from: '2026-10-31', to: '2026-10-01', perDay: false })).toBe(
+      'The end date 2026-10-01 is before the start date 2026-10-31.',
+    )
   })
 
   it('allows a year when no day-by-day attribution is needed', () => {

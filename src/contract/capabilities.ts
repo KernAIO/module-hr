@@ -203,6 +203,9 @@ export const hrCapabilityProcedures: Record<string, readonly string[]> = {
     'leave.requests.create',
     'leave.requests.cancel',
     'leave.team.calendar',
+    // Same reason as the attendance reports above: a balance report in a workspace with no leave is
+    // not zero days, it is a question that does not apply.
+    'reports.leaveBalance',
   ],
   attendance: [
     'attendance.state',
@@ -221,6 +224,13 @@ export const hrCapabilityProcedures: Record<string, readonly string[]> = {
     'attendance.schedules.assign',
     'attendance.regularizations.list',
     'attendance.regularizations.request',
+    // The three reports built from `attendance_days`. A workspace that never switched attendance on
+    // has no day sheet to aggregate, so a report over it would answer zero rather than 404 — which
+    // is the shape of lie this map exists to prevent: a number is a worse "not available" than an
+    // error, because it looks like an answer.
+    'reports.attendance',
+    'reports.overtime',
+    'reports.absence',
   ],
   leave_accrual: [
     'policies.list',
