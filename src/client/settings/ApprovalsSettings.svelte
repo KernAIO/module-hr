@@ -77,13 +77,19 @@ const manage = $derived(canHr('approvalManage'))
 
 // ---------------------------------------------------------------- vocabulary
 
-const SUBJECT_TYPES: ApprovalSubjectType[] = [
-  'leave',
-  'regularization',
-  'overtime',
-  'timesheet',
-  'shift_swap',
-]
+/**
+ * What an admin may build a chain *for* — the two things this module can actually raise.
+ *
+ * `ApprovalSubjectType` still carries `overtime`, `timesheet` and `shift_swap`, because the engine
+ * is keyed by subject type on purpose and a stored chain must keep parsing. But offering them here
+ * let somebody design, name and save a chain that nothing can ever fire, and then wait for
+ * approvals that never arrive — a worse failure than the feature being absent, because it looks
+ * configured. They join this list with the code that raises them.
+ *
+ * `subjectLabel` below stays exhaustive: a workspace that already saved one of those chains must
+ * still see it named rather than rendered as a raw enum value.
+ */
+const SUBJECT_TYPES: ApprovalSubjectType[] = ['leave', 'regularization']
 
 /** The same names the inbox uses. An approval called one thing here and another there is two things. */
 const subjectLabel = (subject: ApprovalSubjectType): string =>
@@ -145,7 +151,6 @@ const APPROVER_PERMISSIONS = [
   'hr.person.manage',
   'hr.leave.manage',
   'hr.attendance.manage',
-  'hr.overtime.manage',
   'hr.office.manage',
   'hr.approval.manage',
 ] as const
@@ -157,13 +162,11 @@ const permissionLabel = (key: string): string =>
       ? t('chain_perm_leave')
       : key === 'hr.attendance.manage'
         ? t('chain_perm_attendance')
-        : key === 'hr.overtime.manage'
-          ? t('chain_perm_overtime')
-          : key === 'hr.office.manage'
-            ? t('chain_perm_office')
-            : key === 'hr.approval.manage'
-              ? t('chain_perm_approval')
-              : key
+        : key === 'hr.office.manage'
+          ? t('chain_perm_office')
+          : key === 'hr.approval.manage'
+            ? t('chain_perm_approval')
+            : key
 
 const modeLabel = (mode: ApprovalStepSpec['mode']): string =>
   mode === 'all' ? t('chain_mode_all') : mode === 'any' ? t('chain_mode_any') : t('chain_mode_quorum')

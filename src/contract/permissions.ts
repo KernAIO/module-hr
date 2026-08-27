@@ -258,20 +258,10 @@ export const hrPermissions = definePermissions([
     defaultRoles: ['owner', 'admin'],
     dangerous: true,
   },
-  {
-    key: 'hr.overtime.view',
-    label: 'View overtime',
-    scope: 'workspace',
-    defaultRoles: ['owner', 'admin'],
-    dangerous: false,
-  },
-  {
-    key: 'hr.overtime.manage',
-    label: 'Approve and adjust overtime',
-    scope: 'workspace',
-    defaultRoles: ['owner', 'admin'],
-    dangerous: false,
-  },
+  // No `hr.overtime.*` here. Overtime is detected, stored and shown as part of attendance, and
+  // nothing asks a question these keys could answer — a role checkbox that gates nothing teaches an
+  // administrator the same lesson a dead capability switch does. They come back with the approval
+  // flow that needs them.
 
   // ---------------------------------------------------------------- policies and periods
   {
@@ -357,8 +347,6 @@ export const HR_PERMISSIONS = {
   attendanceView: 'hr.attendance.view',
   attendanceViewTeam: 'hr.attendance.view_team',
   attendanceManage: 'hr.attendance.manage',
-  overtimeView: 'hr.overtime.view',
-  overtimeManage: 'hr.overtime.manage',
   policyView: 'hr.policy.view',
   policyManage: 'hr.policy.manage',
   periodManage: 'hr.period.manage',

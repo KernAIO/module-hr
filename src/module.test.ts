@@ -129,6 +129,31 @@ describe('every procedure is authorised', () => {
   it('names only procedures the contract actually has', () => {
     for (const name of gated) expect(Object.keys(declared)).toContain(name)
   })
+
+  /**
+   * The converse, and the one that was missing.
+   *
+   * Everything above asks whether a gate names something real. Nothing asked whether a *declared*
+   * capability has anything behind it — so `overtime` sat in the registry for weeks with two
+   * permission keys, a slot in the chain editor and not one procedure, and every check passed. A
+   * switch an administrator can flip that changes nothing teaches them the other nine mean nothing
+   * either, which is the failure the registry's own doc comment is written to prevent.
+   *
+   * `core` is exempt because it is the always-on floor: it cannot be switched off, so there is
+   * nothing for `requiresCapability` to refuse. Every other id has to earn its place by naming at
+   * least one procedure it gates.
+   */
+  it('gives every declared capability at least one procedure behind it', () => {
+    const gatedIds = new Set(Object.keys(hrCapabilityProcedures))
+    for (const cap of hrCapabilities) {
+      if (cap.id === 'core') continue
+      expect(
+        gatedIds.has(cap.id),
+        `"${cap.id}" is declared as a capability and no procedure is gated on it. ` +
+          'Either put something behind it or take it out of the registry until you do.',
+      ).toBe(true)
+    }
+  })
 })
 
 describe('the module declares what it uses', () => {

@@ -113,14 +113,6 @@ export const hrCapabilities = defineCapabilities([
     level: 1,
   },
   {
-    id: 'overtime',
-    label: 'Overtime',
-    description: 'Detect and approve time worked beyond the schedule',
-    dependsOn: ['attendance'],
-    defaultEnabled: false,
-    level: 2,
-  },
-  {
     id: 'documents',
     label: 'Employee documents',
     description: 'Contracts, identity documents and certificates against a person',
