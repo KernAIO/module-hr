@@ -139,14 +139,17 @@ describe('every procedure is authorised', () => {
    * switch an administrator can flip that changes nothing teaches them the other nine mean nothing
    * either, which is the failure the registry's own doc comment is written to prevent.
    *
-   * `core` is exempt because it is the always-on floor: it cannot be switched off, so there is
-   * nothing for `requiresCapability` to refuse. Every other id has to earn its place by naming at
-   * least one procedure it gates.
+   * The exemption is `required`, not the id `core`. A required capability is the always-on floor —
+   * it cannot be switched off, so there is nothing for `requiresCapability` to refuse. Keying on the
+   * flag rather than on a magic string is what makes this the same rule in every module: Quire's
+   * floor is called `pages`, and an id check would quietly pass a module whose floor is named
+   * anything else. Every capability that can actually be switched off has to earn its place by
+   * naming at least one procedure it gates.
    */
   it('gives every declared capability at least one procedure behind it', () => {
     const gatedIds = new Set(Object.keys(hrCapabilityProcedures))
     for (const cap of hrCapabilities) {
-      if (cap.id === 'core') continue
+      if (cap.required) continue
       expect(
         gatedIds.has(cap.id),
         `"${cap.id}" is declared as a capability and no procedure is gated on it. ` +
