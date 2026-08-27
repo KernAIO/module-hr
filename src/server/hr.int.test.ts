@@ -41,6 +41,7 @@ import { todayIn } from './services/db.js'
 import { LedgerService } from './services/ledger.js'
 import { PeopleService } from './services/people.js'
 import { hashConfig, PolicyService } from './services/policies.js'
+import { type EraseResult, PrivacyService } from './services/privacy.js'
 import { ResolveService } from './services/resolve.js'
 
 /**
@@ -3227,5 +3228,114 @@ describe("the jobs, in each office's own calendar", () => {
     expect(rows.map((r) => r.timezone).sort()).toEqual([NY, IST].sort())
     expect(rows.filter((r) => r.isDefault)).toHaveLength(1)
     expect([istanbul, newYork].every((id) => rows.some((r) => r.id === id))).toBe(true)
+  })
+})
+
+/**
+ * The two properties erasure rests on, and the only two that need a database.
+ *
+ * `privacy.test.ts` pins every judgement about *what counts as identifying* without Postgres, which
+ * is where those belong. What it cannot reach is whether the predicates match the rows they claim
+ * to — every step of `erase` is written as "rows that still have something to clear", and that
+ * sentence is only true if the SQL agrees with it.
+ *
+ * Both properties are the same claim from two directions: the dry run and the act must not be able
+ * to disagree. If they can, a preview stops being a preview, and this is the one feature in the
+ * module where there is no undo.
+ */
+describe('erasure, against a real database', () => {
+  const seedErasable = async () => {
+    const person = randomUUID()
+    await run((tx) =>
+      tx.insert(people).values({
+        id: person,
+        workspaceId: WS_A,
+        displayName: 'Ayşe Demir',
+        employeeNo: `E-${person.slice(0, 4)}`,
+        workEmail: 'ayse@example.test',
+        personalEmail: 'ayse@personal.test',
+        phone: '+90 555 000 00 00',
+      }),
+    )
+    return person
+  }
+
+  it('reports the same counts for a dry run and the act that follows it', async () => {
+    const svc = new PrivacyService()
+    const person = await seedErasable()
+
+    const preview = await run((tx) =>
+      svc.erase(tx, {
+        workspaceId: WS_A,
+        personId: person,
+        dryRun: true,
+        reason: null,
+        keepNationalIdForAudit: false,
+        actorUserId: ALICE,
+      }),
+    )
+    const real = await run((tx) =>
+      svc.erase(tx, {
+        workspaceId: WS_A,
+        personId: person,
+        dryRun: false,
+        reason: null,
+        keepNationalIdForAudit: false,
+        actorUserId: ALICE,
+      }),
+    )
+
+    // Not "both non-empty" — the same rows, class by class. A preview that under-reports is a
+    // consent obtained for less than what happened.
+    const shape = (r: EraseResult) => r.redacted.map((x) => `${x.class}/${x.table}:${x.rows}`).sort()
+    // The floor, before the comparison: two empty lists are equal, so without this the assertion
+    // below passes when erasure reports nothing at all — which is exactly the state it would be in
+    // if a predicate matched no rows.
+    expect(shape(preview).length).toBeGreaterThan(0)
+    expect(preview.redacted.some((r) => r.rows > 0)).toBe(true)
+    expect(shape(preview)).toEqual(shape(real))
+    expect(preview.erasedAt).toBeNull()
+    expect(real.erasedAt).not.toBeNull()
+  })
+
+  it('is a no-op the second time, and does not move the tombstone', async () => {
+    const svc = new PrivacyService()
+    const person = await seedErasable()
+
+    const first = await run((tx) =>
+      svc.erase(tx, {
+        workspaceId: WS_A,
+        personId: person,
+        dryRun: false,
+        reason: null,
+        keepNationalIdForAudit: false,
+        actorUserId: ALICE,
+      }),
+    )
+    const again = await run((tx) =>
+      svc.erase(tx, {
+        workspaceId: WS_A,
+        personId: person,
+        dryRun: false,
+        reason: null,
+        keepNationalIdForAudit: false,
+        actorUserId: ALICE,
+      }),
+    )
+
+    // Every class reports zero: there is nothing left that still has something to clear.
+    expect(again.redacted.every((r) => r.rows === 0)).toBe(true)
+    // And the date says when she was erased, not when somebody last pressed the button. A tombstone
+    // that moves is a retention clock that never expires.
+    const [row] = await run((tx) =>
+      tx
+        .select()
+        .from(people)
+        .where(and(eq(people.workspaceId, WS_A), eq(people.id, person))),
+    )
+    expect(row?.erasedAt?.toISOString()).toBe(first.erasedAt?.toISOString())
+    expect(row?.displayName).not.toContain('Ayşe')
+    expect(row?.personalEmail).toBeNull()
+    expect(row?.phone).toBeNull()
   })
 })
