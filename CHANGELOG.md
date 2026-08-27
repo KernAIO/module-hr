@@ -1,5 +1,11 @@
 # @kernhq/module-hr
 
+## 0.13.1
+
+### Patch Changes
+
+- fix(hr): stop claiming the whole sensitive dialog is encrypted
+
 ## 0.13.0
 
 ### Minor Changes
