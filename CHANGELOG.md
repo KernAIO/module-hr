@@ -1,5 +1,11 @@
 # @kernhq/module-hr
 
+## 0.17.1
+
+### Patch Changes
+
+- test(hr): pin the two erasure properties only Postgres can check
+
 ## 0.17.0
 
 ### Minor Changes
