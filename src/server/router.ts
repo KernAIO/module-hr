@@ -10,7 +10,22 @@ import {
   workspaceScoped,
 } from '@kernhq/kernel'
 import { implement } from '@orpc/server'
-import { and, asc, count, desc, eq, gte, ilike, inArray, isNull, lte, or, sql } from 'drizzle-orm'
+import {
+  and,
+  asc,
+  type Column,
+  count,
+  desc,
+  eq,
+  getTableColumns,
+  gte,
+  ilike,
+  inArray,
+  isNull,
+  lte,
+  or,
+  sql,
+} from 'drizzle-orm'
 import { HrSettings, hrContract, hrEvents, MODULE_ID, type WorkingWeek } from '../contract/index.js'
 import {
   AccrualConfig,
@@ -65,6 +80,96 @@ import { hashConfig, PolicyService } from './services/policies.js'
 import { DEFAULT_WORKING_WEEK, ResolveService } from './services/resolve.js'
 
 const os = implement(hrContract).$context<RequestContext>()
+
+// ---------------------------------------------------------------------- pagination
+
+/**
+ * Keyset pagination, shared by every paged list below.
+ *
+ * `PageInput` has always declared a `cursor` and every handler here answered `nextCursor: null`, so
+ * the contract offered pagination the server could not perform: a company with more people than one
+ * page had no way of reaching the rest of them, and nothing said so.
+ *
+ * The cursor carries the last row's sort key **and** its id, because not one of the sort keys here
+ * is unique — two people called Ali, four punches in a minute, a whole office starting leave on the
+ * same Monday. A cursor on the key alone silently drops everything that ties with the last row on
+ * the page, and an offset repeats or skips rows the moment somebody clocks in between two fetches.
+ * The id is a uuidv7 in every one of these tables, so it also breaks ties in creation order.
+ */
+type PageCursor = { key: string; id: string }
+
+const encodeCursor = (key: string, id: string) =>
+  Buffer.from(JSON.stringify([key, id]), 'utf8').toString('base64url')
+
+function decodeCursor(raw: string | undefined): PageCursor | null {
+  if (!raw) return null
+  try {
+    const [key, id] = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8')) as unknown[]
+    if (typeof key !== 'string' || typeof id !== 'string') throw new Error('malformed cursor')
+    return { key, id }
+  } catch {
+    // A cursor is opaque to the caller, so a broken one is a tampered URL or a bug on our side —
+    // never something the reader can fix by asking again. Refusing beats quietly serving page one,
+    // which reads as a list that jumps back to the top for no reason anybody can see.
+    throw KernError.badRequest('That page cursor is not valid.')
+  }
+}
+
+/**
+ * `(sort, id) > (…)` as one row comparison rather than `sort > k or (sort = k and id > i)`:
+ * Postgres can drive a row comparison straight off an index on `(sort, id)` and cannot do that with
+ * the `or` spelling. Both halves of the cursor are cast to the column's own type, because an
+ * untyped bind parameter beside a `date` or a `timestamptz` is not something to make the planner
+ * guess at.
+ */
+const after = (sort: Column, id: Column, dir: 'asc' | 'desc', c: PageCursor) => {
+  const from = sql`(${c.key}::${sql.raw(sort.getSQLType())}, ${c.id}::uuid)`
+  return dir === 'asc' ? sql`(${sort}, ${id}) > ${from}` : sql`(${sort}, ${id}) < ${from}`
+}
+
+/**
+ * Did this error come from one named unique index?
+ *
+ * The cause chain is walked rather than the error itself, because drizzle wraps what the driver
+ * threw and the `code` a duplicate key arrives as — `23505` — is on the pg error underneath. The
+ * index name is checked too: a handler that treats *any* duplicate key as its own idempotency
+ * replay would silently swallow a collision on some other constraint, which is a bug reported as a
+ * success.
+ */
+function isUniqueViolation(err: unknown, constraint: string): boolean {
+  for (let e: unknown = err, depth = 0; e && depth < 5; e = (e as { cause?: unknown }).cause, depth++) {
+    const pg = e as { code?: unknown; constraint?: unknown }
+    if (pg.code === '23505' && pg.constraint === constraint) return true
+  }
+  return false
+}
+
+/**
+ * Cut a page out of the `limit + 1` rows the query asked for.
+ *
+ * The extra row is how "there is more" is known without a second count, and why a page that happens
+ * to fill exactly does not advertise a next page that turns out to be empty.
+ *
+ * **The key is `string`, never a `Date`, and that is load-bearing.** A `timestamptz` is stored at
+ * microsecond precision and node-postgres hands it back as a JS `Date`, which is milliseconds — so
+ * a cursor built from the row object is *strictly less* than the value it came from, and
+ * `(at, id) < (key, id)` then excludes every row that ties with the last row of the page. That is
+ * silent: no error, the list just ends early, and it bites hardest exactly where the id tiebreaker
+ * was supposed to save it — one edit writing several rows in a transaction, all sharing `now()`.
+ * Measured on `person_history`: five rows in one statement, page size two, page two returned none
+ * of the remaining three. A timestamp cursor therefore has to select the value `::text` and pass
+ * that, which the type here forces rather than trusts.
+ */
+function paginate<R>(
+  rows: R[],
+  limit: number,
+  cursorOf: (row: R) => [key: string, id: string],
+): { items: R[]; nextCursor: string | null } {
+  if (rows.length <= limit) return { items: rows, nextCursor: null }
+  const items = rows.slice(0, limit)
+  const [key, id] = cursorOf(items[items.length - 1]!)
+  return { items, nextCursor: encodeCursor(key, id) }
+}
 
 /**
  * The router.
@@ -151,16 +256,25 @@ export function implement_(kernel: Kernel) {
             )
           }
 
-          const rows = await tx
-            .select()
-            .from(people)
-            .where(and(...where))
-            .orderBy(asc(people.displayName))
-            .limit(input.limit)
+          // The count is of everything the filters match, so it is taken before the cursor narrows
+          // the set — `total` is the size of the directory, not of the page being looked at.
           const [total] = await tx
             .select({ n: count() })
             .from(people)
             .where(and(...where))
+
+          const cursor = decodeCursor(input.cursor)
+          if (cursor) where.push(after(people.displayName, people.id, 'asc', cursor))
+          const { items: rows, nextCursor } = paginate(
+            await tx
+              .select()
+              .from(people)
+              .where(and(...where))
+              .orderBy(asc(people.displayName), asc(people.id))
+              .limit(input.limit + 1),
+            input.limit,
+            (r) => [r.displayName, r.id],
+          )
 
           // One query for the whole page rather than a resolution per row: a directory of five
           // hundred people would otherwise be five hundred ladder walks.
@@ -196,7 +310,7 @@ export function implement_(kernel: Kernel) {
               officeId: officeBy.get(r.id)?.officeId ?? null,
               officeName: officeBy.get(r.id)?.name ?? null,
             })),
-            nextCursor: null,
+            nextCursor,
             total: total?.n ?? 0,
           }
         }),
@@ -298,7 +412,15 @@ export function implement_(kernel: Kernel) {
         return PeopleService.toPerson(row.updated)
       }),
 
-      /** Ends employment and keeps the record. A terminated person is history, not a deletion. */
+      /**
+       * Ends employment and keeps the record. A terminated person is history, not a deletion.
+       *
+       * The reason the dialog collects is written to `person_history` rather than to a column on
+       * `people`: "why did she leave" is a fact about the *event*, it is asked for by an audit
+       * alongside who ended the employment and when, and `person_history` is the append-only table
+       * that already answers exactly that question. It used to be accepted and dropped on the
+       * floor, which is the one thing an offboarding record must not do.
+       */
       offboard: scoped.people.offboard
         .use(requires('hr.person.manage'))
         .handler(async ({ input, context }) => {
@@ -329,9 +451,13 @@ export function implement_(kernel: Kernel) {
                   isNull(officeAssignments.effectiveTo),
                 ),
               )
+            const reason = input.reason?.trim()
             await svc.record(tx, input.workspaceId, input.personId, context.principal.userId ?? null, [
               { field: 'status', from: before.status, to: 'terminated' },
               { field: 'terminatedOn', from: before.terminatedOn, to: input.on },
+              // Only when there is one. A row saying the reason changed from nothing to nothing is
+              // noise in the trail somebody reads to find out what happened.
+              ...(reason ? [{ field: 'terminationReason', from: null, to: reason }] : []),
             ])
             return { before, updated: updated! }
           })
@@ -352,17 +478,27 @@ export function implement_(kernel: Kernel) {
 
       history: scoped.people.history.use(requires('hr.person.view')).handler(({ input }) =>
         db.withWorkspace(input.workspaceId, async (tx) => {
-          const rows = await tx
-            .select()
-            .from(personHistory)
-            .where(
-              and(
-                eq(personHistory.workspaceId, input.workspaceId),
-                eq(personHistory.personId, input.personId),
-              ),
-            )
-            .orderBy(desc(personHistory.at))
-            .limit(input.limit)
+          const where = [
+            eq(personHistory.workspaceId, input.workspaceId),
+            eq(personHistory.personId, input.personId),
+          ]
+          // The id tiebreaker earns its keep here more than anywhere: one edit writes several rows
+          // in one statement, and `now()` is frozen for a transaction, so they all share an `at`.
+          const cursor = decodeCursor(input.cursor)
+          if (cursor) where.push(after(personHistory.at, personHistory.id, 'desc', cursor))
+          const { items: rows, nextCursor } = paginate(
+            // `atText` rather than the `Date`: see `paginate`. `now()` is frozen for a transaction,
+            // so a single edit's rows all share an `at` to the microsecond, and a millisecond cursor
+            // would drop every one of them after the first page.
+            await tx
+              .select({ ...getTableColumns(personHistory), atText: sql<string>`${personHistory.at}::text` })
+              .from(personHistory)
+              .where(and(...where))
+              .orderBy(desc(personHistory.at), desc(personHistory.id))
+              .limit(input.limit + 1),
+            input.limit,
+            (r) => [r.atText, r.id],
+          )
           return {
             items: rows.map((r) => ({
               id: r.id,
@@ -373,7 +509,7 @@ export function implement_(kernel: Kernel) {
               actorId: r.actorId,
               source: r.source,
             })),
-            nextCursor: null,
+            nextCursor,
           }
         }),
       ),
@@ -877,44 +1013,60 @@ export function implement_(kernel: Kernel) {
           return toOffice(row)
         }),
 
+      /**
+       * The office's people, and its headcount.
+       *
+       * One join rather than the two round trips this used to be. The old shape limited the
+       * *assignments* and then sorted the people it had fetched, so a page was an arbitrary subset
+       * put in alphabetical order — and it reported `rows.length` as `total`, which told an office
+       * of forty that it had twenty as soon as one page stopped holding everybody. The headcount is
+       * counted now, over the same predicate and without the cursor.
+       */
       people: scoped.offices.people
         .use(cap('offices'))
         .use(requires('hr.office.view'))
         .handler(({ input }) =>
           db.withWorkspace(input.workspaceId, async (tx) => {
+            const here = and(
+              eq(people.id, officeAssignments.personId),
+              eq(people.workspaceId, officeAssignments.workspaceId),
+            )
             const where = [
               eq(officeAssignments.workspaceId, input.workspaceId),
               eq(officeAssignments.officeId, input.officeId),
               isNull(officeAssignments.effectiveTo),
             ]
             if (input.primaryOnly) where.push(eq(officeAssignments.isPrimary, true))
-            const assignments = await tx
-              .select()
+
+            const [total] = await tx
+              .select({ n: count() })
               .from(officeAssignments)
+              .innerJoin(people, here)
               .where(and(...where))
-              .limit(input.limit)
-            if (!assignments.length) return { items: [], nextCursor: null, total: 0 }
-            const rows = await tx
-              .select()
-              .from(people)
-              .where(
-                and(
-                  eq(people.workspaceId, input.workspaceId),
-                  inArray(
-                    people.id,
-                    assignments.map((a) => a.personId),
-                  ),
-                ),
-              )
-              .orderBy(asc(people.displayName))
-            const primaryHere = new Set(assignments.filter((a) => a.isPrimary).map((a) => a.personId))
+
+            const cursor = decodeCursor(input.cursor)
+            if (cursor) where.push(after(people.displayName, people.id, 'asc', cursor))
+            const { items: rows, nextCursor } = paginate(
+              await tx
+                .select({ person: people, isPrimary: officeAssignments.isPrimary })
+                .from(officeAssignments)
+                .innerJoin(people, here)
+                .where(and(...where))
+                .orderBy(asc(people.displayName), asc(people.id))
+                .limit(input.limit + 1),
+              input.limit,
+              (r) => [r.person.displayName, r.person.id],
+            )
+
             return {
               items: rows.map((r) => ({
-                ...PeopleService.toPerson(r),
-                isPrimaryHere: primaryHere.has(r.id),
+                ...PeopleService.toPerson(r.person),
+                // Migration 0001 allows one open assignment per person per office, so the join
+                // cannot produce a person twice and this flag cannot disagree with itself.
+                isPrimaryHere: r.isPrimary,
               })),
-              nextCursor: null,
-              total: rows.length,
+              nextCursor,
+              total: total?.n ?? 0,
             }
           }),
         ),
@@ -1790,13 +1942,19 @@ export function implement_(kernel: Kernel) {
           db.withWorkspace(input.workspaceId, async (tx) => {
             const where = [eq(periods.workspaceId, input.workspaceId)]
             if (input.kind) where.push(eq(periods.kind, input.kind))
-            const rows = await tx
-              .select()
-              .from(periods)
-              .where(and(...where))
-              .orderBy(desc(periods.startsOn))
-              .limit(input.limit)
-            return { items: rows.map(toPeriod), nextCursor: null }
+            const cursor = decodeCursor(input.cursor)
+            if (cursor) where.push(after(periods.startsOn, periods.id, 'desc', cursor))
+            const { items, nextCursor } = paginate(
+              await tx
+                .select()
+                .from(periods)
+                .where(and(...where))
+                .orderBy(desc(periods.startsOn), desc(periods.id))
+                .limit(input.limit + 1),
+              input.limit,
+              (r) => [r.startsOn, r.id],
+            )
+            return { items: items.map(toPeriod), nextCursor }
           }),
         ),
 
@@ -1975,13 +2133,23 @@ export function implement_(kernel: Kernel) {
                 lte(punches.businessDate, input.to),
               ]
               if (!input.includeVoided) where.push(isNull(punches.voidedByPunchId))
-              const rows = await tx
-                .select()
-                .from(punches)
-                .where(and(...where))
-                .orderBy(asc(punches.at))
-                .limit(input.limit)
-              return { items: rows.map(toPunch), nextCursor: null }
+              const cursor = decodeCursor(input.cursor)
+              if (cursor) where.push(after(punches.at, punches.id, 'asc', cursor))
+              const { items, nextCursor } = paginate(
+                // `atText`, for the reason in `paginate`. Every insert here supplies a JS `Date`, so
+                // nothing sub-millisecond is stored today and the bug is latent rather than live —
+                // but the column carries `.defaultNow()`, so one insert that omits `at` would start
+                // dropping punches off the end of a page with nothing to show for it.
+                await tx
+                  .select({ ...getTableColumns(punches), atText: sql<string>`${punches.at}::text` })
+                  .from(punches)
+                  .where(and(...where))
+                  .orderBy(asc(punches.at), asc(punches.id))
+                  .limit(input.limit + 1),
+                input.limit,
+                (r) => [r.atText, r.id],
+              )
+              return { items: items.map(toPunch), nextCursor }
             }),
           ),
 
@@ -2055,13 +2223,19 @@ export function implement_(kernel: Kernel) {
                 const personId = await personFor(tx, input.workspaceId, context, input.personId)
                 where.push(eq(attendanceDays.personId, personId))
               }
-              const rows = await tx
-                .select()
-                .from(attendanceDays)
-                .where(and(...where))
-                .orderBy(asc(attendanceDays.businessDate))
-                .limit(input.limit)
-              return { items: rows.map(toAttendanceDay), nextCursor: null }
+              const cursor = decodeCursor(input.cursor)
+              if (cursor) where.push(after(attendanceDays.businessDate, attendanceDays.id, 'asc', cursor))
+              const { items, nextCursor } = paginate(
+                await tx
+                  .select()
+                  .from(attendanceDays)
+                  .where(and(...where))
+                  .orderBy(asc(attendanceDays.businessDate), asc(attendanceDays.id))
+                  .limit(input.limit + 1),
+                input.limit,
+                (r) => [r.businessDate, r.id],
+              )
+              return { items: items.map(toAttendanceDay), nextCursor }
             }),
           ),
 
@@ -2227,13 +2401,19 @@ export function implement_(kernel: Kernel) {
                 eq(regularizations.personId, personId),
               ]
               if (input.status?.length) where.push(inArray(regularizations.status, input.status))
-              const rows = await tx
-                .select()
-                .from(regularizations)
-                .where(and(...where))
-                .orderBy(desc(regularizations.businessDate))
-                .limit(input.limit)
-              return { items: rows.map(toRegularization), nextCursor: null }
+              const cursor = decodeCursor(input.cursor)
+              if (cursor) where.push(after(regularizations.businessDate, regularizations.id, 'desc', cursor))
+              const { items, nextCursor } = paginate(
+                await tx
+                  .select()
+                  .from(regularizations)
+                  .where(and(...where))
+                  .orderBy(desc(regularizations.businessDate), desc(regularizations.id))
+                  .limit(input.limit + 1),
+                input.limit,
+                (r) => [r.businessDate, r.id],
+              )
+              return { items: items.map(toRegularization), nextCursor }
             }),
           ),
 
@@ -2394,13 +2574,22 @@ export function implement_(kernel: Kernel) {
               ]
               if (input.leaveTypeId) where.push(eq(leaveLedger.leaveTypeId, input.leaveTypeId))
               if (input.periodYear) where.push(eq(leaveLedger.periodYear, input.periodYear))
-              const rows = await tx
-                .select()
-                .from(leaveLedger)
-                .where(and(...where))
-                .orderBy(desc(leaveLedger.effectiveOn), desc(leaveLedger.createdAt))
-                .limit(input.limit)
-              return { items: rows.map(toLedgerEntry), nextCursor: null }
+              const cursor = decodeCursor(input.cursor)
+              if (cursor) where.push(after(leaveLedger.effectiveOn, leaveLedger.id, 'desc', cursor))
+              // The second sort key is the id rather than `created_at`, and means the same thing:
+              // ids here are uuidv7, so they already run in creation order — and unlike `created_at`
+              // no two rows can share one, which is what makes the cursor land in exactly one place.
+              const { items, nextCursor } = paginate(
+                await tx
+                  .select()
+                  .from(leaveLedger)
+                  .where(and(...where))
+                  .orderBy(desc(leaveLedger.effectiveOn), desc(leaveLedger.id))
+                  .limit(input.limit + 1),
+                input.limit,
+                (r) => [r.effectiveOn, r.id],
+              )
+              return { items: items.map(toLedgerEntry), nextCursor }
             }),
           ),
       },
@@ -2444,23 +2633,66 @@ export function implement_(kernel: Kernel) {
           .handler(({ input, context }) =>
             db.withWorkspace(input.workspaceId, async (tx) => {
               const where = [eq(leaveRequests.workspaceId, input.workspaceId)]
-              if (input.personId) where.push(eq(leaveRequests.personId, input.personId))
-              else if (!context.principal.instanceAdmin) {
-                // Without an explicit person, this is "my requests". Seeing everybody's by default
-                // would leak the whole company's absences to any member with hr.leave.view.
+
+              // An office is other people's absences, so asking for one costs the same permission
+              // the team calendar costs. `hr.leave.view` alone must not become a way of reading the
+              // whole company — which is exactly what a filter the server ignores had made of it.
+              if (input.officeId) {
+                await kernel.authz.require(context.principal, 'hr.leave.view_team', {
+                  kind: 'workspace',
+                  id: input.workspaceId,
+                  workspaceId: input.workspaceId,
+                })
+                const here = await tx
+                  .select({ personId: officeAssignments.personId })
+                  .from(officeAssignments)
+                  .where(
+                    and(
+                      eq(officeAssignments.workspaceId, input.workspaceId),
+                      eq(officeAssignments.officeId, input.officeId),
+                      isNull(officeAssignments.effectiveTo),
+                    ),
+                  )
+                // An empty office matches nobody, not everybody.
+                where.push(
+                  here.length
+                    ? inArray(
+                        leaveRequests.personId,
+                        here.map((h) => h.personId),
+                      )
+                    : sql`false`,
+                )
+              }
+
+              if (input.personId) {
+                // Naming somebody else is the same act as naming their office, and was the one way
+                // through this handler that cost nothing: `hr.leave.view` and a person id read
+                // anybody's absences. `personFor` is the rule everywhere else in this module.
+                await personFor(tx, input.workspaceId, context, input.personId)
+                where.push(eq(leaveRequests.personId, input.personId))
+              } else if (!input.officeId && !context.principal.instanceAdmin) {
+                // Without an explicit person or office, this is "my requests". Seeing everybody's by
+                // default would leak the whole company's absences to any member with hr.leave.view.
                 const me = await svc.byUserId(tx, input.workspaceId, context.principal.userId ?? '')
                 where.push(me ? eq(leaveRequests.personId, me.id) : sql`false`)
               }
+
               if (input.status?.length) where.push(inArray(leaveRequests.status, input.status))
               if (input.from) where.push(gte(leaveRequests.endsOn, input.from))
               if (input.to) where.push(lte(leaveRequests.startsOn, input.to))
-              const rows = await tx
-                .select()
-                .from(leaveRequests)
-                .where(and(...where))
-                .orderBy(desc(leaveRequests.startsOn))
-                .limit(input.limit)
-              return { items: rows.map(toLeaveRequest), nextCursor: null }
+              const cursor = decodeCursor(input.cursor)
+              if (cursor) where.push(after(leaveRequests.startsOn, leaveRequests.id, 'desc', cursor))
+              const { items, nextCursor } = paginate(
+                await tx
+                  .select()
+                  .from(leaveRequests)
+                  .where(and(...where))
+                  .orderBy(desc(leaveRequests.startsOn), desc(leaveRequests.id))
+                  .limit(input.limit + 1),
+                input.limit,
+                (r) => [r.startsOn, r.id],
+              )
+              return { items: items.map(toLeaveRequest), nextCursor }
             }),
           ),
 
@@ -2483,11 +2715,31 @@ export function implement_(kernel: Kernel) {
             }),
           ),
 
+        /**
+         * File a request.
+         *
+         * `idempotencyKey` is the contract's promise that a retried submission is safe, and the
+         * server used to store the key without ever reading it. So a retry filed a second request,
+         * or died on whichever unique index it reached first — the exploded days for a counted
+         * absence, the key itself otherwise. Neither is what the caller was promised.
+         *
+         * `hr_leave_requests_idem_uq` is what there is to lean on: it already refuses a second row
+         * for a key, so honouring the promise is a read before the insert and an answer for the
+         * loser of the race.
+         */
         create: scoped.leave.requests.create
           .use(cap('leave'))
           .use(requires('hr.leave.request'))
           .handler(async ({ input, context }) => {
-            const result = await db.withWorkspace(input.workspaceId, async (tx) => {
+            const key = input.idempotencyKey
+            // Held as a promise rather than awaited here, so that the duplicate recovery below is
+            // one step at the end instead of ninety lines wrapped in a `try`.
+            const filing = db.withWorkspace(input.workspaceId, async (tx) => {
+              // Before anything is locked or simulated: the same key is the same submission, and
+              // answering it with the request it already filed is what "safe to retry" means.
+              const already = key ? await byIdempotencyKey(tx, input.workspaceId, key) : undefined
+              if (already) return { request: already, personId: already.personId, replay: true as const }
+
               const personId = await personFor(tx, input.workspaceId, context, input.personId)
 
               // Everything that spends balance takes the cursor lock first, inside this
@@ -2561,8 +2813,27 @@ export function implement_(kernel: Kernel) {
                 await applyApproval(tx, input.workspaceId, request!.id, context.principal.userId ?? null)
 
               const [fresh] = await tx.select().from(leaveRequests).where(eq(leaveRequests.id, request!.id))
-              return { request: fresh!, approvers: raised.firstStepApprovers, personId }
+              return { request: fresh!, personId, replay: false as const }
             })
+
+            const result = await filing.catch(async (err: unknown) => {
+              // The other half of a double submit: two clicks a browser sends before the first has
+              // answered both pass the read above, both reach the insert, and the unique index
+              // refuses one. The loser lost a race it was never meant to enter, so it is answered
+              // with the request that won rather than with a constraint error. The re-read needs a
+              // new transaction — the failed one is aborted and will not answer another query.
+              if (!key || !isUniqueViolation(err, 'hr_leave_requests_idem_uq')) throw err
+              const won = await db.withWorkspace(input.workspaceId, (tx) =>
+                byIdempotencyKey(tx, input.workspaceId, key),
+              )
+              if (!won) throw err
+              return { request: won, personId: won.personId, replay: true as const }
+            })
+
+            // A replay files nothing, so it announces nothing. Emitting `leaveRequested` again would
+            // put a second card in an approver's inbox for one request — the outcome the key exists
+            // to prevent, arriving by a different route.
+            if (result.replay) return toLeaveRequest(result.request)
 
             await kernel.emit(
               hrEvents.leaveRequested,
@@ -2723,6 +2994,13 @@ export function implement_(kernel: Kernel) {
       /**
        * Everything waiting on the caller. No permission: an inbox of what *you* must decide is
        * yours by definition, and the engine only lists steps you are named on.
+       *
+       * The one paged list here that still answers `nextCursor: null`, and the only one that cannot
+       * be fixed from this file: the page is cut inside `ApprovalService.inboxFor`, which takes a
+       * limit and no cursor. Honouring one means widening that signature and pushing
+       * `after(approvalRequests.requestedAt, approvalRequests.id, 'desc', …)` into its final query —
+       * ordering it by `(requested_at, id)` on the way, so the cursor has something unique to land
+       * on. Filtering the rows it returns would not do: it has already truncated them.
        */
       inbox: scoped.approvals.inbox.handler(({ input, context }) =>
         db.withWorkspace(input.workspaceId, async (tx) => {
@@ -3353,6 +3631,16 @@ export function implement_(kernel: Kernel) {
       workspaceId,
     })
     return personId
+  }
+
+  /** The request a retry is a retry *of*, or undefined the first time a key is seen. */
+  async function byIdempotencyKey(tx: Tx, workspaceId: string, key: string) {
+    const [row] = await tx
+      .select()
+      .from(leaveRequests)
+      .where(and(eq(leaveRequests.workspaceId, workspaceId), eq(leaveRequests.idempotencyKey, key)))
+      .limit(1)
+    return row
   }
 
   async function loadRequest(tx: Tx, workspaceId: string, requestId: string) {

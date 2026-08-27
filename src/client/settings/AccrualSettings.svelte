@@ -270,6 +270,19 @@ function failureText(error: unknown, fallbackKey: string): string {
 
 // ---------------------------------------------------------------- the policy form
 
+/**
+ * What an empty form starts a day at, and the only eight hours on this screen.
+ *
+ * A seed, never a conversion. `accrueForPeriod` multiplies entitlement days by the policy's own
+ * `minutesPerDay`, so anything here that turns time into days — or days into time — reads that
+ * figure instead of assuming one: five days of a seven-and-a-half-hour day is 2250 minutes, and at
+ * a hardcoded 8 × 60 the same five days read as 2400, which is a cap that never bites and a
+ * balance nobody can reconcile against the ledger.
+ */
+const DEFAULT_DAY_MINUTES = 8 * 60
+/** The contract's own ceiling on `roundToMinutes`. A whole day exceeds it on any day past eight hours. */
+const ROUND_CAP_MINUTES = 480
+
 let policyDialog = $state<'create' | 'edit' | null>(null)
 let policyId = $state('')
 let policyName = $state('')
@@ -278,11 +291,21 @@ let policyTo = $state('')
 let frequency = $state<Frequency>('monthly')
 let leaveTypeKey = $state('')
 let daysPerYear = $state('20')
-let minutesPerDay = $state('480')
+let minutesPerDay = $state(String(DEFAULT_DAY_MINUTES))
 let waitingMonths = $state('0')
-let roundTo = $state('0')
+/** A token rather than a minute count — see `roundMinutes`. */
+let roundChoice = $state('0')
 let tiers = $state<Tier[]>([])
 let policyError = $state<string | null>(null)
+/**
+ * Whether the form was seeded from a config the schema could not read.
+ *
+ * `configOf` answering null means the stored jsonb is not an accrual config — an older release, or
+ * a row edited by hand. Every field below then holds a default, and saving writes those defaults
+ * over whatever the engine is actually using, so the dialog says so rather than presenting eight
+ * hours and twenty days as though they were the policy.
+ */
+let seededFromUnreadable = $state(false)
 
 function openCreate() {
   policyDialog = 'create'
@@ -293,23 +316,30 @@ function openCreate() {
   frequency = 'monthly'
   leaveTypeKey = leaveTypes[0]?.key ?? ''
   daysPerYear = '20'
-  minutesPerDay = '480'
+  minutesPerDay = String(DEFAULT_DAY_MINUTES)
   waitingMonths = '0'
-  roundTo = '0'
+  roundChoice = '0'
   tiers = []
   policyError = null
+  seededFromUnreadable = false
 }
 
 function fillFrom(policy: PolicyRow) {
   const config = configOf(policy)
+  seededFromUnreadable = config === null
   policyName = policy.name
   policyTo = policy.effectiveTo ?? ''
   frequency = config?.frequency ?? 'monthly'
   leaveTypeKey = config?.leaveTypeKey ?? leaveTypes[0]?.key ?? ''
   daysPerYear = String(config?.daysPerYear ?? 20)
-  minutesPerDay = String(config?.minutesPerDay ?? 480)
+  const day = config?.minutesPerDay ?? DEFAULT_DAY_MINUTES
+  minutesPerDay = String(day)
   waitingMonths = String(config?.waitingPeriodMonths ?? 0)
-  roundTo = String(config?.roundToMinutes ?? 0)
+  // Back to what the step *meant* under the day it was saved with. Read as a bare number, a policy
+  // rounding to a whole 450-minute day would reopen as "450 minutes" and stop following the day the
+  // moment somebody lengthened it.
+  const step = config?.roundToMinutes ?? 0
+  roundChoice = step === 0 ? '0' : step === day ? 'day' : step === Math.round(day / 2) ? 'half' : String(step)
   tiers = (config?.seniorityTiers ?? []).map((tier) => ({
     afterYears: String(tier.afterYears),
     daysPerYear: String(tier.daysPerYear),
@@ -346,33 +376,56 @@ const clampedDays = (value: string, min: number, max: number) => {
 }
 
 /**
- * Rounding offered as the steps somebody actually means, half and whole days included — those are
- * derived from the day length in the same form, because "half a day" is 210 minutes on a
- * seven-hour day. The contract caps a step at 480 minutes, so a long day's whole-day option is
- * dropped rather than offered and refused.
+ * The day this policy is being given, and the figure everything below converts against.
+ *
+ * The same number the server stores as `minutesPerDay` and `accrueForPeriod` multiplies by, so a
+ * length shown here is the length leave is actually earned in.
+ */
+const dayMinutes = $derived(clamped(minutesPerDay, 1, 1440))
+
+/**
+ * Rounding held as what the admin meant, resolved against the day beside it.
+ *
+ * "A whole day" is 450 minutes on a seven-and-a-half-hour day and 480 on an eight-hour one. Held as
+ * a bare number the step stops meaning a day the moment the day length changes — silently, because
+ * the select goes on reading "A whole day" while the engine rounds to something else. So the choice
+ * is a token and the minutes follow from it.
+ */
+const roundMinutes = $derived(
+  roundChoice === 'day'
+    ? dayMinutes
+    : roundChoice === 'half'
+      ? Math.round(dayMinutes / 2)
+      : Math.max(0, Math.round(Number(roundChoice) || 0)),
+)
+
+/**
+ * Rounding offered as the steps somebody actually means, half and whole days included.
+ *
+ * The two day steps are kept beside the fixed ones even where they land on the same number, because
+ * they are a different choice: one follows the day length, the other stays where it was typed. A
+ * whole day past the contract's cap is offered and refused by `formProblem` with the reason next to
+ * the button, rather than dropped from the list with nothing to explain the gap.
  */
 const roundOptions = $derived.by(() => {
-  const dayMinutes = clamped(minutesPerDay, 1, 1440)
-  const steps = [
-    { minutes: 15, label: t('accr_round_minutes', { count: 15 }) },
-    { minutes: 30, label: t('accr_round_minutes', { count: 30 }) },
-    { minutes: 60, label: t('accr_round_minutes', { count: 60 }) },
-    { minutes: Math.round(dayMinutes / 2), label: t('accr_round_half_day') },
-    { minutes: dayMinutes, label: t('accr_round_day') },
-  ].filter((step) => step.minutes > 0 && step.minutes <= 480)
-
-  const seen = new Set<number>()
-  const options = [{ value: '0', label: t('accr_round_exact') }]
-  for (const step of steps) {
-    if (seen.has(step.minutes)) continue
-    seen.add(step.minutes)
-    options.push({ value: String(step.minutes), label: step.label })
-  }
+  const half = Math.round(dayMinutes / 2)
+  const options = [
+    { value: '0', minutes: 0, label: t('accr_round_exact') },
+    { value: '15', minutes: 15, label: t('accr_round_minutes', { count: 15 }) },
+    { value: '30', minutes: 30, label: t('accr_round_minutes', { count: 30 }) },
+    { value: '60', minutes: 60, label: t('accr_round_minutes', { count: 60 }) },
+    { value: 'half', minutes: half, label: t('accr_round_half_day', { length: duration(half) }) },
+    { value: 'day', minutes: dayMinutes, label: t('accr_round_day', { length: duration(dayMinutes) }) },
+  ]
   // A stored step none of these produce would otherwise vanish the moment somebody opened the
   // policy to change its name.
-  if (!options.some((option) => option.value === roundTo))
-    options.push({ value: roundTo, label: t('accr_round_minutes', { count: Number(roundTo) || 0 }) })
-  return options.sort((a, b) => Number(a.value) - Number(b.value))
+  if (!options.some((option) => option.value === roundChoice))
+    options.push({
+      value: roundChoice,
+      minutes: roundMinutes,
+      label: t('accr_round_minutes', { count: roundMinutes }),
+    })
+  return options.sort((a, b) => a.minutes - b.minutes).map(({ value, label }) => ({ value, label }))
 })
 
 const tierYears = $derived(tiers.map((tier) => clamped(tier.afterYears, 0, 60)))
@@ -384,19 +437,23 @@ const formProblem = $derived.by(() => {
   if (!policyFrom) return t('accr_error_from')
   if (policyTo && policyTo < policyFrom) return t('accr_error_to_before_from')
   if (tiersClash) return t('accr_error_tier_clash')
+  // Said rather than clamped: a step quietly cut back to eight hours is a policy rounding to
+  // something other than the day it names.
+  if (roundMinutes > ROUND_CAP_MINUTES) return t('accr_error_round_cap', { max: duration(ROUND_CAP_MINUTES) })
   return null
 })
 
 const configDraft = $derived({
   frequency,
   daysPerYear: clampedDays(daysPerYear, 0, 365),
-  minutesPerDay: clamped(minutesPerDay, 1, 1440),
+  minutesPerDay: dayMinutes,
   seniorityTiers: tiers.map((tier) => ({
     afterYears: clamped(tier.afterYears, 0, 60),
     daysPerYear: clampedDays(tier.daysPerYear, 0, 365),
   })),
   waitingPeriodMonths: clamped(waitingMonths, 0, 24),
-  roundToMinutes: clamped(roundTo, 0, 480),
+  // Save is blocked above the cap, so this never silently shortens a step somebody chose.
+  roundToMinutes: Math.min(roundMinutes, ROUND_CAP_MINUTES),
   leaveTypeKey,
 })
 
@@ -815,7 +872,11 @@ const HEAD = 10
               {#if config}
                 <span class="num">{t('accr_days_per_year', { count: config.daysPerYear })}</span>
                 <span class="sub">
-                  {leaveTypeName(config.leaveTypeKey)} · {duration(config.minutesPerDay)}
+                  <!-- The day length is named rather than left as a bare duration beside a leave
+                       type, because it is the number those days per year are earned in. -->
+                  {leaveTypeName(config.leaveTypeKey)} · {t('accr_day_is', {
+                    length: duration(config.minutesPerDay),
+                  })}
                   {#if config.seniorityTiers.length > 0}
                     · {t('accr_tiers_count', { count: config.seniorityTiers.length })}
                   {/if}
@@ -1003,6 +1064,13 @@ const HEAD = 10
       <p class="note">{t('accr_edit_retroactive')}</p>
     {/if}
 
+    {#if seededFromUnreadable}
+      <!-- Every field below is a default, the day length included — and the day length is what the
+           engine multiplies entitlement days by. Saying so is the difference between repairing a
+           broken row and overwriting a working one with eight hours and twenty days. -->
+      <p class="note warn">{t('accr_config_unreadable_form')}</p>
+    {/if}
+
     <Field label={t('accr_name')} hint={t('accr_name_hint')} required>
       {#snippet children(id)}
         <Input {id} bind:value={policyName} maxlength={120} />
@@ -1054,10 +1122,7 @@ const HEAD = 10
           <Input {id} type="number" min={0} max={365} step={0.5} bind:value={daysPerYear} />
         {/snippet}
       </Field>
-      <Field
-        label={t('accr_day_length')}
-        hint={t('accr_day_length_hint', { length: duration(clamped(minutesPerDay, 1, 1440)) })}
-      >
+      <Field label={t('accr_day_length')} hint={t('accr_day_length_hint', { length: duration(dayMinutes) })}>
         {#snippet children(id)}
           <Input {id} type="number" min={1} max={1440} bind:value={minutesPerDay} />
         {/snippet}
@@ -1072,7 +1137,12 @@ const HEAD = 10
       </Field>
       <Field label={t('accr_rounding')} hint={t('accr_rounding_hint')}>
         {#snippet children(id)}
-          <Select {id} value={roundTo} onValueChange={(v) => (roundTo = v)} options={roundOptions} />
+          <Select
+            {id}
+            value={roundChoice}
+            onValueChange={(v) => (roundChoice = v)}
+            options={roundOptions}
+          />
         {/snippet}
       </Field>
     </div>
@@ -1388,7 +1458,18 @@ const HEAD = 10
     {:else if preview}
       <div class="tiles">
         <StatTile size="md" label={t('accr_run_people')} value={formatCount(creditable.length, 999)} />
-        <StatTile size="md" label={t('accr_run_total')} value={duration(preview.totalMinutes)} />
+        <!--
+          In time, not days, and deliberately so: one run covers everybody, and the people in it may
+          sit on policies whose days are different lengths, so there is no single day this sum could
+          honestly be divided by. Each row below *is* in days, because the server divided it by that
+          person's own policy. The unit is on the tile rather than left to be inferred.
+        -->
+        <StatTile
+          size="md"
+          label={t('accr_run_total')}
+          value={duration(preview.totalMinutes)}
+          note={t('accr_run_total_note')}
+        />
         <StatTile size="md" label={t('accr_run_skipped')} value={formatCount(preview.skipped.length, 999)} />
       </div>
 

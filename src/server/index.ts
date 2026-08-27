@@ -123,6 +123,37 @@ export const hrModule = defineServerModule({
           return row ?? null
         }),
     },
+    /**
+     * The same person, the other way round: a `personId` to the account behind it.
+     *
+     * Every HR event carries a `personId` and none of them carries a `userId`, because a person is
+     * HR's noun and an account is core's — so a subscriber that has to act on somebody's *account*
+     * (revoke a licence, collect the laptop the asset register says is theirs) has a person id and
+     * nothing it can do with one. `person.byUserId` answers the question a module asks when it
+     * already knows the account; this answers the one it asks when it has just been told an
+     * employment ended.
+     *
+     * `userId` is nullable and legitimately null twice over: for somebody with no Kern account, and
+     * for somebody whose account was removed from the workspace — `core.member.removed` above
+     * clears the link on purpose, because an employment record outlives an account. A caller must
+     * treat null as "nothing to do", not as an error.
+     */
+    'person.get': {
+      handler: async (input: { workspaceId: string; personId: string }, { kernel }) =>
+        kernel.database.withWorkspace(input.workspaceId, async (tx) => {
+          const [row] = await tx
+            .select({
+              id: people.id,
+              userId: people.userId,
+              displayName: people.displayName,
+              status: people.status,
+            })
+            .from(people)
+            .where(eq(people.id, input.personId))
+            .limit(1)
+          return row ?? null
+        }),
+    },
   },
 
   subscriptions: {

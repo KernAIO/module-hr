@@ -871,6 +871,13 @@ const tabs = $derived([
             </div>
 
             {#if selected.total > 0}
+              <!--
+                `orgUnit` is read by the directory, which seeds an org-unit filter from it and asks
+                for the whole subtree — which is why the count here is `total` and not `headcount`.
+                The parameter name is the whole contract between the two screens: renaming it here
+                alone breaks nothing loudly, it just lands on the unfiltered company directory,
+                which is exactly how it shipped.
+              -->
               <Button
                 size="sm"
                 variant="secondary"

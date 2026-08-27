@@ -43,6 +43,19 @@ import { formatDuration, hrKeys, isoDate } from '../query.js'
  * the week runs down the dialog rather than across it, and the label column lands on whichever side
  * the reader's language starts from without a single `left` or `right` in the stylesheet.
  *
+ * **A schedule sets the hours, not the zone, and this screen used to say otherwise.** There was a
+ * "Time zone" field here offering the person's office, the person's own zone, or one fixed zone,
+ * and `schedules.tz_mode` / `schedules.tz` do store whichever was picked. Nothing ever reads them:
+ * `attendance.scheduleFor` builds a `ResolvedSchedule` of shifts, rounding and the automatic close
+ * and carries neither, and the zone a day is attributed in comes from `resolve.forPerson` — the
+ * person's own override if their profile sets one, otherwise their primary office. That ladder is
+ * the module's stated rule rather than an accident (`OfficeAssignment` in the contract: only the
+ * primary decides "which timezone the person's day is attributed in"), so the control was offering
+ * to change something it could not reach, and `fixed` was the option with no rung at all. The
+ * control is gone; the two columns stay. They hold what somebody once chose, dropping them would
+ * destroy that, and switching a setting off must never destroy data — so the screen states where
+ * the zone comes from instead of asking.
+ *
  * No stat tiles. Every number worth one here — how many schedules, how long each week is — is
  * already a column of the table below, and OfficesPage learned the hard way that a tile restating
  * the list is noise. The one figure that would earn a tile, how many people are on no schedule at
@@ -199,8 +212,6 @@ let editing = $state<{ schedule: Schedule | null } | null>(null)
 let name = $state('')
 let kind = $state('fixed')
 let week = $state<Week>(defaultWeek())
-let tzMode = $state('office')
-let tz = $state('')
 let graceIn = $state('0')
 let graceOut = $state('0')
 let roundingStep = $state('0')
@@ -215,8 +226,6 @@ function openEditor(schedule: Schedule | null) {
   name = schedule?.name ?? ''
   kind = schedule?.kind ?? 'fixed'
   week = schedule ? readWeek(schedule.week) : defaultWeek()
-  tzMode = schedule?.tzMode ?? 'office'
-  tz = schedule?.tz ?? ''
   graceIn = String(schedule?.graceInMinutes ?? 0)
   graceOut = String(schedule?.graceOutMinutes ?? 0)
   roundingStep = String(schedule?.roundingStepMinutes ?? 0)
@@ -261,22 +270,15 @@ const timesMissing = $derived(
   }),
 )
 const noWorkingDays = $derived(workingDays.length === 0)
-const zoneMissing = $derived(tzMode === 'fixed' && !tz)
 
 const weekError = $derived(
   noWorkingDays ? t('schedule_week_empty') : timesMissing ? t('schedule_time_missing') : null,
 )
-const canSave = $derived(manage && name.trim().length > 0 && !weekError && !zoneMissing)
+const canSave = $derived(manage && name.trim().length > 0 && !weekError)
 
 /** Why Save is off, in the order somebody would fix them. Null when nothing is blocking. */
 const blockedReason = $derived(
-  canSave
-    ? null
-    : !manage
-      ? t('schedules_readonly')
-      : !name.trim()
-        ? t('schedule_name_required')
-        : (weekError ?? (zoneMissing ? t('schedule_tz_required') : null)),
+  canSave ? null : !manage ? t('schedules_readonly') : !name.trim() ? t('schedule_name_required') : weekError,
 )
 
 const save = createMutation(() => ({
@@ -292,16 +294,15 @@ const save = createMutation(() => ({
       roundingDirection: roundingDirection as Schedule['roundingDirection'],
       autoClockOutAfterMinutes: autoClockOut ? Number(autoClockOut) : null,
     }
-    // Kind and time zone are create-only in the contract, and deliberately: the days already
-    // computed were measured with them, so changing one would rewrite history rather than the rule.
+    // Kind is create-only in the contract, and deliberately: the days already computed were
+    // measured with it, so changing it would rewrite history rather than the rule.
+    //
+    // `tzMode`/`tz` are not sent. The contract defaults `tzMode` to `office` and leaves `tz` null,
+    // which is the only combination that describes what attendance actually does — see the
+    // docblock. Sending anything else would record a choice no computation will honour.
     return current
       ? api.attendance.schedules.update({ ...common, scheduleId: current.id })
-      : api.attendance.schedules.create({
-          ...common,
-          kind: kind as Schedule['kind'],
-          tzMode: tzMode as Schedule['tzMode'],
-          tz: tzMode === 'fixed' ? tz : null,
-        })
+      : api.attendance.schedules.create({ ...common, kind: kind as Schedule['kind'] })
   },
   onSuccess: (schedule) => {
     toast.success(isNew ? t('schedule_created', { name: schedule.name }) : t('schedule_saved'))
@@ -417,34 +418,6 @@ const kindOptions = $derived([
   { value: 'flexible', label: t('schedule_kind_flexible'), description: t('schedule_kind_flexible_desc') },
   { value: 'shift', label: t('schedule_kind_shift'), description: t('schedule_kind_shift_desc') },
 ])
-
-const tzModeOptions = $derived([
-  { value: 'office', label: t('schedule_tz_office') },
-  { value: 'person', label: t('schedule_tz_person') },
-  { value: 'fixed', label: t('schedule_tz_fixed') },
-])
-
-/**
- * Every zone the runtime knows, grouped by area.
- *
- * `supportedValuesOf` is the only complete list available to a browser; where it is missing there
- * is exactly one zone worth offering, the one this machine is in. Reading it is not formatting, so
- * it does not go through the shared formatters.
- */
-const ZONES: string[] = (() => {
-  try {
-    const supported = (Intl as { supportedValuesOf?: (key: string) => string[] }).supportedValuesOf
-    const list = supported?.call(Intl, 'timeZone') ?? []
-    return list.length ? list : [Intl.DateTimeFormat().resolvedOptions().timeZone]
-  } catch {
-    return [Intl.DateTimeFormat().resolvedOptions().timeZone]
-  }
-})()
-const zoneOptions = ZONES.map((zone) => ({
-  value: zone,
-  label: zone.split('/').slice(1).join(' / ').replace(/_/g, ' ') || zone,
-  group: zone.split('/')[0]?.replace(/_/g, ' ') ?? '',
-}))
 
 /** A break somebody actually typed into the database keeps its place in the list. */
 const breakOptions = (current: number) =>
@@ -716,35 +689,15 @@ const autoClockOutOptions = $derived([
       </div>
     </section>
 
-    <!-- Time zone -->
-    {#if isNew}
-      <div class="pair">
-        <Field label={t('schedule_tz_mode')} hint={t('schedule_tz_hint')}>
-          {#snippet children(id)}
-            <Select {id} bind:value={tzMode} options={tzModeOptions} />
-          {/snippet}
-        </Field>
-        {#if tzMode === 'fixed'}
-          <Field
-            label={t('schedule_tz_label')}
-            required
-            error={zoneMissing ? t('schedule_tz_required') : null}
-          >
-            {#snippet children(id)}
-              <Select {id} bind:value={tz} options={zoneOptions} placeholder={t('schedule_tz_label')} />
-            {/snippet}
-          </Field>
-        {/if}
-      </div>
-    {:else}
-      <div class="ro">
-        <span class="rolabel">{t('schedule_tz_mode')}</span>
-        <p class="rovalue">
-          {tzModeOptions.find((option) => option.value === tzMode)?.label ?? tzMode}{#if tz}&nbsp;· {tz}{/if}
-        </p>
-        <p class="note">{t('schedule_immutable_hint')}</p>
-      </div>
-    {/if}
+    <!--
+      Whose clock the readings above are on — a sentence, because it is not a choice.
+
+      A control stood here offering to pick the zone. Nothing read what it stored, and the answer it
+      was asking for is the same for every schedule in the workspace, so the honest version of the
+      field is the fact it was hiding. Read-only on an existing schedule was the same claim in the
+      past tense, so that went with it.
+    -->
+    <p class="note">{t('schedule_tz_note')}</p>
 
     <!-- Grace -->
     <div class="pair">

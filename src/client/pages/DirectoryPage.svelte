@@ -8,6 +8,7 @@ import {
   EmptyState,
   formatCount,
   formatDate,
+  Icon,
   Input,
   messageLocale,
   navigation,
@@ -48,10 +49,100 @@ const workspaceSlug = $derived(navigation.workspaceSlug)
 const workspace = $derived(session.workspaces.find((w) => w.slug === workspaceSlug))
 const workspaceId = $derived(workspace?.id ?? '')
 
+/**
+ * A query parameter is whatever somebody pasted into the address bar, and the contract types both
+ * filters as uuids — so a truncated or hand-edited link would be refused by the server and this
+ * screen would draw a red error where a filter was meant. Anything that is not a uuid is no filter.
+ */
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const asId = (value: string | undefined): string | null => (value && UUID.test(value) ? value : null)
+
 let search = $state('')
-let officeTab = $state('all')
+/**
+ * The filter the directory was opened with.
+ *
+ * Both are links from somewhere else — an office row on the offices screen, "See the people" on a
+ * department — and until this read the query string they landed on the unfiltered company
+ * directory, which reads as the link being broken rather than as a filter that never applied.
+ *
+ * Seeded here rather than in the `$effect` below, and that is load-bearing: an effect runs after
+ * the first render, so `people.list` would fetch and draw the whole company for a beat before
+ * narrowing to the office somebody actually clicked.
+ */
+let officeTab = $state(asId(navigation.search.officeId) ?? 'all')
+let orgUnitId = $state<string | null>(asId(navigation.search.orgUnit))
 const selected = $derived(navigation.search.person)
 const creating = $derived(navigation.search.new === '1')
+
+/**
+ * The URL keeps seeding the filter after that first render: arriving from the offices screen while
+ * the directory is already mounted changes the query string without remounting anything, and the
+ * back button is a filter change too. It only ever writes what it does not read, so there is no loop.
+ */
+$effect(() => {
+  officeTab = asId(navigation.search.officeId) ?? 'all'
+  orgUnitId = asId(navigation.search.orgUnit)
+})
+
+/**
+ * A filter change is written to the URL as well as to state, so the address bar always describes
+ * what is on screen: a reload, a shared link and the back button all land on the same directory.
+ * `person` and `new` are carried through rather than rebuilt, or switching office would close a
+ * panel somebody has open.
+ *
+ * `replaceState` because a filter is not a place — the way back from a filtered directory is the
+ * screen that linked into it, not one history entry per pill.
+ */
+function writeFilter(patch: { officeId?: string | null; orgUnit?: string | null }) {
+  const params = new URLSearchParams(navigation.search)
+  for (const [key, value] of Object.entries(patch)) {
+    if (value) params.set(key, value)
+    else params.delete(key)
+  }
+  const query = params.toString()
+  navigation.go(`/${workspaceSlug}/hr${query ? `?${query}` : ''}`, {
+    replaceState: true,
+    keepFocus: true,
+    noScroll: true,
+  })
+}
+
+/** State first, URL second: the shell's router is asynchronous and the pills must not lag a click. */
+function chooseOffice(value: string) {
+  officeTab = value
+  writeFilter({ officeId: value === 'all' ? null : value })
+}
+
+/**
+ * Clears the search along with the office and the department.
+ *
+ * The empty state that offers this button is reached when a filter is on, which includes the case
+ * where a *search* inside that filter is what found nobody. Clearing only the filter there leaves
+ * the term in the box, so the table can still be empty after the click — a button that visibly does
+ * nothing, on the one screen where the reader has already failed to find someone.
+ */
+function clearFilters() {
+  officeTab = 'all'
+  orgUnitId = null
+  search = ''
+  debounced = ''
+  writeFilter({ officeId: null, orgUnit: null })
+}
+
+/**
+ * A row link carries the filter it was opened from.
+ *
+ * Now that the filter is in the query string, a bare `?person=…` is also a request to show the
+ * whole company — so opening somebody from an office directory would quietly re-fetch and redraw
+ * every person in the workspace behind the panel. `new` is dropped rather than kept: two dialogs
+ * over one directory is not a state anything should be able to link to.
+ */
+function personHref(personId: string): string {
+  const params = new URLSearchParams(navigation.search)
+  params.delete('new')
+  params.set('person', personId)
+  return `/${workspaceSlug}/hr?${params.toString()}`
+}
 
 const showOffices = $derived(session.hasCapability('hr', HR_CAPABILITIES.offices))
 /**
@@ -79,6 +170,23 @@ $effect(() => {
   return () => clearTimeout(handle)
 })
 
+/**
+ * What the filter asks the server for, shared by the table and the counts above it.
+ *
+ * `includeDescendants` is passed rather than left to the contract's default: the number on the
+ * "See the people" button that links here is the department's *subtree* total, and a directory
+ * holding fewer people than the link promised is the same defect one layer down.
+ */
+const scopeArgs = $derived({
+  ...(officeTab !== 'all' ? { officeId: officeTab } : {}),
+  ...(orgUnitId ? { orgUnitId, includeDescendants: true } : {}),
+})
+/**
+ * The same filter as a cache key. `'all'` is spelled out rather than left absent, so that no two
+ * scopes ever hash alike and the cache cannot answer a filtered directory with the whole company.
+ */
+const scopeKey = $derived({ officeId: officeTab, orgUnitId: orgUnitId ?? 'all' })
+
 const officesQuery = createQuery(() => ({
   queryKey: hrKeys.offices(workspaceId),
   enabled: Boolean(workspaceId) && showOffices && canHr('officeView'),
@@ -87,23 +195,76 @@ const officesQuery = createQuery(() => ({
 const offices = $derived(officesQuery.data ?? [])
 
 const peopleQuery = createQuery(() => ({
-  queryKey: hrKeys.people(workspaceId, { q: debounced, officeId: officeTab }),
+  queryKey: hrKeys.people(workspaceId, { ...scopeKey, q: debounced }),
   enabled: Boolean(workspaceId),
   queryFn: () =>
     api.people.list({
       workspaceId,
       limit: 100,
       ...(debounced ? { q: debounced } : {}),
-      ...(officeTab !== 'all' ? { officeId: officeTab } : {}),
+      ...scopeArgs,
     }),
 }))
 const people = $derived(peopleQuery.data?.items ?? [])
+
+/**
+ * The tiles count the company, not the page.
+ *
+ * `people.list` returns a `total` for the whole filter, so both numbers are asked of the server
+ * with `limit: 1` rather than counted off the rows on screen. Counting the rows made "On leave"
+ * fall as somebody typed a name — the table narrows on every keystroke and stops at a hundred rows
+ * either way — which is a tile reporting the search box while wearing the label of a company fact.
+ *
+ * The search is deliberately not part of these: a tile describes the scope the directory is
+ * showing, and finding one person inside it does not change how many of them are away. The filter
+ * *is* part of them, so an office's directory shows that office's numbers.
+ */
+const headcountQuery = createQuery(() => ({
+  queryKey: hrKeys.people(workspaceId, { ...scopeKey, count: 'headcount' }),
+  enabled: Boolean(workspaceId),
+  queryFn: () => api.people.list({ workspaceId, limit: 1, ...scopeArgs }),
+}))
+
+const onLeaveQuery = createQuery(() => ({
+  queryKey: hrKeys.people(workspaceId, { ...scopeKey, count: 'on_leave' }),
+  enabled: Boolean(workspaceId),
+  queryFn: () => api.people.list({ workspaceId, limit: 1, status: ['on_leave'], ...scopeArgs }),
+}))
+
+/**
+ * Only to name the department in the filter chip, so it is asked for only when there is one to
+ * name. It shares `hrKeys.orgUnits` with the org chart, which is where "See the people" is clicked
+ * — so arriving from there costs no request at all.
+ */
+const orgUnitsQuery = createQuery(() => ({
+  queryKey: hrKeys.orgUnits(workspaceId),
+  enabled: Boolean(workspaceId) && orgUnitId !== null && canHr('orgView'),
+  queryFn: () => api.org.units.tree({ workspaceId, includeArchived: false }),
+}))
+const orgUnitName = $derived(orgUnitsQuery.data?.find((u) => u.id === orgUnitId)?.name ?? null)
 
 /** Office tabs only once there is more than one place of work — otherwise they say nothing. */
 const tabs = $derived([
   { value: 'all', label: t('title') },
   ...offices.map((o) => ({ value: o.id, label: o.name })),
 ])
+
+/**
+ * Whether the office filter has to be said in words.
+ *
+ * A selected pill already says it, so this is for what the tabs cannot cover: a workspace with one
+ * office (no tabs at all), a viewer without `hr.office.view`, and an id that is not in the list any
+ * more — an archived office whose link somebody kept. There is no name to give in any of those
+ * cases, which is why the chip's wording does not promise one.
+ *
+ * While the offices are still loading there is nothing to say yet and the table is drawing
+ * skeletons, so it waits rather than flashing a sentence a pill is about to replace.
+ */
+const officeNeedsChip = $derived(
+  officeTab !== 'all' && !officesQuery.isLoading && !tabs.some((tab) => tab.value === officeTab),
+)
+/** Any filter at all — what decides whether an empty table is "nobody yet" or "nobody here". */
+const filtered = $derived(officeTab !== 'all' || orgUnitId !== null)
 
 const balancesQuery = createQuery(() => ({
   queryKey: hrKeys.leaveBalance(workspaceId, undefined),
@@ -205,9 +366,9 @@ const SUBJECT_LABELS: Record<string, () => string> = {
 const subjectLabel = (subjectType: string) => SUBJECT_LABELS[subjectType]?.() ?? subjectType
 
 const stats = $derived({
-  headcount: peopleQuery.data?.total ?? people.length,
+  headcount: headcountQuery.data?.total ?? null,
   offices: offices.length,
-  away: people.filter((p) => p.status === 'on_leave').length,
+  away: onLeaveQuery.data?.total ?? null,
   balance: balancesQuery.data?.[0]?.available ?? 0,
 })
 
@@ -267,6 +428,14 @@ const started = (iso: string | null) =>
 
 /** `formatCount` caps at 99 for badges. A headcount is a real number and must not read "99+". */
 const count = (n: number) => formatCount(n, Number.MAX_SAFE_INTEGER)
+
+/**
+ * A count nobody has yet is an em dash, never a zero.
+ *
+ * "0 on leave" is a fact about the company, and a tile stating it while the request is still in
+ * flight — or after it failed — is the same lie the tile was counting rows to tell.
+ */
+const tileCount = (n: number | null) => (n === null ? '—' : count(n))
 </script>
 
 <PageHeader
@@ -283,7 +452,7 @@ const count = (n: number) => formatCount(n, Number.MAX_SAFE_INTEGER)
 
 <Page>
   <div class="tiles">
-    <StatTile size="md" label={t('widget_headcount_title')} value={count(stats.headcount)} />
+    <StatTile size="md" label={t('widget_headcount_title')} value={tileCount(stats.headcount)} />
     <!--
       Only where the workspace has offices. It rendered unconditionally and read "Offices 0" on a
       single-site workspace — a tile counting a feature nobody switched on, sitting beside three
@@ -292,7 +461,11 @@ const count = (n: number) => formatCount(n, Number.MAX_SAFE_INTEGER)
     {#if showOffices}
       <StatTile size="md" label={t('offices_title')} value={count(stats.offices)} />
     {/if}
-    <StatTile size="md" label={t('status_on_leave')} value={count(stats.away)} />
+    <!--
+      The number comes from the server, and the note says which number it is: "On leave" over a
+      figure could as easily mean this week or this month, and it means neither.
+    -->
+    <StatTile size="md" label={t('status_on_leave')} value={tileCount(stats.away)} note={t('on_leave_note')} />
     <!-- Same rule for leave: the balance tile is the surface of a capability, so it goes with it. -->
     {#if showBalance}
       <StatTile
@@ -310,7 +483,28 @@ const count = (n: number) => formatCount(n, Number.MAX_SAFE_INTEGER)
 
       <div class="filters">
         {#if tabs.length > 1}
-          <Tabs items={tabs} value={officeTab} variant="pill" onValueChange={(v) => (officeTab = v)} />
+          <Tabs items={tabs} value={officeTab} variant="pill" label={t('office')} onValueChange={chooseOffice} />
+        {/if}
+        <!--
+          What the pills cannot say. A directory that opened filtered and says nothing about it is
+          indistinguishable from a directory that lost half the company, so anything the tabs are not
+          already showing gets a chip — and one control puts every filter back at once.
+        -->
+        {#if officeNeedsChip || orgUnitId}
+          <div class="active">
+            {#if officeNeedsChip}
+              <span class="chip">
+                <Icon name="building" size={12} strokeWidth={1.8} />{t('filter_office_unnamed')}
+              </span>
+            {/if}
+            {#if orgUnitId}
+              <span class="chip">
+                <Icon name="git-branch" size={12} strokeWidth={1.8} />
+                {orgUnitName ? t('filter_department', { name: orgUnitName }) : t('filter_department_unnamed')}
+              </span>
+            {/if}
+            <Button size="xs" variant="ghost" onclick={clearFilters}>{t('filter_clear')}</Button>
+          </div>
         {/if}
         <div class="search">
           <Input bind:value={search} placeholder={t('search_people')} type="search" size="sm" />
@@ -339,7 +533,7 @@ const count = (n: number) => formatCount(n, Number.MAX_SAFE_INTEGER)
           </div>
           {#each people as person (person.id)}
             {@const time = localTime(person.timezone, tick)}
-            <a class="trow" role="row" href={`/${workspaceSlug}/hr?person=${person.id}`}>
+            <a class="trow" role="row" href={personHref(person.id)}>
               <span class="cell who" role="cell">
                 <Avatar name={person.displayName} id={person.id} size={28} />
                 <span class="stack">
@@ -363,6 +557,19 @@ const count = (n: number) => formatCount(n, Number.MAX_SAFE_INTEGER)
             <Button variant="secondary" onclick={() => void peopleQuery.refetch()}>{t('retry')}</Button>
           {/snippet}
         </EmptyState>
+      <!--
+        "Nobody here yet — add the first person" is the right sentence for an empty company and the
+        wrong one for an office with nobody in it: it invites somebody to create a second record for
+        a person the filter is simply hiding. A filtered miss offers the way out instead.
+      -->
+      {:else if filtered}
+        <EmptyState icon="search" title={t('no_people_match')} description={t('no_people_match_filtered')}>
+          {#snippet actions()}
+            <Button variant="secondary" onclick={clearFilters}>{t('filter_clear')}</Button>
+          {/snippet}
+        </EmptyState>
+      {:else if debounced}
+        <EmptyState icon="search" title={t('no_people_match')} description={t('no_people_match_search')} />
       {:else}
         <EmptyState icon="users" title={t('no_people')} description={t('no_people_desc')} />
       {/if}
@@ -458,11 +665,34 @@ const count = (n: number) => formatCount(n, Number.MAX_SAFE_INTEGER)
   display: flex;
   align-items: center;
   gap: 12px;
+  /* A department name is as long as somebody named it, and Persian and German run longer than the
+     English it was laid out in. The row wraps rather than crushing the search box. */
+  flex-wrap: wrap;
   margin-block: 4px 8px;
 }
 .search {
   margin-inline-start: auto;
-  width: min(260px, 40%);
+  inline-size: min(260px, 40%);
+}
+.active {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-inline-size: 0;
+}
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding-inline: 9px;
+  block-size: 24px;
+  border-radius: var(--kern-r-full);
+  background: var(--kern-surface-chip);
+  font-size: 12px;
+  /* A colour, not opacity: opacity fades text against the page whatever token it names. */
+  color: var(--kern-ink-700);
+  white-space: nowrap;
 }
 .rows {
   display: grid;

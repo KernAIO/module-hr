@@ -160,6 +160,12 @@ const kindTone = (kind: string): BadgeTone => (kind === 'remote' ? 'info' : 'gre
         <span role="columnheader">{t('local_time')}</span>
       </div>
       {#each offices as office (office.id)}
+        <!--
+          `officeId` is read by the directory, which seeds its office filter from it and shows the
+          filter it landed with. The parameter name is the whole contract between the two screens:
+          renaming it here alone breaks nothing loudly — the link still resolves, and quietly lands
+          on the unfiltered company directory, which is exactly how it shipped.
+        -->
         <a
           class="trow"
           role="row"

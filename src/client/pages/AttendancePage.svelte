@@ -18,6 +18,7 @@ import { getHrApi } from '../api-instance.js'
 import ClockControls from '../components/ClockControls.svelte'
 import DayDetail from '../components/DayDetail.svelte'
 import { t } from '../i18n.js'
+import { canHr } from '../permissions.js'
 import { formatDuration, hrKeys, monthRange } from '../query.js'
 
 /**
@@ -46,6 +47,26 @@ const workspace = $derived(session.workspaces.find((w) => w.slug === workspaceSl
 const workspaceId = $derived(workspace?.id ?? '')
 
 const range = $derived(monthRange())
+
+/**
+ * The clock is the punch permission, and nothing else on this page is.
+ *
+ * `hr.attendance.view` is what opens this route — reading your own month — while every one of the
+ * four transitions behind `ClockControls` is `requires('hr.attendance.punch')` on the server. A
+ * workspace revokes that from somebody whose punches arrive from a badge terminal or from their
+ * manager, and for them the clock row was a set of buttons that can only answer 403 — an offer the
+ * product cannot honour.
+ *
+ * Hidden rather than disabled-with-a-reason, because this is a permission and not a state: they may
+ * never do it, there is nothing to wait for, and "you cannot clock in" repeated on every visit
+ * teaches nothing. It is also the same answer the dashboard already gives — `module.ts` declares the
+ * clock widget with `permission: attendancePunch`, so the shell has always hidden this exact
+ * component for these people. The page was the one place it leaked.
+ *
+ * The status line goes with the buttons it captions; the month underneath is what a viewer keeps,
+ * and today is a row in it.
+ */
+const canPunch = $derived(canHr('attendancePunch'))
 
 const daysQuery = createQuery(() => ({
   queryKey: hrKeys.attendanceDays(workspaceId, undefined, range.from, range.to),
@@ -168,7 +189,9 @@ const dayLabel = (iso: string) =>
 {/snippet}
 
 <Page>
-  <ClockControls {workspaceId} />
+  {#if canPunch}
+    <ClockControls {workspaceId} />
+  {/if}
 
   {#if totalsUnknown}
     {@render tilesUnknown()}
