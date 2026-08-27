@@ -1,5 +1,11 @@
 # @kernhq/module-hr
 
+## 0.14.1
+
+### Patch Changes
+
+- refactor(hr): read the redaction flag instead of inferring it
+
 ## 0.14.0
 
 ### Minor Changes
