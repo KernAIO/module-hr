@@ -493,7 +493,7 @@ export function hrSubjects(deps: {
     await tx
       .update(leaveRequestDays)
       .set({ status: 'approved' })
-      .where(eq(leaveRequestDays.requestId, request.id))
+      .where(and(eq(leaveRequestDays.workspaceId, workspaceId), eq(leaveRequestDays.requestId, request.id)))
     await tx
       .update(leaveRequests)
       .set({
@@ -503,7 +503,7 @@ export function hrSubjects(deps: {
         decidedAt: new Date(),
         updatedAt: new Date(),
       })
-      .where(eq(leaveRequests.id, request.id))
+      .where(and(eq(leaveRequests.workspaceId, workspaceId), eq(leaveRequests.id, request.id)))
   }
 
   /**
@@ -561,7 +561,7 @@ export function hrSubjects(deps: {
     await tx
       .update(regularizations)
       .set({ status: 'approved', appliedAt: new Date() })
-      .where(eq(regularizations.id, row.id))
+      .where(and(eq(regularizations.workspaceId, workspaceId), eq(regularizations.id, row.id)))
   }
 
   /** A rejected request costs no balance and writes no punches; it just stops being live. */
@@ -576,7 +576,7 @@ export function hrSubjects(deps: {
     await tx
       .update(leaveRequests)
       .set({ status: 'rejected', decidedAt: new Date(), updatedAt: new Date() })
-      .where(eq(leaveRequests.id, leaveRequestId))
+      .where(and(eq(leaveRequests.workspaceId, workspaceId), eq(leaveRequests.id, leaveRequestId)))
   }
 
   /** The same, for a correction. */
@@ -590,7 +590,7 @@ export function hrSubjects(deps: {
     await tx
       .update(regularizations)
       .set({ status: 'rejected' })
-      .where(eq(regularizations.id, regularizationId))
+      .where(and(eq(regularizations.workspaceId, workspaceId), eq(regularizations.id, regularizationId)))
   }
 
   return {
@@ -1246,7 +1246,10 @@ export function implement_(kernel: Kernel) {
                where workspace_id = ${input.workspaceId}
                  and path <@ ${unit.path}::ltree
             `)
-            await tx.update(orgUnits).set({ parentId: input.parentId }).where(eq(orgUnits.id, input.unitId))
+            await tx
+              .update(orgUnits)
+              .set({ parentId: input.parentId })
+              .where(and(eq(orgUnits.workspaceId, input.workspaceId), eq(orgUnits.id, input.unitId)))
 
             return tx
               .select()
@@ -2126,7 +2129,7 @@ export function implement_(kernel: Kernel) {
               await tx
                 .update(calendars)
                 .set({ packKey: input.packKey, packVersion: String(input.year), updatedAt: new Date() })
-                .where(eq(calendars.id, input.calendarId))
+                .where(and(eq(calendars.workspaceId, input.workspaceId), eq(calendars.id, input.calendarId)))
               return diff
             })
             await emitCalendarChanged(
@@ -4145,7 +4148,12 @@ export function implement_(kernel: Kernel) {
           const [fresh] = await tx
             .select()
             .from(approvalRequests)
-            .where(eq(approvalRequests.id, input.requestId))
+            .where(
+              and(
+                eq(approvalRequests.workspaceId, input.workspaceId),
+                eq(approvalRequests.id, input.requestId),
+              ),
+            )
           return { hydrated: await hydrateApproval(tx, fresh!), request: fresh! }
         })
 
@@ -4229,7 +4237,12 @@ export function implement_(kernel: Kernel) {
               const [updated] = await tx
                 .update(approvalChains)
                 .set(set)
-                .where(eq(approvalChains.id, input.chainId))
+                .where(
+                  and(
+                    eq(approvalChains.workspaceId, input.workspaceId),
+                    eq(approvalChains.id, input.chainId),
+                  ),
+                )
                 .returning()
               return updated!
             })
@@ -5355,6 +5368,10 @@ export function implement_(kernel: Kernel) {
 
   async function diffPack(tx: Tx, workspaceId: string, calendarId: string, packKey: string, year: number) {
     requirePack(packKey)
+    // The calendar id is the caller's. Proving it belongs to this workspace is what stops `apply`
+    // stamping a pack onto another tenant's calendar, and stops `preview` answering with the empty
+    // diff a calendar nobody can see produces.
+    await loadCalendar(tx, workspaceId, calendarId)
     const from = `${year}-01-01`
     const to = `${year}-12-31`
     const existing = await tx

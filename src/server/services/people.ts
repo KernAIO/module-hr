@@ -229,7 +229,7 @@ export class PeopleService {
       await tx
         .update(employments)
         .set({ effectiveTo: sql`${effectiveFrom}::date - 1` })
-        .where(eq(employments.id, open.id))
+        .where(and(eq(employments.workspaceId, workspaceId), eq(employments.id, open.id)))
     }
 
     const [row] = await tx
@@ -288,11 +288,14 @@ export class PeopleService {
         await tx
           .update(officeAssignments)
           .set({ effectiveTo: sql`${effectiveFrom}::date - 1` })
-          .where(eq(officeAssignments.id, row.id))
+          .where(and(eq(officeAssignments.workspaceId, workspaceId), eq(officeAssignments.id, row.id)))
       } else if (isPrimary && row.isPrimary) {
         // Demote, do not close: somebody moving their primary from Istanbul to Amsterdam usually
         // keeps a presence in Istanbul, and closing it would remove them from that directory.
-        await tx.update(officeAssignments).set({ isPrimary: false }).where(eq(officeAssignments.id, row.id))
+        await tx
+          .update(officeAssignments)
+          .set({ isPrimary: false })
+          .where(and(eq(officeAssignments.workspaceId, workspaceId), eq(officeAssignments.id, row.id)))
       }
     }
 

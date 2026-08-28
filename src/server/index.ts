@@ -2,7 +2,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { core } from '@kernhq/contracts'
 import { defineModule, defineServerModule, type Kernel, packageVersion, uuidv7 } from '@kernhq/kernel'
-import { eq } from 'drizzle-orm'
+import { and, eq } from 'drizzle-orm'
 import {
   HrSettings,
   hrCapabilities,
@@ -171,7 +171,7 @@ export const hrModule = defineServerModule({
           const [row] = await tx
             .select({ id: people.id, displayName: people.displayName, status: people.status })
             .from(people)
-            .where(eq(people.userId, input.userId))
+            .where(and(eq(people.workspaceId, input.workspaceId), eq(people.userId, input.userId)))
             .limit(1)
           return row ?? null
         }),
@@ -202,7 +202,7 @@ export const hrModule = defineServerModule({
               status: people.status,
             })
             .from(people)
-            .where(eq(people.id, input.personId))
+            .where(and(eq(people.workspaceId, input.workspaceId), eq(people.id, input.personId)))
             .limit(1)
           return row ?? null
         }),
@@ -220,7 +220,12 @@ export const hrModule = defineServerModule({
     'core.member.removed': async (event, kernel) => {
       const { workspaceId, userId } = event.payload as { workspaceId: string; userId: string }
       await kernel.database.withWorkspace(workspaceId, (tx) =>
-        tx.update(people).set({ userId: null }).where(eq(people.userId, userId)),
+        // Scoped to the workspace the member left. The same account can hold a person record in
+        // several workspaces, and leaving one of them says nothing about the others.
+        tx
+          .update(people)
+          .set({ userId: null })
+          .where(and(eq(people.workspaceId, workspaceId), eq(people.userId, userId))),
       )
     },
   },

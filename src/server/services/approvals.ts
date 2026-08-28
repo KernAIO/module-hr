@@ -427,7 +427,13 @@ export class ApprovalService {
     const [step] = await tx
       .select()
       .from(approvalSteps)
-      .where(and(eq(approvalSteps.requestId, requestId), eq(approvalSteps.stepIndex, request.currentStep)))
+      .where(
+        and(
+          eq(approvalSteps.workspaceId, workspaceId),
+          eq(approvalSteps.requestId, requestId),
+          eq(approvalSteps.stepIndex, request.currentStep),
+        ),
+      )
       .limit(1)
     if (!step) throw KernError.notFound('Approval step')
 
@@ -451,18 +457,24 @@ export class ApprovalService {
       comment,
     })
 
-    const decisions = await tx.select().from(approvalDecisions).where(eq(approvalDecisions.stepId, step.id))
+    const decisions = await tx
+      .select()
+      .from(approvalDecisions)
+      .where(and(eq(approvalDecisions.workspaceId, workspaceId), eq(approvalDecisions.stepId, step.id)))
     const approvals = decisions.filter((d) => d.decision === 'approve').length
     const rejections = decisions.filter((d) => d.decision === 'reject').length
 
     // One rejection ends it. Every workflow we have wants that, and "some approvers rejected but it
     // went through anyway" is not a sentence anybody wants to read in an audit.
     if (rejections > 0) {
-      await tx.update(approvalSteps).set({ status: 'rejected' }).where(eq(approvalSteps.id, step.id))
+      await tx
+        .update(approvalSteps)
+        .set({ status: 'rejected' })
+        .where(and(eq(approvalSteps.workspaceId, workspaceId), eq(approvalSteps.id, step.id)))
       await tx
         .update(approvalRequests)
         .set({ status: 'rejected', decidedAt: new Date(), version: sql`${approvalRequests.version} + 1` })
-        .where(eq(approvalRequests.id, requestId))
+        .where(and(eq(approvalRequests.workspaceId, workspaceId), eq(approvalRequests.id, requestId)))
       return { status: 'rejected' as const, request }
     }
 
@@ -487,33 +499,43 @@ export class ApprovalService {
     step: typeof approvalSteps.$inferSelect,
     now = new Date(),
   ): Promise<number | null> {
-    await tx.update(approvalSteps).set({ status: 'approved' }).where(eq(approvalSteps.id, step.id))
+    const workspaceId = request.workspaceId
+    await tx
+      .update(approvalSteps)
+      .set({ status: 'approved' })
+      .where(and(eq(approvalSteps.workspaceId, workspaceId), eq(approvalSteps.id, step.id)))
 
     const [next] = await tx
       .select()
       .from(approvalSteps)
-      .where(and(eq(approvalSteps.requestId, request.id), eq(approvalSteps.stepIndex, step.stepIndex + 1)))
+      .where(
+        and(
+          eq(approvalSteps.workspaceId, workspaceId),
+          eq(approvalSteps.requestId, request.id),
+          eq(approvalSteps.stepIndex, step.stepIndex + 1),
+        ),
+      )
       .limit(1)
 
     if (next) {
       await tx
         .update(approvalRequests)
         .set({ currentStep: next.stepIndex, version: sql`${approvalRequests.version} + 1` })
-        .where(eq(approvalRequests.id, request.id))
+        .where(and(eq(approvalRequests.workspaceId, workspaceId), eq(approvalRequests.id, request.id)))
       // Left alone when the step states no SLA of its own, so a request raised before steps carried
       // `sla_hours` keeps whatever deadline it was given rather than losing it to a null.
       if (next.slaHours)
         await tx
           .update(approvalSteps)
           .set({ dueAt: deadlineFrom(next.slaHours, now) })
-          .where(eq(approvalSteps.id, next.id))
+          .where(and(eq(approvalSteps.workspaceId, workspaceId), eq(approvalSteps.id, next.id)))
       return next.stepIndex
     }
 
     await tx
       .update(approvalRequests)
       .set({ status: 'approved', decidedAt: now, version: sql`${approvalRequests.version} + 1` })
-      .where(eq(approvalRequests.id, request.id))
+      .where(and(eq(approvalRequests.workspaceId, workspaceId), eq(approvalRequests.id, request.id)))
     return null
   }
 
@@ -599,7 +621,7 @@ export class ApprovalService {
               mode: step.mode === 'all' ? 'quorum' : step.mode,
               minApprovals: step.mode === 'all' ? step.approverIds.length : step.minApprovals,
             })
-            .where(eq(approvalSteps.id, step.id))
+            .where(and(eq(approvalSteps.workspaceId, workspaceId), eq(approvalSteps.id, step.id)))
           // Everyone on the step, old and new. The people it went over the head of are the ones
           // most owed the sentence, and the ones it landed on cannot act on what they are not told.
           pending.push({
@@ -696,7 +718,7 @@ export class ApprovalService {
       await tx
         .update(approvalSteps)
         .set({ timeoutHandledAt: now, timeoutAction: action })
-        .where(eq(approvalSteps.id, step.id))
+        .where(and(eq(approvalSteps.workspaceId, workspaceId), eq(approvalSteps.id, step.id)))
       touched.add(request.id)
     }
 
