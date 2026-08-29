@@ -1,5 +1,11 @@
 # @kernhq/module-hr
 
+## 0.20.1
+
+### Patch Changes
+
+- 08c76bd: Peer @kernhq/kernel ^0.9.1 — the framework published; the module's range follows so one install resolves a single consistent kernel.
+
 ## 0.20.0
 
 ### Minor Changes
