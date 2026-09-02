@@ -1953,7 +1953,7 @@ export const ar: Record<string, Message> = {
   'hr.cap_periods': 'فترات الرواتب',
   'hr.cap_periods_desc': 'إغلاق الشهر حتى لا يتغيّر كشف رواتب مُعتمد بعد اعتماده',
   'hr.capabilities_desc':
-    'Turn a feature off and it disappears — from navigation, dashboards and the API. Nothing is deleted, so turning it back on restores what was there.',
+    'عند إيقاف أي ميزة تختفي — من التنقّل ولوحات المعلومات وواجهة البرمجة. لا يُحذف شيء، وإعادة تشغيلها تعيد ما كان.',
   'hr.capabilities_none': 'لا يوجد ما يمكن تشغيله أو إيقافه',
   'hr.capabilities_none_desc':
     'كل ما هنا يأتي ككتلة واحدة. الميزات التي يمكن تشغيلها أو إيقافها تظهر في هذه القائمة.',
@@ -3442,7 +3442,7 @@ export const de: Record<string, Message> = {
   'hr.cap_periods_desc':
     'Einen Monat schließen, damit eine eingereichte Abrechnung sich nicht nachträglich verschiebt',
   'hr.capabilities_desc':
-    'Turn a feature off and it disappears — from navigation, dashboards and the API. Nothing is deleted, so turning it back on restores what was there.',
+    'Schalten Sie eine Funktion aus, verschwindet sie — aus Navigation, Dashboards und API. Nichts wird gelöscht; beim Wiedereinschalten ist alles wieder da.',
   'hr.capabilities_none': 'Hier gibt es nichts zu schalten',
   'hr.capabilities_none_desc':
     'Alles hier wird als ein Stück ausgeliefert. Funktionen, die Sie ein- und ausschalten können, erscheinen in dieser Liste.',
