@@ -62,6 +62,12 @@ export const hrKeys = {
   /** Fetched only where the viewer holds `hr.person.view_sensitive`, so it is its own entry. */
   sensitive: (ws: string, personId: string) => ['hr', 'sensitive', ws, personId] as const,
   /**
+   * The live definitions, as every person form and panel reads them; the settings screen adds a
+   * suffix. `field`, singular, because that is the entity `router.ts` announces after a write and
+   * the realtime client invalidates by `[module, entity]`.
+   */
+  fields: (ws: string) => ['hr', 'field', ws] as const,
+  /**
    * The org editor asks for archived units too, so it cannot share `orgUnits` with the chart —
    * a toggle that changes what a query asks for has to change the key, or the cache answers the
    * question it was asked last time and the switch appears to do nothing.
@@ -70,8 +76,91 @@ export const hrKeys = {
   positions: (ws: string) => ['hr', 'positions', ws, 'with-archived'] as const,
   /** Every period in one read: `periods.list` returns no cursor, so there is nothing to page. */
   periods: (ws: string) => ['hr', 'periods', ws] as const,
+  /**
+   * The payroll preview is keyed by everything the server was asked: the same period previewed as
+   * a draft and as a final export answers differently (`refusals`, the filenames, `finality`), and
+   * serving one from the other's cache would show a reader a file that is not the one they get.
+   */
+  payrollExportPreview: (ws: string, legalEntityId: string, periodId: string, draft: boolean) =>
+    ['hr', 'payroll-export-preview', ws, legalEntityId, periodId, draft ? 'draft' : 'final'] as const,
   approvalChains: (ws: string) => ['hr', 'approval-chains', ws] as const,
+  /** The horizons with their counts. One read per workspace; the settings screen is the only asker. */
+  retention: (ws: string) => ['hr', 'retention', ws] as const,
+  /**
+   * Who read one person's sensitive fields. Keyed by the subject, because the same panel asks about
+   * different people and a viewer's own log must never be served a colleague's from cache.
+   */
+  accessLog: (ws: string, personId: string) => ['hr', 'access-log', ws, personId] as const,
+  /**
+   * Rosters are keyed by the entity name the server announces, not by a screen's name for it.
+   *
+   * `router.ts` calls `changed(ws, 'roster_shift' | 'roster_pattern' | 'roster_assignment' |
+   * 'roster_day', …)` after every write, and the realtime client invalidates by the
+   * `[module, entity]` prefix — so a key spelt `roster-shifts` would never be refetched when
+   * somebody else edits a shift, and the coverage grid on a second screen would keep yesterday's
+   * answer until a reload.
+   */
+  rosterShifts: (ws: string) => ['hr', 'roster_shift', ws] as const,
+  rosterPatterns: (ws: string) => ['hr', 'roster_pattern', ws] as const,
+  rosterAssignments: (ws: string, personId?: string) =>
+    personId
+      ? (['hr', 'roster_assignment', ws, personId] as const)
+      : (['hr', 'roster_assignment', ws] as const),
+  rosterDays: (ws: string, personId: string | undefined, from: string, to: string) =>
+    ['hr', 'roster_day', ws, personId ?? 'me', from, to] as const,
+  /**
+   * Coverage sits under `roster_day` too, because there is no `roster_coverage` entity to announce
+   * and a key can carry one prefix. An override is the change that happens day to day and comes
+   * from another screen, so that is the one worth following live; a rotation or an assignment
+   * changes from the settings page, which invalidates all of `['hr']` after its own writes.
+   */
+  rosterCoverage: (ws: string, from: string, to: string, officeId?: string) =>
+    ['hr', 'roster_day', ws, 'coverage', from, to, officeId ?? 'all'] as const,
+  /**
+   * A report is keyed by everything that decides its population and its figures — the range, the
+   * slice and the row limit — because the same title over a different population is a different
+   * report, and serving one from the other's cache is exactly the defect `ReportHeader` exists to
+   * prevent. The balance report is keyed on its `asOf` date instead of a range.
+   */
+  reportAttendance: (ws: string, input: ReportRangeInput) => ['hr', 'report-attendance', ws, input] as const,
+  reportOvertime: (ws: string, input: ReportRangeInput) => ['hr', 'report-overtime', ws, input] as const,
+  reportAbsence: (ws: string, input: ReportRangeInput) => ['hr', 'report-absence', ws, input] as const,
+  reportLeaveBalance: (ws: string, input: ReportBalanceInput) =>
+    ['hr', 'report-leave-balance', ws, input] as const,
 } as const
+
+/** What narrows a day-sheet report: the range, the slice, and how many rows to draw. */
+export interface ReportRangeInput {
+  from: string
+  to: string
+  by: 'workspace' | 'office' | 'legal_entity'
+  sliceId?: string
+  limit: number
+}
+
+/** The balance report is a position, so one date stands in for the range. */
+export interface ReportBalanceInput {
+  asOf: string
+  by: 'workspace' | 'office' | 'legal_entity'
+  sliceId?: string
+  limit: number
+}
+
+/**
+ * `iso` moved by `n` calendar days.
+ *
+ * Stepped in UTC and read back as a date, so a daylight-saving change in the viewer's zone cannot
+ * turn "+1 day" into 23 hours and land on the same date twice — the same reason `mock.ts` steps its
+ * ranges that way.
+ */
+export function addDays(iso: string, n: number): string {
+  return new Date(Date.parse(`${iso}T00:00:00Z`) + n * 86_400_000).toISOString().slice(0, 10)
+}
+
+/** How many calendar days `from`..`to` covers, both ends included. Zero or less when reversed. */
+export function daysInclusive(from: string, to: string): number {
+  return Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86_400_000) + 1
+}
 
 /** `YYYY-MM-DD` for a date, in the viewer's own zone rather than UTC. */
 export const isoDate = (d: Date = new Date()): string => new Intl.DateTimeFormat('en-CA').format(d)

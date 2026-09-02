@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import type { Principal } from '@kernhq/contracts'
+import type { core, Principal } from '@kernhq/contracts'
 import { CAPABILITIES_KEY, createKernel, type Kernel, type RequestContext, type Tx } from '@kernhq/kernel'
 import { call } from '@orpc/server'
 import { and, eq, inArray, isNull } from 'drizzle-orm'
@@ -91,11 +91,26 @@ const inWs =
 
 const run = inWs(WS_A)
 
+/** Every search document HR wrote, and every id it took back out — the directory's index, recorded. */
+const INDEXED: core.SearchDocument[] = []
+const UNINDEXED: string[] = []
+
 function registerCoreStubs(k: Kernel) {
   k.broker.register('core', {
     'activity.record': { handler: async () => ({ ok: true }) },
     'notifications.create': { handler: async () => ({ ok: true }) },
-    'search.index': { handler: async () => ({ ok: true }) },
+    'search.index': {
+      handler: async (input: { documents: core.SearchDocument[] }) => {
+        INDEXED.push(...input.documents)
+        return { ok: true }
+      },
+    },
+    'search.remove': {
+      handler: async (input: { refs: Array<{ object: { id: string } }> }) => {
+        UNINDEXED.push(...input.refs.map((ref) => ref.object.id))
+        return { ok: true }
+      },
+    },
     'modules.isEnabled': { handler: async () => true },
     'users.principal': { handler: async (i: { userId: string }) => principal(i.userId, WS_A) },
     'authz.customRolePermissions': { handler: async () => [] },
@@ -3337,5 +3352,132 @@ describe('erasure, against a real database', () => {
     expect(row?.displayName).not.toContain('Ayşe')
     expect(row?.personalEmail).toBeNull()
     expect(row?.phone).toBeNull()
+  })
+})
+
+describe('the directory in the workspace-wide search index', () => {
+  /**
+   * What a search document says is exactly what `hr.person.view` returns to everybody: the name,
+   * the employee number, the work email. Never the personal email or the phone — `forViewer`
+   * withholds those from a reader without a personnel key, and a hit that matched on a phone number
+   * would republish what the card hides.
+   */
+  it('indexes a new person with the directory card and nothing the card hides', async () => {
+    INDEXED.length = 0
+    const person = await call(
+      hr.people.create,
+      {
+        workspaceId: WS_A,
+        displayName: 'Nilüfer Kaya',
+        employeeNo: 'EMP-SEARCH-1',
+        workEmail: 'nilufer@example.test',
+      },
+      { context: asUser(ALICE) },
+    )
+    const doc = INDEXED.find((d) => d.object.id === person.id)
+    expect(doc).toBeDefined()
+    expect(doc?.object).toEqual({ module: 'hr', type: 'person', id: person.id })
+    expect(doc?.title).toBe('Nilüfer Kaya')
+    expect(doc?.body).toContain('EMP-SEARCH-1')
+    expect(doc?.body).toContain('nilufer@example.test')
+    expect(doc?.url).toBe(`/hr?person=${person.id}`)
+    expect(doc?.acl).toBeNull()
+
+    // A rename lands in the index by the same route every other screen learns about it.
+    INDEXED.length = 0
+    await call(
+      hr.people.update,
+      { workspaceId: WS_A, personId: person.id, displayName: 'Nilüfer Kaya-Demir' },
+      { context: asUser(ALICE) },
+    )
+    expect(INDEXED.find((d) => d.object.id === person.id)?.title).toBe('Nilüfer Kaya-Demir')
+
+    // Offboarding takes the person out of the directory, and therefore out of the palette.
+    UNINDEXED.length = 0
+    await call(
+      hr.people.offboard,
+      { workspaceId: WS_A, personId: person.id, on: '2026-09-30' },
+      { context: asUser(ALICE) },
+    )
+    expect(UNINDEXED).toContain(person.id)
+  })
+
+  it('never puts the personal email or the phone into a document', async () => {
+    INDEXED.length = 0
+    const person = await call(
+      hr.people.create,
+      { workspaceId: WS_A, displayName: 'Search Privacy Check', workEmail: 'spc@example.test' },
+      { context: asUser(ALICE) },
+    )
+    INDEXED.length = 0
+    await call(
+      hr.people.update,
+      {
+        workspaceId: WS_A,
+        personId: person.id,
+        personalEmail: 'private@home.test',
+        phone: '+90 555 000 0000',
+      },
+      { context: asUser(ALICE) },
+    )
+    const doc = INDEXED.find((d) => d.object.id === person.id)
+    expect(doc).toBeDefined()
+    expect(JSON.stringify(doc)).not.toContain('private@home.test')
+    expect(JSON.stringify(doc)).not.toContain('555 000')
+  })
+})
+
+describe('a sensitive custom field, written by somebody who may not read it', () => {
+  /**
+   * `people.update` replaces `custom` whole, and `people.get` strips the sensitive keys from a
+   * reader without `hr.person.view_sensitive` — ALICE is an admin, and that permission is nobody's
+   * by default. So a form that sent back the map it was shown would erase the passport number on
+   * every save of a desk; the router carries the hidden keys over unless the patch names them.
+   */
+  it('keeps the value the writer was never shown, and clears it when the writer names it', async () => {
+    const key = `passport_${randomUUID().slice(0, 6)}`
+    await call(
+      hr.fields.create,
+      { workspaceId: WS_A, key, name: 'Passport', type: 'text', sensitive: true },
+      { context: asUser(ALICE) },
+    )
+    const person = await call(
+      hr.people.create,
+      { workspaceId: WS_A, displayName: 'Custom Fields Check' },
+      { context: asUser(ALICE) },
+    )
+    await call(
+      hr.people.update,
+      { workspaceId: WS_A, personId: person.id, custom: { [key]: 'U1234567', desk: 'A-1' } },
+      { context: asUser(ALICE) },
+    )
+
+    const shown = await call(
+      hr.people.get,
+      { workspaceId: WS_A, personId: person.id },
+      { context: asUser(ALICE) },
+    )
+    expect(shown.custom).toEqual({ desk: 'A-1' })
+
+    // What the panel does: the map it was shown, with one key changed.
+    await call(
+      hr.people.update,
+      { workspaceId: WS_A, personId: person.id, custom: { desk: 'B-2' } },
+      { context: asUser(ALICE) },
+    )
+    const stored = () =>
+      run(async (tx) => {
+        const [row] = await tx.select({ custom: people.custom }).from(people).where(eq(people.id, person.id))
+        return row?.custom
+      })
+    expect(await stored()).toEqual({ [key]: 'U1234567', desk: 'B-2' })
+
+    // Naming the key is a write, not a carry-over.
+    await call(
+      hr.people.update,
+      { workspaceId: WS_A, personId: person.id, custom: { desk: 'B-2', [key]: null } },
+      { context: asUser(ALICE) },
+    )
+    expect(await stored()).toEqual({ [key]: null, desk: 'B-2' })
   })
 })

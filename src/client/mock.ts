@@ -16,11 +16,23 @@
 import { ORPCError } from '@orpc/contract'
 import type { ApprovalChain, ApprovalChainSpec } from '../contract/approvals.js'
 import type { Punch, Regularization, Schedule, ScheduleAssignment } from '../contract/attendance.js'
+import {
+  PAYROLL_EXPORT_CONTRACT,
+  PAYROLL_HOURS_COLUMNS,
+  PAYROLL_LEAVE_COLUMNS,
+  type PayrollExport,
+  type PayrollExportManifest,
+  type PayrollExportPreview,
+  type PayrollExportRefusal,
+  type PayrollHoursRow,
+  type PayrollLeaveRow,
+} from '../contract/exports.js'
 import type { LeaveLedgerEntry, LeaveType } from '../contract/leave.js'
 import type {
   Calendar,
   CalendarDay,
   CalendarDayKind,
+  CustomFieldDef,
   Employment,
   LegalEntity,
   Office,
@@ -33,6 +45,29 @@ import type {
   WorkingWeek,
 } from '../contract/models.js'
 import type { Period, Policy, PolicyAssignment, PolicySubjectKind } from '../contract/policies.js'
+import type {
+  ErasureCaveat,
+  ErasureRedaction,
+  ErasureRetained,
+  RetentionClass,
+  SensitiveAccess,
+} from '../contract/privacy.js'
+import {
+  type AbsenceRow,
+  MAX_PERSON_DAYS,
+  MAX_REPORT_DAYS,
+  MAX_SLICED_REPORT_DAYS,
+  type ReportFinality,
+  type ReportSliceBy,
+} from '../contract/reports.js'
+import {
+  MAX_COVERAGE_DAYS,
+  MAX_ROSTER_DAYS,
+  type RosterAssignment,
+  type RosterDaySource,
+  type RosterPattern,
+  type RosterShift,
+} from '../contract/rosters.js'
 
 /**
  * A refusal the client cannot tell from the server's.
@@ -291,7 +326,76 @@ export function createMockHrApi() {
       timezone: 'Europe/Berlin',
       employeeNo: 'E-4',
     },
+    // Assigned to Amsterdam and employed by nobody yet: the state the payroll export refuses with
+    // `hr.payroll.no_employment`, which is unreachable in a demo where every person has a row.
+    {
+      id: id('d005'),
+      displayName: 'Leyla Demir',
+      hiredOn: day(-40),
+      workEmail: 'leyla@example.test',
+      status: 'active',
+      timezone: 'Europe/Amsterdam',
+      employeeNo: null,
+    },
   ]
+
+  // ---------------------------------------------------------------- custom fields
+
+  /**
+   * Three definitions, one of each thing the screens have to handle: a select with options, a
+   * plain text field in a second section, and a sensitive one — which the real server strips
+   * from `people.custom` for a reader without `hr.person.view_sensitive`, and which the panel
+   * therefore draws only inside the disclosed section.
+   */
+  const fieldDefs: Row<CustomFieldDef>[] = [
+    {
+      id: id('f001'),
+      key: 't_shirt_size',
+      name: 'T-shirt size',
+      type: 'select',
+      options: [
+        { value: 's', label: 'S' },
+        { value: 'm', label: 'M' },
+        { value: 'l', label: 'L' },
+        { value: 'xl', label: 'XL' },
+      ],
+      required: false,
+      sensitive: false,
+      section: 'profile',
+      order: 0,
+      archivedAt: null,
+    },
+    {
+      id: id('f002'),
+      key: 'desk',
+      name: 'Desk',
+      type: 'text',
+      options: null,
+      required: false,
+      sensitive: false,
+      section: 'employment',
+      order: 0,
+      archivedAt: null,
+    },
+    {
+      id: id('f003'),
+      key: 'passport_no',
+      name: 'Passport number',
+      type: 'text',
+      options: null,
+      required: false,
+      sensitive: true,
+      section: 'other',
+      order: 0,
+      archivedAt: null,
+    },
+  ]
+
+  /** `people.custom`, by person. Replaced whole on `people.update`, the way the server does it. */
+  const customValues: Record<string, Record<string, unknown>> = {
+    [people[0]!.id]: { t_shirt_size: 'm', desk: 'IST-3-14', passport_no: 'U12345678' },
+    [people[1]!.id]: { t_shirt_size: 's', desk: 'AMS-1-02' },
+  }
 
   /**
    * Who works where, with exactly one primary each.
@@ -351,6 +455,16 @@ export function createMockHrApi() {
       reason: null,
       createdAt: iso(80 * 86_400_000),
     },
+    {
+      id: id('a5006'),
+      personId: id('d005'),
+      officeId: id('e002'),
+      isPrimary: true,
+      effectiveFrom: day(-40),
+      effectiveTo: null,
+      reason: null,
+      createdAt: iso(40 * 86_400_000),
+    },
   ]
 
   const activeAssignments = (personId: string) =>
@@ -370,6 +484,12 @@ export function createMockHrApi() {
   const headcount = (officeId: string) =>
     assignments.filter((a) => a.officeId === officeId && a.effectiveTo === null && a.isPrimary).length
 
+  /**
+   * Who has been erased, and when. Kept beside the rows rather than on them: erasure is redaction,
+   * so the row survives with a token for a name, and the date is what tells a screen it is one.
+   */
+  const erasedPeople = new Map<string, string>()
+
   const person = (p: (typeof people)[number], workspaceId: string) => ({
     ...p,
     workspaceId,
@@ -378,7 +498,8 @@ export function createMockHrApi() {
     phone: null,
     photoFileId: null,
     terminatedOn: null,
-    custom: {},
+    custom: clone(customValues[p.id] ?? {}),
+    erasedAt: erasedPeople.get(p.id) ?? null,
     createdAt: iso(400 * 86_400_000),
     updatedAt: iso(),
   })
@@ -1147,6 +1268,19 @@ export function createMockHrApi() {
       lockedBy: null,
       note: null,
     },
+    // The Dutch entity's month, closed — so the payroll export has a locked period to refuse for
+    // the person above who has an office there and no employment record.
+    {
+      id: id('9e04'),
+      kind: 'payroll',
+      legalEntityId: id('1e02'),
+      startsOn: monthStart(-1),
+      endsOn: monthEnd(-1),
+      status: 'locked',
+      lockedAt: iso(4 * 86_400_000),
+      lockedBy: null,
+      note: null,
+    },
   ]
 
   /** Working days in a range — what lock and unlock report as the days they froze or released. */
@@ -1860,6 +1994,318 @@ export function createMockHrApi() {
     ledger.push(entry(other.id, SICK, 'grant', 10 * 480, `${YEAR}-01-01`, { reason: 'Annual entitlement' }))
   }
 
+  // ---------------------------------------------------------------- privacy
+
+  /** Every retention class, in the order the settings screen shows them — the server's list. */
+  const RETENTION_CLASSES: RetentionClass[] = [
+    'punchDetail',
+    'punches',
+    'attendanceDays',
+    'leave',
+    'personHistory',
+    'personDocuments',
+    'terminatedPeople',
+    'sensitiveAccessLog',
+  ]
+  /** Null everywhere: the shipped state. No number here is a default, on the server or in a demo. */
+  const retention: Record<RetentionClass, number | null> = {
+    punchDetail: null,
+    punches: null,
+    attendanceDays: null,
+    leave: null,
+    personHistory: null,
+    personDocuments: null,
+    terminatedPeople: null,
+    sensitiveAccessLog: null,
+  }
+  let retentionUpdatedAt: string | null = null
+  let retentionUpdatedBy: string | null = null
+
+  /**
+   * Two accounts that have read Ayşe's details: a colleague with an HR record of her own, and an
+   * administrator who has none — the row the panel has to render without a person to name.
+   */
+  const HR_ACCOUNT = id('ac0001')
+  const ADMIN_ACCOUNT = id('ac0002')
+  const ALL_SENSITIVE = ['nationalId', 'birthDate', 'iban', 'emergencyContact'] as const
+  const accessLog: Row<SensitiveAccess>[] = [
+    {
+      id: id('5a01'),
+      personId: people[0]!.id,
+      actorUserId: HR_ACCOUNT,
+      actorPersonId: people[1]!.id,
+      fields: [...ALL_SENSITIVE],
+      purpose: 'Payroll onboarding',
+      via: 'ui',
+      at: iso(30 * 86_400_000),
+    },
+    {
+      id: id('5a02'),
+      personId: people[0]!.id,
+      actorUserId: ADMIN_ACCOUNT,
+      actorPersonId: null,
+      fields: ['emergencyContact'],
+      purpose: null,
+      via: 'api',
+      at: iso(6 * 86_400_000),
+    },
+    {
+      id: id('5a03'),
+      personId: people[0]!.id,
+      actorUserId: HR_ACCOUNT,
+      actorPersonId: people[1]!.id,
+      fields: [...ALL_SENSITIVE],
+      purpose: 'Subject access request',
+      via: 'export',
+      at: iso(2 * 3600_000),
+    },
+  ]
+  let accessLogCounter = accessLog.length
+
+  /**
+   * Record a read, the way `PeopleService.readSensitive` does: one row per read, naming only the
+   * fields that actually came back with a value. An empty list is a fact too — the record was
+   * opened and there was nothing in it — so the row is written either way.
+   */
+  const logRead = (personId: string, via: SensitiveAccess['via'], purpose: string | null) => {
+    const row = sensitive.find((x) => x.personId === personId)
+    accessLog.push({
+      id: id(`5a${(++accessLogCounter).toString(16).padStart(2, '0')}`),
+      personId,
+      actorUserId: HR_ACCOUNT,
+      actorPersonId: people[1]!.id,
+      fields: ALL_SENSITIVE.filter((f) => row?.[f] != null),
+      purpose,
+      via,
+      at: iso(),
+    })
+  }
+
+  /** The pseudonym an erased person is shown under — `erasureDisplayName` on the server. */
+  const erasureToken = (p: (typeof people)[number]) => p.employeeNo?.trim() || `person-${p.id.slice(0, 8)}`
+
+  const beforeCutoff = (stamp: string, cutoff: string) => stamp.slice(0, 10) < cutoff
+
+  /** How many rows are already past a horizon — the dry run the settings screen shows. */
+  const pastHorizon = (cls: RetentionClass, cutoff: string): number => {
+    switch (cls) {
+      case 'punchDetail':
+        return punches.filter(
+          (p) => p.businessDate < cutoff && (p.geo !== null || p.deviceId !== null || p.note !== null),
+        ).length
+      case 'punches':
+        return punches.filter((p) => p.businessDate < cutoff).length
+      case 'attendanceDays':
+        return new Set(punches.filter((p) => p.businessDate < cutoff).map((p) => p.businessDate)).size
+      case 'leave':
+        return ledger.filter((e) => e.effectiveOn < cutoff).length
+      case 'personHistory':
+        return 0
+      case 'personDocuments':
+        return documents.filter((d) => beforeCutoff(d.createdAt, cutoff)).length
+      case 'terminatedPeople':
+        return people.filter((p) => p.status === 'terminated' && !erasedPeople.has(p.id)).length
+      case 'sensitiveAccessLog':
+        return accessLog.filter((a) => beforeCutoff(a.at, cutoff)).length
+    }
+  }
+
+  const retentionState = (workspaceId: string, withCounts: boolean) => ({
+    workspaceId,
+    classes: RETENTION_CLASSES.map((cls) => {
+      const days = retention[cls]
+      return { class: cls, days, dueNow: withCounts && days !== null ? pastHorizon(cls, day(-days)) : null }
+    }),
+    updatedAt: retentionUpdatedAt,
+    updatedBy: retentionUpdatedBy,
+    // False, and saying so is the point: nothing in HR deletes on these horizons yet.
+    sweepEnabled: false as const,
+  })
+
+  // ---------------------------------------------------------------- rosters
+
+  /**
+   * Three shifts, one 4-on-4-off rotation, two people on it out of phase, and one changed day.
+   *
+   * Ayşe and Sanne share the rotation with a `cycleOffset` four apart, which is the whole reason
+   * an offset exists: Sanne works exactly the days Ayşe is off, so the coverage grid has somebody
+   * on every day and an "off" row that is never empty. The override takes Ayşe off a day the
+   * rotation would have put her on Late, with a note, so the person view has one row of each
+   * source to draw and the grid has a day where the rotation and the roster disagree.
+   */
+  const SHIFT_EARLY = id('5e01')
+  const SHIFT_LATE = id('5e02')
+  const SHIFT_NIGHT = id('5e03')
+  const rosterShifts: Row<RosterShift>[] = [
+    {
+      id: SHIFT_EARLY,
+      name: 'Early',
+      code: 'E',
+      start: '06:00',
+      end: '14:00',
+      breakMinutes: 30,
+      graceInMinutes: 5,
+      graceOutMinutes: 5,
+      color: '#2563EB',
+      archivedAt: null,
+    },
+    {
+      id: SHIFT_LATE,
+      name: 'Late',
+      code: 'L',
+      start: '14:00',
+      end: '22:00',
+      breakMinutes: 30,
+      graceInMinutes: 5,
+      graceOutMinutes: 5,
+      color: '#D97706',
+      archivedAt: null,
+    },
+    {
+      id: SHIFT_NIGHT,
+      name: 'Night',
+      code: 'N',
+      start: '22:00',
+      end: '06:00',
+      breakMinutes: 45,
+      graceInMinutes: 15,
+      graceOutMinutes: 15,
+      color: '#7C3AED',
+      archivedAt: null,
+    },
+  ]
+
+  const PATTERN_4X4 = id('5f01')
+  const rosterPatterns: Row<RosterPattern>[] = [
+    {
+      id: PATTERN_4X4,
+      name: '4 on, 4 off',
+      anchorDate: day(-8),
+      days: [[SHIFT_EARLY], [SHIFT_EARLY], [SHIFT_LATE], [SHIFT_LATE], [], [], [], []],
+      archivedAt: null,
+    },
+  ]
+
+  const rosterAssignments: Row<RosterAssignment>[] = [
+    {
+      id: id('5a01'),
+      personId: id('d001'),
+      patternId: PATTERN_4X4,
+      effectiveFrom: day(-60),
+      effectiveTo: null,
+      cycleOffset: 0,
+      createdAt: iso(60 * 86_400_000),
+    },
+    {
+      id: id('5a02'),
+      personId: id('d002'),
+      patternId: PATTERN_4X4,
+      effectiveFrom: day(-60),
+      effectiveTo: null,
+      cycleOffset: 4,
+      createdAt: iso(60 * 86_400_000),
+    },
+  ]
+
+  type RosterOverride = { personId: string; businessDate: string; shiftIds: string[]; note: string | null }
+  const rosterOverrides: RosterOverride[] = [
+    { personId: id('d001'), businessDate: day(2), shiftIds: [], note: 'Swapped with Sanne — dentist' },
+  ]
+
+  /** Whole days between two dates, stepped in UTC like `eachDate`, so a DST hour cannot skip one. */
+  const rosterDaysBetween = (from: string, to: string) =>
+    Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86_400_000)
+
+  /**
+   * The rotation's arithmetic, as `services/rosters.ts` does it: `((raw % len) + len) % len`,
+   * because a date before the anchor gives a negative index and `days[-3]` reads as a rest day.
+   */
+  const cycleIndexFor = (pattern: Row<RosterPattern>, date: string, cycleOffset: number) => {
+    const len = pattern.days.length
+    if (len <= 0) return -1
+    const raw = rosterDaysBetween(pattern.anchorDate, date) + cycleOffset
+    return ((raw % len) + len) % len
+  }
+
+  const rosterAssignmentOn = (personId: string, date: string) => {
+    let best: Row<RosterAssignment> | null = null
+    for (const a of rosterAssignments) {
+      if (a.personId !== personId || a.effectiveFrom > date) continue
+      if (a.effectiveTo !== null && a.effectiveTo < date) continue
+      if (!best || a.effectiveFrom > best.effectiveFrom) best = a
+    }
+    return best
+  }
+
+  /** Override, then rotation, then nothing — an empty override wins over the rotation on purpose. */
+  const rosterPlanFor = (
+    personId: string,
+    date: string,
+  ): { shiftIds: string[]; source: RosterDaySource; note: string | null } => {
+    const override = rosterOverrides.find((o) => o.personId === personId && o.businessDate === date)
+    if (override) return { shiftIds: [...override.shiftIds], source: 'override', note: override.note }
+    const assignment = rosterAssignmentOn(personId, date)
+    const pattern = assignment ? rosterPatterns.find((p) => p.id === assignment.patternId) : undefined
+    if (!assignment || !pattern) return { shiftIds: [], source: 'none', note: null }
+    const index = cycleIndexFor(pattern, date, assignment.cycleOffset)
+    if (index < 0) return { shiftIds: [], source: 'none', note: null }
+    return { shiftIds: [...(pattern.days[index] ?? [])], source: 'pattern', note: null }
+  }
+
+  /** Archived shifts included: a rostered day that names one is retired, not empty. */
+  const rosterShiftRows = (shiftIds: readonly string[], workspaceId: string) =>
+    shiftIds.flatMap((shiftId) => {
+      const shift = rosterShifts.find((s) => s.id === shiftId)
+      return shift ? [{ ...shift, workspaceId }] : []
+    })
+
+  const rosterDayFor = (personId: string, date: string, workspaceId: string) => {
+    const plan = rosterPlanFor(personId, date)
+    return {
+      personId,
+      businessDate: date,
+      shifts: rosterShiftRows(plan.shiftIds, workspaceId),
+      source: plan.source,
+      note: plan.note,
+    }
+  }
+
+  /** The router's range refusals, in its order and its words. */
+  const MAX_COVERAGE_CELLS = 4200
+  const rosterRefusal = (input: { from: string; to: string; coverage: boolean; population?: number }) => {
+    if (input.to < input.from)
+      refuse('BAD_REQUEST', `The end date ${input.to} is before the start date ${input.from}.`)
+    const days = rosterDaysBetween(input.from, input.to) + 1
+    const max = input.coverage ? MAX_COVERAGE_DAYS : MAX_ROSTER_DAYS
+    if (days > max)
+      refuse(
+        'BAD_REQUEST',
+        input.coverage
+          ? `A coverage grid covers at most ${max} days, and this one asks for ${days}. Ask for a shorter range.`
+          : `A roster covers at most ${max} days, and this one asks for ${days}. Ask for a shorter range.`,
+      )
+    if (input.coverage && input.population !== undefined) {
+      const cells = input.population * days
+      if (cells > MAX_COVERAGE_CELLS)
+        refuse(
+          'BAD_REQUEST',
+          `${input.population} people over ${days} days is ${cells} person-days, and a coverage grid resolves at most ${MAX_COVERAGE_CELLS}. Ask for one office, or a shorter range.`,
+        )
+    }
+  }
+
+  const assertRosterShiftsExist = (shiftIds: readonly string[]) => {
+    const wanted = [...new Set(shiftIds)]
+    const missing = wanted.filter((shiftId) => !rosterShifts.some((s) => s.id === shiftId))
+    if (missing.length)
+      refuse(
+        'BAD_REQUEST',
+        missing.length === 1
+          ? `This roster names a shift this workspace does not have: ${missing[0]}.`
+          : `This roster names shifts this workspace does not have: ${missing.join(', ')}.`,
+      )
+  }
+
   return {
     people: {
       list: async ({
@@ -1905,6 +2351,7 @@ export function createMockHrApi() {
         hiredOn?: string | null
         officeId?: string | null
         employmentType?: string
+        custom?: Record<string, unknown>
       }) => {
         const added = {
           id: crypto.randomUUID(),
@@ -1916,6 +2363,7 @@ export function createMockHrApi() {
           employeeNo: input.employeeNo ?? `E-${people.length + 1}`,
         }
         people.push(added)
+        if (input.custom) customValues[added.id] = clone(input.custom)
         // A new person lands in the default office when nobody chose one, which is what the default
         // flag is for.
         assignments.push({
@@ -1937,10 +2385,14 @@ export function createMockHrApi() {
         workEmail?: string | null
         personalEmail?: string | null
         phone?: string | null
+        custom?: Record<string, unknown>
       }) => {
         const found = people.find((p) => p.id === input.personId) ?? people[0]!
         if (input.displayName) found.displayName = input.displayName
         if (input.workEmail !== undefined) found.workEmail = input.workEmail ?? ''
+        // Replaced, never merged — `people.update` sets the column to what it was sent, so a
+        // screen that sends only the keys it edited erases the rest. Same here, so it shows.
+        if (input.custom !== undefined) customValues[found.id] = clone(input.custom)
         return {
           ...person(found, input.workspaceId),
           personalEmail: input.personalEmail ?? null,
@@ -1956,6 +2408,9 @@ export function createMockHrApi() {
       sensitive: {
         get: async ({ workspaceId, personId }: { workspaceId: string; personId: string }) => {
           const row = sensitive.find((x) => x.personId === personId)
+          // Written with the read, as the server does: opening the section is a disclosure, and the
+          // subject's own access log has to show it without a reload.
+          logRead(personId, 'ui', null)
           return {
             workspaceId,
             personId,
@@ -1997,6 +2452,77 @@ export function createMockHrApi() {
         const found = people.find((p) => p.id === input.personId) ?? people[0]!
         found.status = 'terminated'
         return { ...person(found, input.workspaceId), terminatedOn: input.on }
+      },
+    },
+
+    fields: {
+      list: async ({
+        workspaceId,
+        includeArchived = false,
+      }: {
+        workspaceId: string
+        includeArchived?: boolean
+      }) =>
+        fieldDefs
+          .filter((f) => includeArchived || f.archivedAt === null)
+          .sort((a, b) => a.order - b.order || a.name.localeCompare(b.name))
+          .map((f) => ({ ...clone(f), workspaceId })),
+
+      create: async (input: {
+        workspaceId: string
+        key: string
+        name: string
+        type: CustomFieldDef['type']
+        options?: CustomFieldDef['options']
+        required?: boolean
+        sensitive?: boolean
+        section?: CustomFieldDef['section']
+      }) => {
+        // The unique index on (workspace, key), as the server would refuse it.
+        if (fieldDefs.some((f) => f.key === input.key))
+          refuse('CONFLICT', `A field with the key "${input.key}" already exists.`)
+        const created: Row<CustomFieldDef> = {
+          id: crypto.randomUUID(),
+          key: input.key,
+          name: input.name,
+          type: input.type,
+          options: input.options ? clone(input.options) : null,
+          required: input.required ?? false,
+          sensitive: input.sensitive ?? false,
+          section: input.section ?? 'profile',
+          order: 0,
+          archivedAt: null,
+        }
+        fieldDefs.push(created)
+        return { ...clone(created), workspaceId: input.workspaceId }
+      },
+
+      update: async (input: {
+        workspaceId: string
+        fieldId: string
+        name?: string
+        options?: CustomFieldDef['options']
+        required?: boolean
+        sensitive?: boolean
+        section?: CustomFieldDef['section']
+        order?: number
+      }) => {
+        const found = fieldDefs.find((f) => f.id === input.fieldId)
+        if (!found) refuse('NOT_FOUND', 'Field not found')
+        if (input.name !== undefined) found.name = input.name
+        if (input.options !== undefined) found.options = input.options ? clone(input.options) : null
+        if (input.required !== undefined) found.required = input.required
+        if (input.sensitive !== undefined) found.sensitive = input.sensitive
+        if (input.section !== undefined) found.section = input.section
+        if (input.order !== undefined) found.order = input.order
+        return { ...clone(found), workspaceId: input.workspaceId }
+      },
+
+      // Archived, never dropped: the values stay in `customValues`, as they stay in `people.custom`.
+      archive: async ({ fieldId }: { workspaceId: string; fieldId: string }) => {
+        const found = fieldDefs.find((f) => f.id === fieldId)
+        if (found) found.archivedAt = iso()
+        return { ok: true }
       },
     },
 
@@ -3476,6 +4002,641 @@ export function createMockHrApi() {
       },
     },
 
+    /**
+     * The four reports, over the same seeds the day sheet and the balance tile are drawn from.
+     *
+     * Derived, never stated: a report that named its own numbers would disagree with the month
+     * underneath it on the first click through to a person. The population is who sits in the
+     * slice today — the mock has no history of office moves to attribute day by day — and the
+     * refusals copy the router's sentences, because the screen checks the caps before asking and
+     * these are what it shows when it did not.
+     */
+    reports: {
+      attendance: async (input: MockReportInput) => {
+        const { slice, personIds, dates } = reportPopulation(input)
+        const rows = dayRows(input.workspaceId, personIds, dates)
+        const totals = {
+          days: sumOf(rows, (r) => r.days),
+          scheduledMinutes: sumOf(rows, (r) => r.scheduledMinutes),
+          workedMinutes: sumOf(rows, (r) => r.workedMinutes),
+          scheduledWorkedMinutes: sumOf(rows, (r) => r.scheduledWorkedMinutes),
+          breakMinutes: sumOf(rows, (r) => r.breakMinutes),
+          lateMinutes: 0,
+          earlyLeaveMinutes: 0,
+          noScheduleDays: 0,
+          unknownScheduleDays: 0,
+        }
+        const shown = [...rows].sort((a, b) => b.workedMinutes - a.workedMinutes).slice(0, input.limit ?? 100)
+        return {
+          header: mockReportHeader({
+            input,
+            slice,
+            population: personIds.length,
+            counted: rows.length,
+            shown: shown.length,
+            permissions: ['hr.report.view', 'hr.attendance.view_team'],
+          }),
+          finality: mergeMockFinality(rows.map((r) => r.finality)),
+          totals: {
+            ...totals,
+            workedRatio: mockRatio(totals.scheduledWorkedMinutes, totals.scheduledMinutes),
+          },
+          rows: shown.map((r) => ({
+            personId: r.personId,
+            displayName: nameOf(r.personId),
+            days: r.days,
+            scheduledMinutes: r.scheduledMinutes,
+            workedMinutes: r.workedMinutes,
+            scheduledWorkedMinutes: r.scheduledWorkedMinutes,
+            breakMinutes: r.breakMinutes,
+            lateMinutes: 0,
+            earlyLeaveMinutes: 0,
+            workedRatio: mockRatio(r.scheduledWorkedMinutes, r.scheduledMinutes),
+            noScheduleDays: 0,
+            unknownScheduleDays: 0,
+          })),
+        }
+      },
+
+      overtime: async (input: MockReportInput) => {
+        const { slice, personIds, dates } = reportPopulation(input)
+        const rows = dayRows(input.workspaceId, personIds, dates)
+        const shown = [...rows]
+          .sort((a, b) => b.overtimeMinutes - a.overtimeMinutes)
+          .slice(0, input.limit ?? 100)
+        return {
+          header: mockReportHeader({
+            input,
+            slice,
+            population: personIds.length,
+            counted: rows.length,
+            shown: shown.length,
+            permissions: ['hr.report.view', 'hr.attendance.view_team'],
+          }),
+          finality: mergeMockFinality(rows.map((r) => r.finality)),
+          totals: {
+            days: sumOf(rows, (r) => r.days),
+            overtimeMinutes: sumOf(rows, (r) => r.overtimeMinutes),
+            // Null, not zero: the demo workspace has no overtime policy with an annual ceiling, and
+            // "no ceiling applied" is a different fact from "one applied and nothing exceeded it".
+            beyondCapMinutes: null,
+            cappedDays: 0,
+            uncappedDays: sumOf(rows, (r) => r.days),
+          },
+          rows: shown.map((r) => ({
+            personId: r.personId,
+            displayName: nameOf(r.personId),
+            days: r.days,
+            overtimeMinutes: r.overtimeMinutes,
+            beyondCapMinutes: null,
+            cappedDays: 0,
+            uncappedDays: r.days,
+          })),
+        }
+      },
+
+      absence: async (input: MockReportInput) => {
+        // Always a per-day report, sliced or not: the server walks the calendar ladder per day
+        // whichever way it is asked, so the shorter cap applies whichever way it is asked.
+        const { slice, personIds, dates } = reportPopulation(input, true)
+        const rows: AbsenceRow[] = personIds.map((personId) => {
+          const empty = {
+            personId,
+            displayName: nameOf(personId),
+            expectedDays: null,
+            workedDays: null,
+            leaveDays: null,
+            absentDays: null,
+            absenceRate: null,
+          }
+          if (!hasScheduleIn(personId, input.from, input.to)) return { ...empty, basis: 'no_schedule' }
+          const office = offices.find((o) => o.id === primaryOfficeId(personId))
+          if (!office?.calendarId) return { ...empty, basis: 'no_calendar' }
+          // Weekdays only: the seeded calendars carry holidays, but the day sheet the worked count
+          // is read from does not know them either, and the two have to agree.
+          const sheets = dates
+            .filter((date) => !isWeekend(date))
+            .map((date) => attendanceDay(date, personId, input.workspaceId))
+          const expectedDays = sheets.length
+          const workedDays = sheets.filter((s) => s.workedMinutes > 0).length
+          const leaveDays = sheets.filter((s) => s.status === 'leave').length
+          const absentDays = Math.max(0, expectedDays - workedDays - leaveDays)
+          return {
+            ...empty,
+            basis: 'calendar',
+            expectedDays,
+            workedDays,
+            leaveDays,
+            absentDays,
+            absenceRate: mockRatio(absentDays, expectedDays),
+          }
+        })
+        const measured = rows.filter((r) => r.basis === 'calendar')
+        const expected = sumOf(measured, (r) => r.expectedDays ?? 0)
+        const worked = sumOf(measured, (r) => r.workedDays ?? 0)
+        const leave = sumOf(measured, (r) => r.leaveDays ?? 0)
+        const absent = Math.max(0, expected - worked - leave)
+        // Measured people first, then the two named buckets, so a row limit cannot hide them.
+        const shown = [...rows]
+          .sort(
+            (a, b) =>
+              (a.basis === 'calendar' ? 0 : 1) - (b.basis === 'calendar' ? 0 : 1) ||
+              (b.absentDays ?? -1) - (a.absentDays ?? -1),
+          )
+          .slice(0, input.limit ?? 100)
+        return {
+          header: mockReportHeader({
+            input,
+            slice,
+            population: personIds.length,
+            counted: measured.length,
+            shown: shown.length,
+            permissions: ['hr.report.view', 'hr.attendance.view_team'],
+            attribution: 'each_day',
+          }),
+          finality: mergeMockFinality(
+            measured.map((r) =>
+              finalityOf(
+                r.personId,
+                dates.filter((date) => !isWeekend(date)),
+              ),
+            ),
+          ),
+          leaveCounted: true,
+          totals: {
+            measured: measured.length,
+            expectedDays: expected,
+            workedDays: worked,
+            leaveDays: leave,
+            absentDays: absent,
+            absenceRate: mockRatio(absent, expected),
+          },
+          excluded: {
+            noSchedule: rows.filter((r) => r.basis === 'no_schedule').length,
+            noCalendar: rows.filter((r) => r.basis === 'no_calendar').length,
+          },
+          rows: shown,
+        }
+      },
+
+      leaveBalance: async (input: {
+        workspaceId: string
+        periodYear?: number
+        asOf?: string
+        by?: ReportSliceBy
+        sliceId?: string
+        limit?: number
+      }) => {
+        const asOf = input.asOf ?? day(0)
+        const periodYear = input.periodYear ?? Number(asOf.slice(0, 4))
+        const { slice, personIds } = reportPopulation({ ...input, from: asOf, to: asOf })
+        const types = leaveTypes.filter((lt) => lt.archivedAt === null)
+        // Summed from the ledger and the live requests, exactly as `leave.balance.get` above does
+        // for one person — so the tile and the report never disagree about the same number.
+        const all = personIds.flatMap((personId) =>
+          types.flatMap((lt) => {
+            const balanceMinutes = ledger
+              .filter(
+                (e) => e.personId === personId && e.leaveTypeId === lt.id && e.periodYear === periodYear,
+              )
+              .reduce((sum, e) => sum + e.amountMinutes, 0)
+            const mine = leaveRequests.filter((r) => r.personId === personId && r.leaveTypeId === lt.id)
+            const minutesOf = (status: string) =>
+              mine.filter((r) => r.status === status).reduce((sum, r) => sum + Number(r.minutes ?? 0), 0)
+            const bookedMinutes = minutesOf('approved')
+            const pendingMinutes = minutesOf('pending')
+            if (!balanceMinutes && !bookedMinutes && !pendingMinutes) return []
+            const perUnit = lt.unit === 'hour' ? 60 : 480
+            const availableMinutes = balanceMinutes - pendingMinutes
+            return [
+              {
+                personId,
+                displayName: nameOf(personId),
+                leaveTypeId: lt.id,
+                leaveTypeName: lt.name,
+                unit: lt.unit,
+                order: lt.order,
+                balanceMinutes,
+                bookedMinutes,
+                pendingMinutes,
+                availableMinutes,
+                balance: round2(balanceMinutes / perUnit),
+                available: round2(availableMinutes / perUnit),
+              },
+            ]
+          }),
+        )
+        const counted = [...new Set(all.map((r) => r.personId))].sort((a, b) =>
+          nameOf(a).localeCompare(nameOf(b)),
+        )
+        const keep = new Set(counted.slice(0, input.limit ?? 100))
+        const totals = new Map<
+          string,
+          {
+            people: number
+            balanceMinutes: number
+            bookedMinutes: number
+            pendingMinutes: number
+            availableMinutes: number
+          }
+        >()
+        for (const row of all) {
+          const found = totals.get(row.leaveTypeId) ?? {
+            people: 0,
+            balanceMinutes: 0,
+            bookedMinutes: 0,
+            pendingMinutes: 0,
+            availableMinutes: 0,
+          }
+          found.people += 1
+          found.balanceMinutes += row.balanceMinutes
+          found.bookedMinutes += row.bookedMinutes
+          found.pendingMinutes += row.pendingMinutes
+          found.availableMinutes += row.availableMinutes
+          totals.set(row.leaveTypeId, found)
+        }
+        return {
+          header: mockReportHeader({
+            input: { from: asOf, to: asOf, by: input.by },
+            slice,
+            population: personIds.length,
+            counted: counted.length,
+            shown: keep.size,
+            permissions: ['hr.report.view', 'hr.leave.view_team'],
+            attribution: 'as_of_date',
+            attributionOn: asOf,
+          }),
+          periodYear,
+          dayLengthMinutes: 480,
+          totals: types
+            .filter((lt) => totals.has(lt.id))
+            .map((lt) => ({
+              leaveTypeId: lt.id,
+              leaveTypeName: lt.name,
+              unit: lt.unit,
+              ...totals.get(lt.id)!,
+            })),
+          rows: all
+            .filter((r) => keep.has(r.personId))
+            .sort((a, b) => nameOf(a.personId).localeCompare(nameOf(b.personId)) || a.order - b.order)
+            .map(({ order: _order, ...row }) => row),
+        }
+      },
+    },
+
+    rosters: {
+      shifts: {
+        list: async ({
+          workspaceId,
+          includeArchived = false,
+        }: {
+          workspaceId: string
+          includeArchived?: boolean
+        }) =>
+          rosterShifts
+            .filter((s) => includeArchived || s.archivedAt === null)
+            .sort((a, b) => a.start.localeCompare(b.start) || a.name.localeCompare(b.name))
+            .map((s) => ({ ...s, workspaceId })),
+
+        create: async (input: {
+          workspaceId: string
+          name: string
+          code?: string | null
+          start: string
+          end: string
+          breakMinutes?: number
+          graceInMinutes?: number
+          graceOutMinutes?: number
+          color?: string | null
+        }) => {
+          const created: Row<RosterShift> = {
+            id: crypto.randomUUID(),
+            name: input.name,
+            code: input.code ?? null,
+            start: input.start,
+            end: input.end,
+            breakMinutes: input.breakMinutes ?? 0,
+            graceInMinutes: input.graceInMinutes ?? 0,
+            graceOutMinutes: input.graceOutMinutes ?? 0,
+            color: input.color ?? null,
+            archivedAt: null,
+          }
+          rosterShifts.push(created)
+          return { ...created, workspaceId: input.workspaceId }
+        },
+
+        update: async (input: {
+          workspaceId: string
+          shiftId: string
+          name?: string
+          code?: string | null
+          start?: string
+          end?: string
+          breakMinutes?: number
+          graceInMinutes?: number
+          graceOutMinutes?: number
+          color?: string | null
+        }) => {
+          const found = rosterShifts.find((s) => s.id === input.shiftId)
+          if (!found) refuse('NOT_FOUND', 'Shift not found')
+          if (input.name !== undefined) found.name = input.name
+          if (input.code !== undefined) found.code = input.code ?? null
+          if (input.start !== undefined) found.start = input.start
+          if (input.end !== undefined) found.end = input.end
+          if (input.breakMinutes !== undefined) found.breakMinutes = input.breakMinutes
+          if (input.graceInMinutes !== undefined) found.graceInMinutes = input.graceInMinutes
+          if (input.graceOutMinutes !== undefined) found.graceOutMinutes = input.graceOutMinutes
+          if (input.color !== undefined) found.color = input.color ?? null
+          return { ...found, workspaceId: input.workspaceId }
+        },
+
+        /** Archived, not deleted: rotations and changed days keep pointing at it. */
+        archive: async ({ shiftId }: { workspaceId: string; shiftId: string }) => {
+          const found = rosterShifts.find((s) => s.id === shiftId)
+          if (found) found.archivedAt = iso()
+          return { ok: true as const }
+        },
+      },
+
+      patterns: {
+        list: async ({
+          workspaceId,
+          includeArchived = false,
+        }: {
+          workspaceId: string
+          includeArchived?: boolean
+        }) =>
+          rosterPatterns
+            .filter((p) => includeArchived || p.archivedAt === null)
+            .sort((a, b) => a.name.localeCompare(b.name))
+            .map((p) => ({ ...p, days: clone(p.days), workspaceId })),
+
+        create: async (input: {
+          workspaceId: string
+          name: string
+          anchorDate: string
+          days: string[][]
+        }) => {
+          assertRosterShiftsExist(input.days.flat())
+          const created: Row<RosterPattern> = {
+            id: crypto.randomUUID(),
+            name: input.name,
+            anchorDate: input.anchorDate,
+            days: clone(input.days),
+            archivedAt: null,
+          }
+          rosterPatterns.push(created)
+          return { ...created, days: clone(created.days), workspaceId: input.workspaceId }
+        },
+
+        update: async (input: {
+          workspaceId: string
+          patternId: string
+          name?: string
+          anchorDate?: string
+          days?: string[][]
+        }) => {
+          if (input.days) assertRosterShiftsExist(input.days.flat())
+          const found = rosterPatterns.find((p) => p.id === input.patternId)
+          if (!found) refuse('NOT_FOUND', 'Rotation not found')
+          if (input.name !== undefined) found.name = input.name
+          if (input.anchorDate !== undefined) found.anchorDate = input.anchorDate
+          if (input.days !== undefined) found.days = clone(input.days)
+          return { ...found, days: clone(found.days), workspaceId: input.workspaceId }
+        },
+
+        /** Hidden from the pickers, still read by everybody already on it. */
+        archive: async ({ patternId }: { workspaceId: string; patternId: string }) => {
+          const found = rosterPatterns.find((p) => p.id === patternId)
+          if (found) found.archivedAt = iso()
+          return { ok: true as const }
+        },
+      },
+
+      assignments: async ({
+        workspaceId,
+        personId,
+        patternId,
+      }: {
+        workspaceId: string
+        personId?: string
+        patternId?: string
+      }) =>
+        rosterAssignments
+          .filter((a) => (!personId || a.personId === personId) && (!patternId || a.patternId === patternId))
+          .sort((a, b) => b.effectiveFrom.localeCompare(a.effectiveFrom) || a.id.localeCompare(b.id))
+          .map((a) => ({ ...a, workspaceId })),
+
+      /**
+       * The router's two refusals, in its order and its words: somebody not in the workspace, and
+       * somebody whose *later* assignment this one would have to trim backwards. An assignment
+       * already running on the start date is closed the day before, as the server does it.
+       */
+      assign: async (input: {
+        workspaceId: string
+        patternId: string
+        personIds: string[]
+        effectiveFrom: string
+        effectiveTo?: string | null
+        cycleOffset?: number
+      }) => {
+        const pattern = rosterPatterns.find((p) => p.id === input.patternId)
+        if (!pattern) refuse('NOT_FOUND', 'Rotation not found')
+        const personIds = [...new Set(input.personIds)]
+        if (personIds.some((personId) => !people.some((p) => p.id === personId)))
+          refuse('BAD_REQUEST', 'This list names somebody who is not in this workspace.')
+        const dayBefore = day(rosterDaysBetween(day(0), input.effectiveFrom) - 1)
+        for (const a of rosterAssignments) {
+          if (!personIds.includes(a.personId)) continue
+          if (
+            a.effectiveFrom <= dayBefore &&
+            (a.effectiveTo === null || a.effectiveTo >= input.effectiveFrom)
+          )
+            a.effectiveTo = dayBefore
+        }
+        const clash = rosterAssignments
+          .filter(
+            (a) =>
+              personIds.includes(a.personId) &&
+              a.effectiveFrom >= input.effectiveFrom &&
+              (!input.effectiveTo || a.effectiveFrom <= input.effectiveTo),
+          )
+          .sort((a, b) => a.effectiveFrom.localeCompare(b.effectiveFrom))[0]
+        if (clash) {
+          const who = people.find((p) => p.id === clash.personId)?.displayName ?? 'Somebody in this list'
+          refuse(
+            'BAD_REQUEST',
+            `${who} already starts a rotation on ${clash.effectiveFrom}. End that one first, or give this assignment an end date before it.`,
+          )
+        }
+        for (const personId of personIds) {
+          rosterAssignments.push({
+            id: crypto.randomUUID(),
+            personId,
+            patternId: input.patternId,
+            effectiveFrom: input.effectiveFrom,
+            effectiveTo: input.effectiveTo ?? null,
+            cycleOffset: input.cycleOffset ?? 0,
+            createdAt: iso(),
+          })
+        }
+        return rosterAssignments
+          .filter((a) => personIds.includes(a.personId))
+          .sort((a, b) => b.effectiveFrom.localeCompare(a.effectiveFrom) || a.id.localeCompare(b.id))
+          .map((a) => ({ ...a, workspaceId: input.workspaceId }))
+      },
+
+      /** Only assignments that have started by that date; one for next month is left alone. */
+      unassign: async ({
+        personIds,
+        effectiveTo,
+      }: {
+        workspaceId: string
+        personIds: string[]
+        effectiveTo: string
+      }) => {
+        let closed = 0
+        for (const a of rosterAssignments) {
+          if (!personIds.includes(a.personId) || a.effectiveTo !== null || a.effectiveFrom > effectiveTo)
+            continue
+          a.effectiveTo = effectiveTo
+          closed++
+        }
+        return { closed }
+      },
+
+      days: async ({
+        workspaceId,
+        personId,
+        from,
+        to,
+      }: {
+        workspaceId: string
+        personId?: string
+        from: string
+        to: string
+      }) => {
+        const who = personId ?? people[0]!.id
+        rosterRefusal({ from, to, coverage: false })
+        return eachDate(from, to).map((date) => rosterDayFor(who, date, workspaceId))
+      },
+
+      /** One override per person-day: a second edit of the same Tuesday replaces the first. */
+      set: async (input: {
+        workspaceId: string
+        personId: string
+        businessDate: string
+        shiftIds: string[]
+        note?: string | null
+      }) => {
+        if (!people.some((p) => p.id === input.personId)) refuse('NOT_FOUND', 'Employee not found')
+        assertRosterShiftsExist(input.shiftIds)
+        const existing = rosterOverrides.find(
+          (o) => o.personId === input.personId && o.businessDate === input.businessDate,
+        )
+        if (existing) {
+          existing.shiftIds = [...input.shiftIds]
+          existing.note = input.note ?? null
+        } else {
+          rosterOverrides.push({
+            personId: input.personId,
+            businessDate: input.businessDate,
+            shiftIds: [...input.shiftIds],
+            note: input.note ?? null,
+          })
+        }
+        return rosterDayFor(input.personId, input.businessDate, input.workspaceId)
+      },
+
+      clear: async ({
+        personId,
+        businessDate,
+      }: {
+        workspaceId: string
+        personId: string
+        businessDate: string
+      }) => {
+        const at = rosterOverrides.findIndex(
+          (o) => o.personId === personId && o.businessDate === businessDate,
+        )
+        if (at >= 0) rosterOverrides.splice(at, 1)
+        return { ok: true as const }
+      },
+
+      /**
+       * Who is on which shift, per day. The population is whoever a rotation covers in the range,
+       * narrowed to one office through the office assignments when asked — the same two queries
+       * the router runs, and the same rule that `none` belongs in neither column.
+       */
+      coverage: async ({
+        workspaceId,
+        from,
+        to,
+        officeId,
+      }: {
+        workspaceId: string
+        from: string
+        to: string
+        officeId?: string
+      }) => {
+        rosterRefusal({ from, to, coverage: true })
+        let personIds = [
+          ...new Set(
+            rosterAssignments
+              .filter((a) => a.effectiveFrom <= to && (a.effectiveTo === null || a.effectiveTo >= from))
+              .map((a) => a.personId),
+          ),
+        ]
+        if (officeId) {
+          const here = new Set(
+            assignments
+              .filter((a) => a.officeId === officeId && a.effectiveTo === null)
+              .map((a) => a.personId),
+          )
+          personIds = personIds.filter((personId) => here.has(personId))
+        }
+        const dates = eachDate(from, to)
+        if (!personIds.length) return dates.map((businessDate) => ({ businessDate, slots: [], off: [] }))
+        rosterRefusal({ from, to, coverage: true, population: personIds.length })
+        void workspaceId
+        const named = (personId: string) => ({
+          personId,
+          displayName: people.find((p) => p.id === personId)?.displayName ?? '',
+        })
+        return dates.map((businessDate) => {
+          // `Row<RosterShift>` plus a plain tenant: the brand is dropped here as everywhere else.
+          const slots = new Map<
+            string,
+            { shift: Row<RosterShift> & { workspaceId: string }; people: string[] }
+          >()
+          const off: string[] = []
+          for (const personId of personIds) {
+            const plan = rosterPlanFor(personId, businessDate)
+            if (plan.source === 'none') continue
+            if (!plan.shiftIds.length) {
+              off.push(personId)
+              continue
+            }
+            for (const shift of rosterShiftRows(plan.shiftIds, workspaceId)) {
+              const slot = slots.get(shift.id) ?? { shift, people: [] }
+              slot.people.push(personId)
+              slots.set(shift.id, slot)
+            }
+          }
+          return {
+            businessDate,
+            slots: [...slots.values()]
+              .sort(
+                (a, b) =>
+                  a.shift.start.localeCompare(b.shift.start) || a.shift.name.localeCompare(b.shift.name),
+              )
+              .map((slot) => ({ shift: slot.shift, people: slot.people.map(named) })),
+            off: off.map(named),
+          }
+        })
+      },
+    },
+
     policies: {
       list: async ({
         workspaceId,
@@ -3670,6 +4831,133 @@ export function createMockHrApi() {
           skipped: preview.skipped.length + preview.rows.filter((r) => r.alreadyAccrued).length,
           totalMinutes,
         }
+      },
+    },
+
+    payroll: {
+      export: {
+        /**
+         * The same rows the server would hand back, with every refusal returned rather than thrown.
+         *
+         * Built from the seeds above the way `PayrollExportService.collect` builds them from the
+         * tables: the population is everybody the ladder puts in the entity on some day of the
+         * period, the hours are the day sheets summed, the leave is approved days grouped by type.
+         */
+        preview: async (input: {
+          workspaceId: string
+          legalEntityId: string
+          periodId: string
+          draft?: boolean
+        }): Promise<PayrollExportPreview> => {
+          const data = collectPayroll(
+            input.workspaceId,
+            input.legalEntityId,
+            input.periodId,
+            input.draft ?? false,
+          )
+          return {
+            manifest: data.manifest,
+            refusals: data.refusals,
+            exportable: data.refusals.length === 0,
+            totals: data.totals,
+            hours: data.hours,
+            leave: data.leave,
+          }
+        },
+
+        /** Throws the first refusal with its code, exactly as the router does, or writes the three files. */
+        v1: async (input: {
+          workspaceId: string
+          legalEntityId: string
+          periodId: string
+          draft?: boolean
+        }): Promise<PayrollExport> => {
+          const data = collectPayroll(
+            input.workspaceId,
+            input.legalEntityId,
+            input.periodId,
+            input.draft ?? false,
+          )
+          const [first] = data.refusals
+          if (first) refuse('CONFLICT', first.message, first.code)
+          const header = [
+            PAYROLL_EXPORT_CONTRACT,
+            data.manifest.legalEntityId,
+            data.manifest.legalEntityName,
+            data.manifest.periodStart,
+            data.manifest.periodEnd,
+          ]
+          const dec = (n: number) => (Math.round(n * 100) / 100 || 0).toFixed(2)
+          const int = (n: number) => String(Math.round(n))
+          const bool = (b: boolean) => (b ? 'true' : 'false')
+          const hoursRows = data.hours.map((r) => [
+            ...header,
+            r.personId,
+            r.employeeNo,
+            r.displayName,
+            r.employmentType,
+            dec(r.fte),
+            r.contractHoursWeek === null ? null : dec(r.contractHoursWeek),
+            r.costCenterCode,
+            r.positionTitle,
+            r.hiredOn,
+            r.terminatedOn,
+            bool(r.employmentChangedInPeriod),
+            int(r.daySheets),
+            int(r.scheduledMinutes),
+            int(r.workedMinutes),
+            int(r.scheduledWorkedMinutes),
+            int(r.breakMinutes),
+            int(r.overtimeMinutes),
+            int(r.lateMinutes),
+            int(r.earlyLeaveMinutes),
+            // Empty, never `0`: the field the whole format exists to get right.
+            r.beyondCapMinutes === null ? null : int(r.beyondCapMinutes),
+            int(r.cappedDays),
+            int(r.uncappedDays),
+            int(r.lockedDays),
+            int(r.openDays),
+            dec(r.paidLeaveDays),
+            dec(r.unpaidLeaveDays),
+          ])
+          const leaveRows = data.leave.map((r) => [
+            ...header,
+            r.personId,
+            r.employeeNo,
+            r.leaveTypeKey,
+            r.leaveTypeName,
+            bool(r.paid),
+            r.unit,
+            dec(r.days),
+            int(r.requests),
+          ])
+          const [hoursFile, leaveFile] = data.manifest.files
+          return {
+            manifest: data.manifest,
+            files: [
+              {
+                name: hoursFile?.name ?? '',
+                contentType: 'text/csv; charset=utf-8',
+                content: csvDocument(PAYROLL_HOURS_COLUMNS, hoursRows),
+              },
+              {
+                name: leaveFile?.name ?? '',
+                contentType: 'text/csv; charset=utf-8',
+                content: csvDocument(PAYROLL_LEAVE_COLUMNS, leaveRows),
+              },
+              {
+                name: payrollFilename(
+                  data.manifest.legalEntityName,
+                  data.manifest,
+                  'manifest',
+                  data.manifest.draft,
+                ),
+                contentType: 'application/json; charset=utf-8',
+                content: `${JSON.stringify(data.manifest, null, 2)}\n`,
+              },
+            ],
+          }
+        },
       },
     },
 
@@ -3949,6 +5237,427 @@ export function createMockHrApi() {
         return { ok: true }
       },
     },
+
+    /**
+     * Subject access, erasure and retention, on the same positions the server takes: nothing is
+     * deleted, an erasure clears columns and reports what stayed, a preview and a run are one
+     * predicate, and an export is a logged read of the sensitive record.
+     */
+    privacy: {
+      retention: {
+        get: async ({ workspaceId, withCounts = false }: { workspaceId: string; withCounts?: boolean }) =>
+          retentionState(workspaceId, withCounts),
+        set: async ({
+          workspaceId,
+          retention: patch,
+        }: {
+          workspaceId: string
+          retention: Partial<Record<RetentionClass, number | null>>
+        }) => {
+          // A field left out is unchanged; a field sent as null goes back to "keep indefinitely".
+          for (const [key, value] of Object.entries(patch)) retention[key as RetentionClass] = value ?? null
+          retentionUpdatedAt = iso()
+          retentionUpdatedBy = HR_ACCOUNT
+          return retentionState(workspaceId, false)
+        },
+      },
+
+      accessLog: {
+        list: async ({
+          workspaceId,
+          personId,
+          actorUserId,
+          cursor,
+          limit = 50,
+        }: {
+          workspaceId: string
+          personId?: string
+          actorUserId?: string
+          cursor?: string
+          limit?: number
+        }) => {
+          // The caller's own record when none is named — `people.me` is Ayşe here, as everywhere.
+          const subject = actorUserId ? personId : (personId ?? people[0]!.id)
+          const rows = accessLog
+            .filter((a) => (subject ? a.personId === subject : true))
+            .filter((a) => (actorUserId ? a.actorUserId === actorUserId : true))
+            .sort((a, b) => b.at.localeCompare(a.at) || b.id.localeCompare(a.id))
+          const start = cursor ? Number(cursor) : 0
+          const items = rows.slice(start, start + limit).map((r) => ({ ...r, workspaceId }))
+          return { items, nextCursor: start + limit < rows.length ? String(start + limit) : null }
+        },
+      },
+
+      subjectAccess: async ({
+        workspaceId,
+        personId,
+        purpose,
+      }: {
+        workspaceId: string
+        personId: string
+        purpose?: string | null
+      }) => {
+        const found = people.find((p) => p.id === personId)
+        if (!found) refuse('NOT_FOUND', 'Person not found')
+        // The decrypt is a bulk read of the sensitive record, and it is logged before the bundle
+        // leaves — the subject sees this row in their own log.
+        logRead(personId, 'export', purpose ?? null)
+        const sens = sensitive.find((x) => x.personId === personId)
+        const mine = <T extends { personId: string }>(rows: T[]) =>
+          rows.filter((r) => r.personId === personId).map((r) => ({ ...r, workspaceId }))
+        const ofPerson = (rows: Array<Record<string, unknown>>, key: string) =>
+          rows.filter((r) => r[key] === personId).map((r) => ({ ...r, workspaceId }))
+        // Oldest first, so the running balance in the bundle reads down the ledger.
+        const myLedger = mine(ledger).sort((a, b) => a.effectiveOn.localeCompare(b.effectiveOn))
+        const myPunches = mine(punches).sort((a, b) => b.at.localeCompare(a.at))
+        const dates = [...new Set(myPunches.map((p) => p.businessDate))].sort().reverse()
+        return {
+          manifest: {
+            workspaceId,
+            personId,
+            generatedAt: iso(),
+            generatedBy: HR_ACCOUNT,
+            moduleVersion: 'mock',
+            truncated: [],
+            excluded: [{ section: 'documents.contents', reason: 'fileContentsNotExportable' as const }],
+          },
+          person: person(found, workspaceId),
+          sensitive: {
+            workspaceId,
+            personId,
+            nationalId: sens?.nationalId ?? null,
+            birthDate: sens?.birthDate ?? null,
+            iban: sens?.iban ?? null,
+            emergencyContact: sens?.emergencyContact ?? null,
+          },
+          employment: mine(employments),
+          offices: mine(assignments),
+          history: [],
+          documents: mine(documents),
+          leave: {
+            types: leaveTypes.map((lt) => ({ ...lt, workspaceId })),
+            requests: ofPerson(leaveRequests, 'personId'),
+            days: [],
+            ledger: myLedger,
+            closingBalanceMinutes: myLedger.reduce((sum, e) => sum + e.amountMinutes, 0),
+          },
+          attendance: { punches: myPunches, days: dates.map((d) => attendanceDay(d, personId, workspaceId)) },
+          regularizations: mine(regularizations),
+          approvals: {
+            raised: approvalRequests
+              .filter((r) => r.requesterPersonId === personId)
+              .map((r) => ({ ...r, workspaceId })),
+            approverOn: [],
+            decisions: [],
+          },
+          delegations: {
+            given: ofPerson(delegations, 'fromPersonId'),
+            received: ofPerson(delegations, 'toPersonId'),
+          },
+          policiesInForce: [],
+          accessLog: accessLog
+            .filter((a) => a.personId === personId)
+            .sort((a, b) => b.at.localeCompare(a.at))
+            .map((a) => ({ ...a, workspaceId })),
+        }
+      },
+
+      /**
+       * Redact one person, or say what redacting them would do.
+       *
+       * `dryRun` defaults to true here as in the contract. Every step matches only rows that still
+       * have something to clear, so a second run reports zero everywhere and keeps the first
+       * erasure's date — the two properties the settings screen's preview and confirmation rest on.
+       */
+      erase: async (input: {
+        workspaceId: string
+        personId: string
+        dryRun?: boolean
+        reason?: string | null
+        keepNationalIdForAudit?: boolean
+      }) => {
+        const found = people.find((p) => p.id === input.personId)
+        if (!found) refuse('NOT_FOUND', 'Person not found')
+        const dryRun = input.dryRun ?? true
+        const keepId = input.keepNationalIdForAudit ?? false
+        const token = erasureToken(found)
+        const already = erasedPeople.get(found.id) ?? null
+        const sens = sensitive.find((x) => x.personId === found.id)
+        const sensitiveDirty =
+          sens !== undefined &&
+          (sens.birthDate !== null ||
+            sens.iban !== null ||
+            sens.emergencyContact !== null ||
+            (!keepId && sens.nationalId !== null))
+        const dirtyPunches = punches.filter(
+          (p) =>
+            p.personId === found.id &&
+            (p.geo !== null || p.deviceId !== null || p.note !== null || p.clientReportedAt !== null),
+        )
+        const myRequests = leaveRequests.filter(
+          (r) => r.personId === found.id && (r.reason != null || r.documentFileId != null),
+        )
+        const myLedger = ledger.filter((e) => e.personId === found.id && e.reason !== null)
+        const myEmployments = employments.filter((e) => e.personId === found.id && e.reason !== null)
+        const myAssignments = assignments.filter((a) => a.personId === found.id && a.reason !== null)
+        const myRegs = regularizations.filter((r) => r.personId === found.id && r.reason !== '')
+        const myDelegations = delegations.filter(
+          (d) => (d.fromPersonId === found.id || d.toPersonId === found.id) && d.reason != null,
+        )
+        const myApprovals = approvalRequests.filter(
+          (r) => r.requesterPersonId === found.id && (r.summary !== '' || r.summaryParams !== null),
+        )
+        const unitHeadships = orgUnits.filter((u) => u.headPersonId === found.id)
+        const officeHeadships = offices.filter((o) => o.headPersonId === found.id)
+
+        const steps: Array<ErasureRedaction & { apply: () => void }> = [
+          {
+            class: 'identity',
+            table: 'people',
+            rows: already ? 0 : 1,
+            columns: [
+              'userId',
+              'displayName',
+              'workEmail',
+              'personalEmail',
+              'phone',
+              'photoFileId',
+              'timezone',
+              'custom',
+            ],
+            apply: () => {
+              found.displayName = token
+              found.workEmail = ''
+              customValues[found.id] = {}
+              erasedPeople.set(found.id, iso())
+            },
+          },
+          {
+            class: 'sensitive',
+            table: 'people_sensitive',
+            rows: sensitiveDirty ? 1 : 0,
+            columns: keepId
+              ? ['birthDate', 'iban', 'emergencyContact']
+              : ['nationalId', 'birthDate', 'iban', 'emergencyContact'],
+            apply: () => {
+              if (!sens) return
+              if (!keepId) sens.nationalId = null
+              sens.birthDate = null
+              sens.iban = null
+              sens.emergencyContact = null
+            },
+          },
+          {
+            class: 'headship',
+            table: 'offices',
+            rows: officeHeadships.length,
+            columns: ['headPersonId'],
+            apply: () => {
+              for (const o of officeHeadships) o.headPersonId = null
+            },
+          },
+          {
+            class: 'headship',
+            table: 'org_units',
+            rows: unitHeadships.length,
+            columns: ['headPersonId'],
+            apply: () => {
+              for (const u of unitHeadships) u.headPersonId = null
+            },
+          },
+          // The mock keeps no person history, so there is nothing to clear and nothing to keep.
+          { class: 'history', table: 'person_history', rows: 0, columns: ['from', 'to'], apply: () => {} },
+          {
+            class: 'punches',
+            table: 'punches',
+            rows: dirtyPunches.length,
+            columns: ['geo', 'deviceId', 'note', 'clientReportedAt'],
+            apply: () => {
+              for (const p of dirtyPunches) {
+                p.geo = null
+                p.deviceId = null
+                p.note = null
+                p.clientReportedAt = null
+              }
+            },
+          },
+          {
+            class: 'leaveRequests',
+            table: 'leave_requests',
+            rows: myRequests.length,
+            columns: ['reason', 'documentFileId'],
+            apply: () => {
+              for (const r of myRequests) {
+                r.reason = null
+                r.documentFileId = null
+              }
+            },
+          },
+          {
+            class: 'leaveLedger',
+            table: 'leave_ledger',
+            rows: myLedger.length,
+            columns: ['reason'],
+            apply: () => {
+              for (const e of myLedger) e.reason = null
+            },
+          },
+          {
+            class: 'employment',
+            table: 'employments',
+            rows: myEmployments.length,
+            columns: ['reason'],
+            apply: () => {
+              for (const e of myEmployments) e.reason = null
+            },
+          },
+          {
+            class: 'officeAssignments',
+            table: 'office_assignments',
+            rows: myAssignments.length,
+            columns: ['reason'],
+            apply: () => {
+              for (const a of myAssignments) a.reason = null
+            },
+          },
+          {
+            class: 'regularizations',
+            table: 'regularizations',
+            rows: myRegs.length,
+            columns: ['reason'],
+            apply: () => {
+              for (const r of myRegs) r.reason = ''
+            },
+          },
+          {
+            class: 'delegations',
+            table: 'delegations',
+            rows: myDelegations.length,
+            columns: ['reason'],
+            apply: () => {
+              for (const d of myDelegations) d.reason = null
+            },
+          },
+          {
+            class: 'approvals',
+            table: 'approval_requests',
+            rows: myApprovals.length,
+            columns: ['summary', 'summaryParams', 'chain'],
+            apply: () => {
+              for (const r of myApprovals) {
+                r.summary = ''
+                r.summaryParams = null
+                r.requesterName = token
+              }
+            },
+          },
+          {
+            class: 'approvalDecisions',
+            table: 'approval_decisions',
+            rows: 0,
+            columns: ['comment'],
+            apply: () => {},
+          },
+        ]
+        const redacted: ErasureRedaction[] = steps.map(({ apply, ...step }) => {
+          if (step.rows > 0 && !dryRun) apply()
+          return step
+        })
+
+        const basis = (days: number | null, fallback: ErasureRetained['basis']): ErasureRetained['basis'] =>
+          days === null ? fallback : 'retentionHorizon'
+        const countOf = (rows: ReadonlyArray<{ personId: string }>) =>
+          rows.filter((r) => r.personId === found.id).length
+        const kept: ErasureRetained[] = [
+          {
+            class: 'employment',
+            table: 'employments',
+            rows: countOf(employments),
+            basis: 'payRecord',
+            retentionDays: null,
+          },
+          {
+            class: 'officeAssignments',
+            table: 'office_assignments',
+            rows: countOf(assignments),
+            basis: 'payRecord',
+            retentionDays: null,
+          },
+          {
+            class: 'leaveLedger',
+            table: 'leave_ledger',
+            rows: countOf(ledger),
+            basis: basis(retention.leave, 'payRecord'),
+            retentionDays: retention.leave,
+          },
+          {
+            class: 'leaveRequests',
+            table: 'leave_requests',
+            rows: leaveRequests.filter((r) => r.personId === found.id).length,
+            basis: basis(retention.leave, 'payRecord'),
+            retentionDays: retention.leave,
+          },
+          {
+            class: 'attendance',
+            table: 'attendance_days',
+            rows: new Set(punches.filter((p) => p.personId === found.id).map((p) => p.businessDate)).size,
+            basis: basis(retention.attendanceDays, 'payRecord'),
+            retentionDays: retention.attendanceDays,
+          },
+          {
+            class: 'punches',
+            table: 'punches',
+            rows: countOf(punches),
+            basis: basis(retention.punches, 'payRecord'),
+            retentionDays: retention.punches,
+          },
+          {
+            class: 'history',
+            table: 'person_history',
+            rows: 0,
+            basis: basis(retention.personHistory, 'auditTrail'),
+            retentionDays: retention.personHistory,
+          },
+          {
+            class: 'history',
+            table: 'person_history',
+            rows: 0,
+            basis: 'anotherPersonsRecord',
+            retentionDays: null,
+          },
+          {
+            class: 'documents',
+            table: 'person_documents',
+            rows: countOf(documents),
+            basis: 'notRemovable',
+            retentionDays: retention.personDocuments,
+          },
+          {
+            class: 'approvals',
+            table: 'approval_requests',
+            rows: approvalRequests.filter((r) => r.requesterPersonId === found.id).length,
+            basis: 'auditTrail',
+            retentionDays: null,
+          },
+        ]
+        const caveats: ErasureCaveat[] = []
+        if (keepId) caveats.push('nationalIdKeptForAudit')
+        if (kept.some((k) => k.class === 'documents' && k.rows > 0)) caveats.push('documentFilesRemain')
+
+        return {
+          workspaceId: input.workspaceId,
+          personId: found.id,
+          dryRun,
+          // A replay keeps the first erasure's date rather than restamping it.
+          erasedAt: already ?? (dryRun ? null : (erasedPeople.get(found.id) ?? null)),
+          displayName: token,
+          redacted,
+          kept,
+          caveats,
+          filesRemaining: [],
+        }
+      },
+    },
   }
 
   /** Kept, not just returned: expanding today's row after clocking in has to show the punch. */
@@ -4009,5 +5718,539 @@ export function createMockHrApi() {
       locked: false,
       computedAt: iso(),
     }
+  }
+
+  // ---------------------------------------------------------------- payroll export
+
+  /**
+   * Which entity a person belonged to on a date: their employment's, else their primary office's.
+   *
+   * The same ladder `ReportsService.population` walks per date, and the half that matters here is
+   * the fallback — somebody with an office and no employment row is in the entity's file through
+   * their desk, which is exactly the person the export refuses to pay.
+   */
+  function entityOn(personId: string, date: string): string | null {
+    const employment = employments.find(
+      (e) =>
+        e.personId === personId &&
+        e.effectiveFrom <= date &&
+        (e.effectiveTo === null || e.effectiveTo >= date),
+    )
+    if (employment?.legalEntityId) return employment.legalEntityId
+    const primary = assignments.find(
+      (a) =>
+        a.personId === personId &&
+        a.isPrimary &&
+        a.effectiveFrom <= date &&
+        (a.effectiveTo === null || a.effectiveTo >= date),
+    )
+    return primary ? (offices.find((o) => o.id === primary.officeId)?.legalEntityId ?? null) : null
+  }
+
+  /** RFC 4180: a comma, a quote, a line break or edge whitespace gets the field quoted. Null is empty. */
+  function csvField(value: string | null): string {
+    if (value === null) return ''
+    return /[",\r\n]|^\s|\s$/.test(value) ? `"${value.replace(/"/g, '""')}"` : value
+  }
+
+  /** BOM, the column names, then the rows, CRLF — the frozen v1 encoding. */
+  function csvDocument(
+    columns: readonly string[],
+    rows: ReadonlyArray<ReadonlyArray<string | null>>,
+  ): string {
+    const line = (fields: ReadonlyArray<string | null>) => `${fields.map(csvField).join(',')}\r\n`
+    return `﻿${line(columns)}${rows.map(line).join('')}`
+  }
+
+  /** `kern-payroll-v1_kern-teknoloji-a-s_2026-06_DRAFT_hours.csv`, spelled the way the server spells it. */
+  function payrollFilename(
+    entityName: string,
+    period: { periodStart: string; periodEnd: string },
+    file: 'hours' | 'leave' | 'manifest',
+    draft: boolean,
+  ): string {
+    const slug =
+      entityName
+        .replace(/[ıİ]/g, 'i')
+        .normalize('NFD')
+        .replace(/\p{M}/gu, '')
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '') || 'entity'
+    const [year, month, first] = period.periodStart.split('-')
+    const lastOfMonth = new Date(Date.UTC(Number(year), Number(month), 0)).getUTCDate()
+    const wholeMonth =
+      first === '01' && period.periodEnd === `${year}-${month}-${String(lastOfMonth).padStart(2, '0')}`
+    const label = wholeMonth ? `${year}-${month}` : `${period.periodStart}_${period.periodEnd}`
+    const extension = file === 'manifest' ? 'json' : 'csv'
+    return `${PAYROLL_EXPORT_CONTRACT}_${slug}_${label}_${draft ? 'DRAFT_' : ''}${file}.${extension}`
+  }
+
+  /**
+   * One entity, one period, every row — and every reason it should not be written.
+   *
+   * The refusals are returned, never thrown: the preview shows all of them at once, and `v1` throws
+   * the first. Every sentence is copied from `services/exports.ts`, because the screen renders the
+   * server's words where it has no translation of its own.
+   */
+  function collectPayroll(workspaceId: string, legalEntityId: string, periodId: string, draft: boolean) {
+    const entity = entities.find((e) => e.id === legalEntityId)
+    if (!entity) refuse('NOT_FOUND', 'Legal entity not found')
+    const period = periods.find((p) => p.id === periodId)
+    if (!period) refuse('NOT_FOUND', 'Period not found')
+    if (period.kind !== 'payroll')
+      refuse(
+        'BAD_REQUEST',
+        'That period is an attendance period, not a payroll one. A payroll export takes a payroll period.',
+      )
+    if (period.legalEntityId && period.legalEntityId !== entity.id)
+      refuse(
+        'BAD_REQUEST',
+        `That period belongs to another legal entity. Lock and export ${entity.name}'s own period.`,
+      )
+
+    const dates = eachDate(period.startsOn, period.endsOn)
+    const today = day(0)
+    const locked = period.status === 'locked'
+
+    const datesByPerson = new Map<string, string[]>()
+    for (const p of people) {
+      const mine = dates.filter((date) => entityOn(p.id, date) === entity.id)
+      if (mine.length) datesByPerson.set(p.id, mine)
+    }
+
+    const withoutEmployment: Array<{ personId: string; displayName: string }> = []
+    const hours: PayrollHoursRow[] = []
+    const leave: PayrollLeaveRow[] = []
+    let lockedDays = 0
+    let openDays = 0
+    let firstOpenDay: string | null = null
+    let lastLockedDay: string | null = null
+    let counted = 0
+
+    for (const [personId, mine] of datesByPerson) {
+      const person = people.find((p) => p.id === personId)
+      if (!person) continue
+      const windowFrom = mine[0] ?? period.startsOn
+      const windowTo = mine[mine.length - 1] ?? period.endsOn
+      const overlapping = employments
+        .filter(
+          (e) =>
+            e.personId === personId &&
+            e.effectiveFrom <= period.endsOn &&
+            (e.effectiveTo === null || e.effectiveTo >= period.startsOn),
+        )
+        .sort((a, b) => a.effectiveFrom.localeCompare(b.effectiveFrom))
+      const here = overlapping.filter(
+        (e) =>
+          e.effectiveFrom <= windowTo &&
+          (e.effectiveTo === null || e.effectiveTo >= windowFrom) &&
+          (e.legalEntityId === null || e.legalEntityId === entity.id),
+      )
+      const last = here[here.length - 1]
+      if (!last) withoutEmployment.push({ personId, displayName: person.displayName })
+
+      // Day sheets exist up to today, which is what `attendance.days.list` answers too. A locked
+      // period's sheets count as locked here because the seeded sheet never consults the periods.
+      const sheets = mine
+        .filter((date) => date <= today)
+        .map((date) => attendanceDay(date, personId, workspaceId))
+      const sum = (of: (row: (typeof sheets)[number]) => number) =>
+        sheets.reduce((total, row) => total + of(row), 0)
+      if (locked) {
+        lockedDays += sheets.length
+        const lastSheet = sheets[sheets.length - 1]
+        if (lastSheet && (lastLockedDay === null || lastSheet.businessDate > lastLockedDay))
+          lastLockedDay = lastSheet.businessDate
+      } else {
+        openDays += sheets.length
+        const firstSheet = sheets[0]
+        if (firstSheet && (firstOpenDay === null || firstSheet.businessDate < firstOpenDay))
+          firstOpenDay = firstSheet.businessDate
+      }
+
+      // Approved leave on the days this person was in the entity, one row per type.
+      const byType = new Map<string, { days: number; requests: Set<string> }>()
+      for (const request of leaveRequests) {
+        if (request.personId !== personId || request.status !== 'approved') continue
+        const taken = eachDate(String(request.startsOn), String(request.endsOn)).filter((date) => {
+          const weekday = WEEKDAYS[new Date(`${date}T00:00:00Z`).getUTCDay()]
+          return mine.includes(date) && weekday !== 'sat' && weekday !== 'sun'
+        })
+        if (!taken.length) continue
+        const typeId = String(request.leaveTypeId)
+        const group = byType.get(typeId) ?? { days: 0, requests: new Set<string>() }
+        group.days += taken.length
+        group.requests.add(String(request.id))
+        byType.set(typeId, group)
+      }
+      let paidLeaveDays = 0
+      let unpaidLeaveDays = 0
+      for (const [typeId, group] of byType) {
+        const type = leaveTypes.find((lt) => lt.id === typeId)
+        if (!type) continue
+        if (type.paid) paidLeaveDays += group.days
+        else unpaidLeaveDays += group.days
+        leave.push({
+          personId,
+          employeeNo: person.employeeNo,
+          leaveTypeKey: type.key,
+          leaveTypeName: type.name,
+          paid: type.paid,
+          unit: type.unit,
+          days: group.days,
+          requests: group.requests.size,
+        })
+      }
+
+      if (sheets.length || byType.size) counted += 1
+
+      const position = last ? positions.find((p) => p.id === last.positionId) : undefined
+      hours.push({
+        personId,
+        employeeNo: person.employeeNo,
+        displayName: person.displayName,
+        employmentType: last?.employmentType ?? '',
+        fte: last?.fte ?? 0,
+        contractHoursWeek: last?.contractHoursWeek ?? null,
+        costCenterCode: null,
+        positionTitle: position?.title ?? null,
+        hiredOn: person.hiredOn,
+        terminatedOn: null,
+        employmentChangedInPeriod: overlapping.length > 1,
+        daySheets: sheets.length,
+        scheduledMinutes: sum((r) => r.scheduledMinutes),
+        workedMinutes: sum((r) => r.workedMinutes),
+        scheduledWorkedMinutes: sum((r) => (r.scheduledMinutes > 0 ? r.workedMinutes : 0)),
+        breakMinutes: sum((r) => r.breakMinutes),
+        overtimeMinutes: sum((r) => r.overtimeMinutes),
+        lateMinutes: sum((r) => r.lateMinutes),
+        earlyLeaveMinutes: sum((r) => r.earlyLeaveMinutes),
+        // Null, never zero: the demo workspace has no ceiling, and "none applied" is not "0 over".
+        beyondCapMinutes: null,
+        cappedDays: 0,
+        uncappedDays: sheets.length,
+        lockedDays: locked ? sheets.length : 0,
+        openDays: locked ? 0 : sheets.length,
+        paidLeaveDays,
+        unpaidLeaveDays,
+      })
+    }
+
+    // Employee numbers first in code-unit order, then names — the server's frozen row order.
+    const order = (a: { employeeNo: string | null; displayName: string }, b: typeof a) => {
+      if ((a.employeeNo === null) !== (b.employeeNo === null)) return a.employeeNo === null ? 1 : -1
+      if (a.employeeNo !== null && b.employeeNo !== null && a.employeeNo !== b.employeeNo)
+        return a.employeeNo < b.employeeNo ? -1 : 1
+      return a.displayName < b.displayName ? -1 : a.displayName > b.displayName ? 1 : 0
+    }
+    hours.sort(order)
+    const nameOf = (personId: string) => people.find((p) => p.id === personId)?.displayName ?? ''
+    leave.sort((a, b) => {
+      const person = order(
+        { employeeNo: a.employeeNo, displayName: nameOf(a.personId) },
+        { employeeNo: b.employeeNo, displayName: nameOf(b.personId) },
+      )
+      return person !== 0 ? person : a.leaveTypeKey.localeCompare(b.leaveTypeKey)
+    })
+
+    const total = (of: (row: PayrollHoursRow) => number) => hours.reduce((sum, row) => sum + of(row), 0)
+    const caps = hours.map((r) => r.beyondCapMinutes).filter((v): v is number => v !== null)
+
+    const refusals: PayrollExportRefusal[] = []
+    if (period.status === 'open' && !draft)
+      refusals.push({
+        code: 'hr.period.not_locked',
+        message: `${period.startsOn} to ${period.endsOn} is still open for ${entity.name}. Lock the period before exporting, or export a draft.`,
+        personIds: [],
+      })
+    if (datesByPerson.size === 0)
+      refusals.push({
+        code: 'hr.payroll.empty',
+        message: `${entity.name} employed nobody between ${period.startsOn} and ${period.endsOn}. There is nothing to export.`,
+        personIds: [],
+      })
+    if (withoutEmployment.length) {
+      const one = withoutEmployment.length === 1
+      const shown = withoutEmployment.slice(0, 5).map((p) => p.displayName)
+      const rest = withoutEmployment.length - shown.length
+      const names = rest > 0 ? `${shown.join(', ')} and ${rest} more` : shown.join(', ')
+      refusals.push({
+        code: 'hr.payroll.no_employment',
+        message:
+          (one
+            ? `${withoutEmployment[0]?.displayName} has no employment record covering their days `
+            : `${withoutEmployment.length} people have no employment record covering their days `) +
+          `in ${entity.name} over this period, so there is no basis to pay ` +
+          (one ? 'them on. ' : `them on: ${names}. `) +
+          'Add an employment record, or move them to the entity that employs them.',
+        personIds: withoutEmployment.map((p) => p.personId),
+      })
+    }
+
+    const range = { periodStart: period.startsOn, periodEnd: period.endsOn }
+    const manifest: PayrollExportManifest = {
+      contract: PAYROLL_EXPORT_CONTRACT,
+      generatedAt: iso(),
+      kernVersion: 'mock',
+      finality: draft ? 'draft' : 'final',
+      draft,
+      legalEntityId: entity.id,
+      legalEntityName: entity.name,
+      country: entity.country,
+      currency: entity.currency ?? null,
+      periodId: period.id,
+      periodStart: period.startsOn,
+      periodEnd: period.endsOn,
+      periodStatus: period.status,
+      population: datesByPerson.size,
+      counted,
+      scope: {
+        permissions: ['hr.payroll.export', 'hr.attendance.view_team', 'hr.leave.view_team'],
+        askedAt: 'workspace',
+      },
+      attendance: { lockedDays, openDays, final: openDays === 0, firstOpenDay, lastLockedDay },
+      dayLengthMinutes: 480,
+      format: {
+        encoding: 'utf-8',
+        byteOrderMark: true,
+        delimiter: ',',
+        lineEnding: 'crlf',
+        quoting: 'rfc4180',
+        decimalSeparator: '.',
+        decimalPlaces: 2,
+        dateFormat: 'iso-8601',
+      },
+      files: [
+        {
+          name: payrollFilename(entity.name, range, 'hours', draft),
+          columns: [...PAYROLL_HOURS_COLUMNS],
+          rows: hours.length,
+        },
+        {
+          name: payrollFilename(entity.name, range, 'leave', draft),
+          columns: [...PAYROLL_LEAVE_COLUMNS],
+          rows: leave.length,
+        },
+      ],
+    }
+
+    return {
+      manifest,
+      refusals,
+      hours,
+      leave,
+      totals: {
+        people: hours.length,
+        daySheets: total((r) => r.daySheets),
+        scheduledMinutes: total((r) => r.scheduledMinutes),
+        workedMinutes: total((r) => r.workedMinutes),
+        scheduledWorkedMinutes: total((r) => r.scheduledWorkedMinutes),
+        breakMinutes: total((r) => r.breakMinutes),
+        overtimeMinutes: total((r) => r.overtimeMinutes),
+        lateMinutes: total((r) => r.lateMinutes),
+        earlyLeaveMinutes: total((r) => r.earlyLeaveMinutes),
+        beyondCapMinutes: caps.length ? caps.reduce((sum, v) => sum + v, 0) : null,
+        cappedDays: total((r) => r.cappedDays),
+        uncappedDays: total((r) => r.uncappedDays),
+        lockedDays: total((r) => r.lockedDays),
+        openDays: total((r) => r.openDays),
+        paidLeaveDays: total((r) => r.paidLeaveDays),
+        unpaidLeaveDays: total((r) => r.unpaidLeaveDays),
+      },
+    }
+  }
+
+  // ---------------------------------------------------------------- reports
+
+  type MockReportInput = {
+    workspaceId: string
+    from: string
+    to: string
+    by?: ReportSliceBy
+    sliceId?: string
+    limit?: number
+  }
+
+  function sumOf<T>(rows: readonly T[], pick: (row: T) => number): number {
+    return rows.reduce((acc, row) => acc + pick(row), 0)
+  }
+  function round2(n: number): number {
+    return Math.round(n * 100) / 100
+  }
+  /** Null when there is nothing to divide by — a screen draws that as an em dash, never as 0%. */
+  function mockRatio(numerator: number, denominator: number): number | null {
+    return denominator > 0 ? round2(numerator / denominator) : null
+  }
+  function nameOf(personId: string): string {
+    return people.find((p) => p.id === personId)?.displayName ?? ''
+  }
+  function entityOf(personId: string): string | null {
+    return offices.find((o) => o.id === primaryOfficeId(personId))?.legalEntityId ?? null
+  }
+  function isWeekend(date: string): boolean {
+    const weekday = WEEKDAYS[new Date(`${date}T00:00:00Z`).getUTCDay()]!
+    return weekday === 'sat' || weekday === 'sun'
+  }
+  function hasScheduleIn(personId: string, from: string, to: string): boolean {
+    return scheduleAssignments.some(
+      (a) =>
+        a.personId === personId && a.effectiveFrom <= to && (a.effectiveTo === null || a.effectiveTo >= from),
+    )
+  }
+
+  /**
+   * Who a report is about, refusing what the router refuses and in its words.
+   *
+   * The range refusals are the server's own sentences — `rangeRefusal` in `services/reports.ts` —
+   * so the error state a screen draws against the mock is the one it draws against core.
+   */
+  function reportPopulation(
+    input: MockReportInput,
+    perDay = false,
+  ): {
+    slice: { by: ReportSliceBy; id: string | null; name: string | null }
+    personIds: string[]
+    dates: string[]
+  } {
+    const by = input.by ?? 'workspace'
+    if (by !== 'workspace' && !input.sliceId)
+      refuse('BAD_REQUEST', 'A report sliced by an office or a legal entity needs the id of one.')
+    const days = input.to < input.from ? 0 : eachDate(input.from, input.to).length
+    if (days === 0) refuse('BAD_REQUEST', `The end date ${input.to} is before the start date ${input.from}.`)
+    const sliced = perDay || by !== 'workspace'
+    const max = sliced ? MAX_SLICED_REPORT_DAYS : MAX_REPORT_DAYS
+    if (days > max) {
+      refuse(
+        'BAD_REQUEST',
+        sliced
+          ? `A report attributed day by day covers at most ${max} days, and this one asks for ${days}. Ask for a shorter range, or drop the slice.`
+          : `A report covers at most ${max} days, and this one asks for ${days}.`,
+      )
+    }
+
+    const slice = { by, id: by === 'workspace' ? null : (input.sliceId ?? null), name: null as string | null }
+    let personIds = people.map((p) => p.id)
+    if (by === 'office') {
+      personIds = personIds.filter((personId) => primaryOfficeId(personId) === slice.id)
+      slice.name = officeName(slice.id)
+    } else if (by === 'legal_entity') {
+      personIds = personIds.filter((personId) => entityOf(personId) === slice.id)
+      slice.name = entities.find((e) => e.id === slice.id)?.name ?? null
+    }
+    if (sliced && personIds.length * days > MAX_PERSON_DAYS) {
+      refuse(
+        'BAD_REQUEST',
+        `${personIds.length} people over ${days} days is ${personIds.length * days} person-days, and this report resolves at most ${MAX_PERSON_DAYS}. Ask for one office, or a shorter range.`,
+      )
+    }
+    // A day sheet exists only for a day that has happened.
+    const dates = eachDate(input.from, input.to).filter((date) => date <= day(0))
+    return { slice, personIds, dates }
+  }
+
+  function mockReportHeader(args: {
+    input: { from: string; to: string; by?: ReportSliceBy }
+    slice: { by: ReportSliceBy; id: string | null; name: string | null }
+    population: number
+    counted: number
+    shown: number
+    permissions: string[]
+    attribution?: 'each_day' | 'as_of_date' | 'not_applicable'
+    attributionOn?: string
+  }) {
+    const by = args.input.by ?? 'workspace'
+    return {
+      from: args.input.from,
+      to: args.input.to,
+      slice: args.slice,
+      scope: { permissions: args.permissions, askedAt: 'workspace' as const },
+      population: args.population,
+      counted: args.counted,
+      attribution:
+        args.attribution ?? (by === 'workspace' ? ('not_applicable' as const) : ('each_day' as const)),
+      attributionOn: args.attributionOn ?? null,
+      truncated: args.shown < args.counted,
+    }
+  }
+
+  /**
+   * Which of a person's days a locked period has frozen.
+   *
+   * Read off the seeded periods rather than the sheet's `locked` flag, which the mock never sets:
+   * last month is locked for the Turkish entity and open for the Dutch one, so a range that
+   * straddles the month boundary shows the mixed-finality line the contract exists to force.
+   */
+  function finalityOf(personId: string, dates: string[]): Omit<ReportFinality, 'final'> {
+    const entity = entityOf(personId)
+    const isLocked = (date: string) =>
+      periods.some(
+        (p) =>
+          p.status === 'locked' &&
+          p.startsOn <= date &&
+          date <= p.endsOn &&
+          (p.legalEntityId === null || p.legalEntityId === entity),
+      )
+    const out: Omit<ReportFinality, 'final'> = {
+      lockedDays: 0,
+      openDays: 0,
+      firstOpenDay: null,
+      lastLockedDay: null,
+    }
+    for (const date of dates) {
+      if (isLocked(date)) {
+        out.lockedDays++
+        if (out.lastLockedDay === null || date > out.lastLockedDay) out.lastLockedDay = date
+      } else {
+        out.openDays++
+        if (out.firstOpenDay === null || date < out.firstOpenDay) out.firstOpenDay = date
+      }
+    }
+    return out
+  }
+
+  /** The server's `mergeFinality`: final only when something was locked and nothing is open. */
+  function mergeMockFinality(parts: ReadonlyArray<Omit<ReportFinality, 'final'>>): ReportFinality {
+    const merged: ReportFinality = {
+      lockedDays: 0,
+      openDays: 0,
+      final: false,
+      firstOpenDay: null,
+      lastLockedDay: null,
+    }
+    for (const part of parts) {
+      merged.lockedDays += part.lockedDays
+      merged.openDays += part.openDays
+      if (part.firstOpenDay && (merged.firstOpenDay === null || part.firstOpenDay < merged.firstOpenDay))
+        merged.firstOpenDay = part.firstOpenDay
+      if (part.lastLockedDay && (merged.lastLockedDay === null || part.lastLockedDay > merged.lastLockedDay))
+        merged.lastLockedDay = part.lastLockedDay
+    }
+    merged.final = merged.lockedDays > 0 && merged.openDays === 0
+    return merged
+  }
+
+  /**
+   * One row per person who has a day sheet in the range — which in this mock is everybody with a
+   * schedule assignment, because the day sheet is built from the schedule. Somebody without one has
+   * no sheet, so they are in the population and not in the count.
+   */
+  function dayRows(workspaceId: string, personIds: string[], dates: string[]) {
+    return personIds
+      .filter((personId) => dates.length > 0 && hasScheduleIn(personId, dates[0]!, dates[dates.length - 1]!))
+      .map((personId) => {
+        const sheets = dates.map((date) => attendanceDay(date, personId, workspaceId))
+        const workedMinutes = sumOf(sheets, (s) => s.workedMinutes)
+        return {
+          personId,
+          days: sheets.length,
+          scheduledMinutes: sumOf(sheets, (s) => s.scheduledMinutes),
+          workedMinutes,
+          scheduledWorkedMinutes: workedMinutes,
+          breakMinutes: sumOf(sheets, (s) => s.breakMinutes),
+          overtimeMinutes: sumOf(sheets, (s) => s.overtimeMinutes),
+          finality: finalityOf(personId, dates),
+        }
+      })
   }
 }

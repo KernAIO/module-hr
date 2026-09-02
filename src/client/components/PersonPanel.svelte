@@ -9,6 +9,7 @@ import {
   formatDate,
   Icon,
   Input,
+  messageLocale,
   navigation,
   RightPanel,
   Skeleton,
@@ -17,8 +18,20 @@ import {
 import { createMutation, createQuery, useQueryClient } from '@tanstack/svelte-query'
 import { getHrApi } from '../api-instance.js'
 import { t } from '../i18n.js'
+import type { CustomFieldDef } from '../index.js'
 import { canHr } from '../permissions.js'
 import { hrKeys, isoDate } from '../query.js'
+import CustomFieldsForm from './CustomFieldsForm.svelte'
+import {
+  bySection,
+  type CustomValues,
+  FIELD_SECTIONS,
+  formatValue,
+  mergeCustom,
+  missingRequired,
+  sameCustom,
+} from './custom-fields.js'
+import PersonAccessLogSection from './PersonAccessLogSection.svelte'
 import PersonDocumentsSection from './PersonDocumentsSection.svelte'
 import PersonJobSection from './PersonJobSection.svelte'
 import PersonSensitiveSection from './PersonSensitiveSection.svelte'
@@ -86,6 +99,49 @@ const managerQuery = createQuery(() => ({
   queryFn: () => api.people.get({ workspaceId, personId: managerId! }),
 }))
 
+/**
+ * The workspace's own fields, live ones only.
+ *
+ * Split by `sensitive` here and handed to two different places: the plain ones are drawn below
+ * the identity list and edited with the name and contact details; the sensitive ones go to the
+ * section `hr.person.view_sensitive` gates, and are edited there. The server has already dropped
+ * a sensitive value this reader may not see from `person.custom`, so nothing here decides who
+ * sees what — only where it sits.
+ */
+const fieldsQuery = createQuery(() => ({
+  queryKey: hrKeys.fields(workspaceId),
+  enabled: Boolean(workspaceId),
+  queryFn: () => api.fields.list({ workspaceId }),
+}))
+const plainFields = $derived((fieldsQuery.data ?? []).filter((def) => !def.sensitive))
+const sensitiveFields = $derived((fieldsQuery.data ?? []).filter((def) => def.sensitive))
+
+const sectionLabel = (section: CustomFieldDef['section']): string =>
+  section === 'profile'
+    ? t('field_section_profile')
+    : section === 'employment'
+      ? t('field_section_employment')
+      : t('field_section_other')
+
+/** Each section with at least one value to show, as label and sentence pairs. */
+const customRows = $derived.by(() => {
+  if (!person) return []
+  const grouped = bySection(plainFields)
+  const ctx = {
+    locale: messageLocale(),
+    yes: t('field_yes'),
+    no: t('field_no'),
+    date: (iso: string) => formatDate(`${iso}T00:00:00`),
+  }
+  return FIELD_SECTIONS.flatMap((section) => {
+    const rows = grouped[section].flatMap((def) => {
+      const text = formatValue(def, person.custom[def.key], ctx)
+      return text === null ? [] : [{ def, text }]
+    })
+    return rows.length ? [{ section, rows }] : []
+  })
+})
+
 const close = () =>
   void navigation.go(`/${workspaceSlug}/hr`, { replaceState: true, keepFocus: true, noScroll: true })
 
@@ -94,6 +150,7 @@ let displayName = $state('')
 let workEmail = $state('')
 let personalEmail = $state('')
 let phone = $state('')
+let custom = $state<CustomValues>({})
 
 $effect(() => {
   if (editing && person) {
@@ -101,8 +158,11 @@ $effect(() => {
     workEmail = person.workEmail ?? ''
     personalEmail = person.personalEmail ?? ''
     phone = person.phone ?? ''
+    custom = Object.fromEntries(plainFields.map((def) => [def.key, person.custom[def.key]]))
   }
 })
+
+const missing = $derived(editing ? missingRequired(plainFields, custom) : [])
 
 /**
  * `saving` and `ending` rather than `isPending`: the disabled attribute only reaches the button on
@@ -113,15 +173,22 @@ let saving = $state(false)
 let ending = $state(false)
 
 const save = createMutation(() => ({
-  mutationFn: () =>
-    api.people.update({
+  mutationFn: () => {
+    // `people.update` replaces the whole map, so what goes up is the record's map with the edited
+    // keys over it — never the edited keys alone, which would erase every field this form does
+    // not show. Left out entirely when nothing changed: a map that matches is a history row
+    // saying nothing happened. Snapshot, not the `$state` proxy, which the API layer cannot clone.
+    const merged = mergeCustom(person?.custom ?? {}, $state.snapshot(custom))
+    return api.people.update({
       workspaceId,
       personId,
       displayName: displayName.trim(),
       workEmail: workEmail.trim() || null,
       personalEmail: personalEmail.trim() || null,
       phone: phone.trim() || null,
-    }),
+      custom: sameCustom(merged, person?.custom ?? {}) ? undefined : merged,
+    })
+  },
   onSuccess: () => {
     toast.success(t('person_updated'))
     void queryClient.invalidateQueries({ queryKey: ['hr'] })
@@ -134,7 +201,7 @@ const save = createMutation(() => ({
 }))
 
 const submitSave = () => {
-  if (saving) return
+  if (saving || missing.length) return
   saving = true
   save.mutate()
 }
@@ -300,6 +367,29 @@ const hiddenHere = $derived(withheld && (!person?.phone || !person?.hiredOn))
       <p class="hint">{t('person_hidden_hint')}</p>
     {/if}
 
+    <!--
+      The workspace's own fields, by section, and only the ones with something in them: a row
+      reading "T-shirt size: —" on every person is a form, not a profile. Sensitive ones are not
+      here — they sit inside the section below that `hr.person.view_sensitive` gates.
+    -->
+    {#each customRows as group (group.section)}
+      <div class="custom">
+        <h3 class="csec">{sectionLabel(group.section)}</h3>
+        <dl>
+          {#each group.rows as row (row.def.id)}
+            <dt>{row.def.name}</dt>
+            {#if row.def.type === 'url'}
+              <dd class="ltr">
+                <a href={row.text} target="_blank" rel="noopener noreferrer">{row.text}</a>
+              </dd>
+            {:else}
+              <dd>{row.text}</dd>
+            {/if}
+          {/each}
+        </dl>
+      </div>
+    {/each}
+
     <Badge tone={person.status === 'active' ? 'active' : person.status === 'on_leave' ? 'upcoming' : 'grey'}
       >{person.status === 'active'
         ? t('status_active')
@@ -313,7 +403,14 @@ const hiddenHere = $derived(withheld && (!person?.phone || !person?.hiredOn))
     >
 
     <PersonJobSection {personId} {workspaceId} personName={person.displayName} />
-    <PersonSensitiveSection {personId} {workspaceId} personName={person.displayName} />
+    <PersonSensitiveSection
+      {personId}
+      {workspaceId}
+      personName={person.displayName}
+      custom={person.custom}
+      fields={sensitiveFields}
+    />
+    <PersonAccessLogSection {personId} {workspaceId} userId={person.userId} personName={person.displayName} />
     <PersonDocumentsSection {personId} {workspaceId} personName={person.displayName} />
     </div>
   {:else if personQuery.isError}
@@ -368,12 +465,18 @@ const hiddenHere = $derived(withheld && (!person?.phone || !person?.hiredOn))
         <Input {id} type="tel" bind:value={phone} autocomplete="tel" />
       {/snippet}
     </Field>
+    {#if plainFields.length}
+      <CustomFieldsForm defs={plainFields} bind:values={custom} idPrefix="hr-edit" />
+    {/if}
   </div>
   {#snippet footer()}
+    {#if missing.length}
+      <span class="note">{t('field_required_missing', { name: missing[0]!.name })}</span>
+    {/if}
     <Button variant="ghost" onclick={() => (editing = false)}>{t('common.cancel')}</Button>
     <Button
       onclick={submitSave}
-      disabled={displayName.trim().length === 0 || saving}
+      disabled={displayName.trim().length === 0 || saving || missing.length > 0}
       loading={save.isPending}>{t('common.save')}</Button
     >
   {/snippet}
@@ -456,6 +559,34 @@ dd {
   font-size: 12px;
   line-height: 1.45;
   color: var(--kern-ink-500);
+}
+.custom {
+  margin-block-end: 16px;
+}
+.csec {
+  margin: 0 0 8px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--kern-ink-500);
+}
+.custom dl {
+  margin: 0;
+}
+.custom dd {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+/* An address reads left to right whatever the interface direction. */
+.ltr {
+  direction: ltr;
+  unicode-bidi: isolate;
+}
+.ltr a {
+  color: var(--kern-accent-text);
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 .actions {
   display: flex;

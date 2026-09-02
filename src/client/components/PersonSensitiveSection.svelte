@@ -7,6 +7,7 @@ import {
   formatDate,
   Icon,
   Input,
+  messageLocale,
   SectionLabel,
   Skeleton,
   toast,
@@ -14,7 +15,10 @@ import {
 import { createMutation, createQuery, useQueryClient } from '@tanstack/svelte-query'
 import { getHrApi } from '../api-instance.js'
 import { t } from '../i18n.js'
+import type { CustomFieldDef } from '../index.js'
 import { canHr } from '../permissions.js'
+import CustomFieldsForm from './CustomFieldsForm.svelte'
+import { type CustomValues, formatValue, mergeCustom, missingRequired, sameCustom } from './custom-fields.js'
 import { explainRefusal } from './refusal.js'
 
 /**
@@ -38,16 +42,45 @@ interface Props {
   personId: string
   workspaceId: string
   personName: string
+  /**
+   * The record's `custom` map and the definitions marked sensitive, from the panel.
+   *
+   * A sensitive custom field — a passport number, say — lives in `people.custom` beside the plain
+   * ones, and the server has already withheld it from a reader without `hr.person.view_sensitive`.
+   * It is drawn here rather than on the identity list so that the disclosure this section asks
+   * for covers it too, and it is edited here for the same reason. The write still goes through
+   * `people.update`, which costs `hr.person.manage`; a holder of `manage_sensitive` alone sees the
+   * values and is told, once, why the controls are not on the form.
+   */
+  custom: CustomValues
+  fields: CustomFieldDef[]
 }
-const { personId, workspaceId, personName }: Props = $props()
+const { personId, workspaceId, personName, custom, fields }: Props = $props()
 
 const api = getHrApi()
 const queryClient = useQueryClient()
 
 const mayView = $derived(canHr('personViewSensitive'))
 const mayManage = $derived(canHr('personManageSensitive'))
+/** `people.update` is what writes a custom value, and it costs the plain manage permission. */
+const mayWriteCustom = $derived(mayManage && canHr('personManage'))
 
 let revealed = $state(false)
+
+const customRows = $derived.by(() => {
+  const ctx = {
+    locale: messageLocale(),
+    yes: t('field_yes'),
+    no: t('field_no'),
+    date: (iso: string) => formatDate(`${iso}T00:00:00`),
+  }
+  return [...fields]
+    .sort((a, b) => a.order - b.order || a.name.localeCompare(b.name))
+    .flatMap((def) => {
+      const text = formatValue(def, custom[def.key], ctx)
+      return text === null ? [] : [{ def, text }]
+    })
+})
 
 const sensitiveQuery = createQuery(() => ({
   queryKey: ['hr', 'sensitive', workspaceId, personId] as const,
@@ -62,7 +95,8 @@ const empty = $derived(
     !details?.nationalId &&
     !details?.birthDate &&
     !details?.iban &&
-    !details?.emergencyContact,
+    !details?.emergencyContact &&
+    customRows.length === 0,
 )
 
 /**
@@ -85,6 +119,7 @@ let iban = $state('')
 let contactName = $state('')
 let relationship = $state('')
 let contactPhone = $state('')
+let customEdit = $state<CustomValues>({})
 
 function openEdit() {
   nationalId = details?.nationalId ?? ''
@@ -93,8 +128,11 @@ function openEdit() {
   contactName = details?.emergencyContact?.name ?? ''
   relationship = details?.emergencyContact?.relationship ?? ''
   contactPhone = details?.emergencyContact?.phone ?? ''
+  customEdit = Object.fromEntries(fields.map((def) => [def.key, custom[def.key]]))
   editing = true
 }
+
+const missing = $derived(editing && mayWriteCustom ? missingRequired(fields, customEdit) : [])
 
 /** A contact is a name *and* a number; either alone is somebody nobody can reach. */
 const contactPartial = $derived(
@@ -111,8 +149,8 @@ const save = createMutation(() => ({
   // Unlike an employment change, an empty field here really does clear: `sensitive.update` takes
   // null for every one of these, which is what makes "she asked us to delete her bank details" a
   // thing this screen can do.
-  mutationFn: () =>
-    api.people.sensitive.update({
+  mutationFn: async () => {
+    const saved = await api.people.sensitive.update({
       workspaceId,
       personId,
       nationalId: nationalId.trim() || null,
@@ -126,10 +164,20 @@ const save = createMutation(() => ({
               phone: contactPhone.trim(),
             }
           : null,
-    }),
+    })
+    // The custom values are a second write to a different table, and only when one changed:
+    // `people.update` replaces the whole map, so it is sent the record's map with these keys over
+    // it. Snapshot, not the `$state` proxy, which the API layer cannot clone.
+    if (mayWriteCustom) {
+      const merged = mergeCustom(custom, $state.snapshot(customEdit))
+      if (!sameCustom(merged, custom)) await api.people.update({ workspaceId, personId, custom: merged })
+    }
+    return saved
+  },
   onSuccess: () => {
     toast.success(t('person_updated'))
     void queryClient.invalidateQueries({ queryKey: ['hr', 'sensitive', workspaceId, personId] })
+    void queryClient.invalidateQueries({ queryKey: ['hr', 'person', workspaceId, personId] })
     editing = false
   },
   onError: (error) => toast.error(explainRefusal(error, t('sensitive_save_error'))),
@@ -139,7 +187,7 @@ const save = createMutation(() => ({
 }))
 
 const submit = () => {
-  if (saving) return
+  if (saving || missing.length) return
   saving = true
   save.mutate()
 }
@@ -207,6 +255,17 @@ const submit = () => {
           <dt>{t('sensitive_iban')}</dt>
           <dd class="mono">{details.iban}</dd>
         {/if}
+        <!-- The workspace's own sensitive fields, inside the same disclosure as the built-in ones. -->
+        {#each customRows as row (row.def.id)}
+          <dt>{row.def.name}</dt>
+          {#if row.def.type === 'url'}
+            <dd class="mono">
+              <a href={row.text} target="_blank" rel="noopener noreferrer">{row.text}</a>
+            </dd>
+          {:else}
+            <dd>{row.text}</dd>
+          {/if}
+        {/each}
       </dl>
     {:else if sensitiveQuery.isError}
       <EmptyState compact icon="triangle-alert" title={t('sensitive_error')}>
@@ -276,15 +335,24 @@ const submit = () => {
           <Input {id} mono bind:value={iban} maxlength={48} autocomplete="off" />
         {/snippet}
       </Field>
+
+      {#if fields.length && mayWriteCustom}
+        <CustomFieldsForm defs={fields} bind:values={customEdit} idPrefix="hr-sens" headings={false} />
+      {:else if fields.length}
+        <p class="muted">{t('field_sensitive_needs_manage')}</p>
+      {/if}
     </div>
 
     {#snippet footer()}
+      {#if missing.length}
+        <span class="note">{t('field_required_missing', { name: missing[0]!.name })}</span>
+      {/if}
       <Button variant="secondary" onclick={() => (editing = false)} disabled={save.isPending}>
         {t('common.cancel')}
       </Button>
       <Button
         loading={save.isPending}
-        disabled={contactPartial || !mayManage || saving}
+        disabled={contactPartial || !mayManage || saving || missing.length > 0}
         onclick={submit}
       >
         {t('common.save')}
@@ -373,6 +441,17 @@ const submit = () => {
 .form {
   display: grid;
   gap: 14px;
+}
+.note {
+  margin-inline-end: auto;
+  align-self: center;
+  font-size: 12px;
+  color: var(--kern-ink-500);
+}
+.mono a {
+  color: var(--kern-accent-text);
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 .pair {
   display: grid;

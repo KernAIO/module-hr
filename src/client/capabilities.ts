@@ -25,6 +25,8 @@ export const HR_CAPABILITIES = {
   periods: 'periods',
   approvals: 'approvals',
   attendance: 'attendance',
+  rosters: 'rosters',
+  payrollExport: 'payroll_export',
 } as const
 
 export type HrCapabilityId = (typeof HR_CAPABILITIES)[keyof typeof HR_CAPABILITIES]

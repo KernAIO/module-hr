@@ -3,7 +3,7 @@ import { coreApi, keys, SidebarGroup, SidebarItem, session } from '@kernhq/ui'
 import { createQuery } from '@tanstack/svelte-query'
 import type { CoreApi } from '../core-api.js'
 import { t } from '../i18n.js'
-import { HR_CAPABILITIES } from '../permissions.js'
+import { HR_CAPABILITIES, HR_PERMISSIONS } from '../permissions.js'
 
 /**
  * HR's own column.
@@ -56,12 +56,34 @@ const active = (path: string) => pathname === `/${workspaceSlug}${path}`
       label={t('attendance_title')}
     />
   {/if}
+  {#if has(HR_CAPABILITIES.rosters)}
+    <SidebarItem
+      href={href('/hr/rosters')}
+      icon="layout-grid"
+      active={active('/hr/rosters')}
+      label={t('rosters_title')}
+    />
+  {/if}
   <SidebarItem
     href={href('/hr/approvals')}
     icon="check-check"
     active={active('/hr/approvals')}
     label={t('approvals_title')}
   />
+  <!--
+    A permission gate, not a capability one: `hr.report.view` is a separate grant that ships to
+    nobody by default, and a row leading to a page that answers 403 is worse than no row. The page
+    itself hides each report whose capability is off, and says which switches it needs when all of
+    them are — so the route stays reachable with either `attendance` or `leave` on.
+  -->
+  {#if session.can(HR_PERMISSIONS.reportView)}
+    <SidebarItem
+      href={href('/hr/reports')}
+      icon="chart-column"
+      active={active('/hr/reports')}
+      label={t('reports_title')}
+    />
+  {/if}
   {#if has(HR_CAPABILITIES.offices)}
     <SidebarItem
       href={href('/hr/offices')}

@@ -122,6 +122,7 @@ import {
 } from './services/reports.js'
 import { DEFAULT_WORKING_WEEK, ResolveService } from './services/resolve.js'
 import { type ResolvedRosterDay, RosterService, rosterRefusal } from './services/rosters.js'
+import { HrSearchService } from './services/search.js'
 
 const os = implement(hrContract).$context<RequestContext>()
 
@@ -652,11 +653,28 @@ export function implement_(kernel: Kernel) {
   const rosters = new RosterService()
   const payroll = new PayrollExportService(reports)
   const audit = new HrAuditService(kernel, access)
+  const search = new HrSearchService(kernel)
   const db = kernel.database
   const settingsOf = (workspaceId: string) => kernel.settings.module(workspaceId, MODULE_ID, HrSettings)
 
-  const changed = (workspaceId: string, entity: string, id: string, op: 'created' | 'updated' | 'deleted') =>
-    kernel.realtime.change(workspaceId, { module: MODULE_ID, entity, id, op })
+  /**
+   * Tell every open screen a row moved — and, for a person, tell the search index too.
+   *
+   * The index is folded in here rather than called beside each `changed(…, 'person', …)`, because
+   * there are seven of those and the eighth would be the one somebody forgets: a directory card
+   * that renames on every screen and still answers to the old name in the command palette. Every
+   * caller already announces after its transaction has committed, which is the only place an index
+   * write may happen — see `HrSearchService.reindex`.
+   */
+  const changed = async (
+    workspaceId: string,
+    entity: string,
+    id: string,
+    op: 'created' | 'updated' | 'deleted',
+  ) => {
+    await kernel.realtime.change(workspaceId, { module: MODULE_ID, entity, id, op })
+    if (entity === 'person') await search.reindex(workspaceId, id)
+  }
 
   return os.router({
     // ================================================================= people
@@ -883,6 +901,18 @@ export function implement_(kernel: Kernel) {
         const { workspaceId, personId, ...patch } = input
         const row = await db.withWorkspace(workspaceId, async (tx) => {
           const before = await svc.load(tx, workspaceId, personId)
+          // `custom` replaces the whole map — and `people.get` handed this writer the map *without*
+          // the sensitive keys they may not read, so a form that sends back what it was shown
+          // would erase every sensitive value on the record. Those keys are carried over from the
+          // row unless the patch names them itself.
+          if (patch.custom) {
+            const hidden = await sensitiveCustomKeys(tx, workspaceId, context.principal)
+            if (hidden.size) {
+              const kept = before.custom ?? {}
+              for (const key of hidden)
+                if (key in kept && !(key in patch.custom)) patch.custom[key] = kept[key]
+            }
+          }
           const set: Record<string, unknown> = { updatedAt: new Date() }
           const history: Array<{ field: string; from: unknown; to: unknown }> = []
           for (const [k, v] of Object.entries(patch)) {

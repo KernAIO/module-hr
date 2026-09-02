@@ -60,6 +60,18 @@ export const hrClientModule = defineClientModule({
       capability: HR_CAPABILITIES.attendance,
     },
     {
+      path: '/hr/rosters',
+      component: () => import('./pages/RostersPage.svelte'),
+      get title() {
+        return t('rosters_title')
+      },
+      // `attendanceView`, not `view_team`: reading your own roster costs the same as reading your
+      // own month, and the page hides its coverage tab from anybody without the team permission
+      // rather than hiding the whole page from the people the roster is about.
+      permission: HR_PERMISSIONS.attendanceView,
+      capability: HR_CAPABILITIES.rosters,
+    },
+    {
       path: '/hr/approvals',
       component: () => import('./pages/ApprovalsPage.svelte'),
       get title() {
@@ -74,6 +86,17 @@ export const hrClientModule = defineClientModule({
       },
       permission: HR_PERMISSIONS.officeView,
       capability: HR_CAPABILITIES.offices,
+    },
+    {
+      path: '/hr/reports',
+      component: () => import('./pages/ReportsPage.svelte'),
+      get title() {
+        return t('reports_title')
+      },
+      // No capability on the route: the page is useful with either `attendance` (three reports) or
+      // `leave` (the balance report), and gates each tab on its own switch. A workspace with
+      // neither is shown which two switches it would need rather than a 404.
+      permission: HR_PERMISSIONS.reportView,
     },
     {
       path: '/hr/org',
@@ -216,6 +239,46 @@ export const hrClientModule = defineClientModule({
       icon: 'check-check',
       run: (ctx) => ctx.navigate('/hr/approvals'),
     },
+    {
+      id: 'hr.reports',
+      get label() {
+        return t('cmd_reports')
+      },
+      icon: 'chart-column',
+      permission: HR_PERMISSIONS.reportView,
+      run: (ctx) => ctx.navigate('/hr/reports'),
+    },
+    {
+      /**
+       * Who has read my identity, birth date or bank details.
+       *
+       * The log sits on the person panel, which is addressed by person id — and the palette does
+       * not know the caller's. So the command asks `people.me` first and opens the panel on the
+       * answer; the panel's own access-log section then shows, because the record is the viewer's.
+       * A member who was never made a person has no record to open, and is told so rather than
+       * being sent to a directory with nothing selected. The API client is imported here rather
+       * than at the top, because `api-instance` reaches the client barrel that re-exports this
+       * module.
+       */
+      id: 'hr.my-access-log',
+      get label() {
+        return t('cmd_my_access_log')
+      },
+      icon: 'shield',
+      permission: HR_PERMISSIONS.personView,
+      run: async (ctx) => {
+        if (!ctx.workspaceId) return
+        const { getHrApi } = await import('./api-instance.js')
+        const me = await getHrApi()
+          .people.me({ workspaceId: ctx.workspaceId })
+          .catch(() => null)
+        if (!me) {
+          ctx.toast({ title: t('cmd_my_access_log_none'), kind: 'info' })
+          return
+        }
+        ctx.navigate(`/hr?person=${encodeURIComponent(me.id)}`)
+      },
+    },
   ],
 
   sidebar: [
@@ -257,6 +320,19 @@ export const hrClientModule = defineClientModule({
       permission: 'core.modules.manage',
       order: 5,
       component: () => import('./settings/CapabilitiesSettings.svelte'),
+    },
+    {
+      // No capability: a field is part of the record itself, and `people.custom` is on every
+      // person whether or not any other feature is switched on.
+      id: 'fields',
+      get label() {
+        return t('settings_fields')
+      },
+      icon: 'file-input',
+      scope: 'workspace',
+      permission: HR_PERMISSIONS.fieldManage,
+      order: 8,
+      component: () => import('./settings/FieldsSettings.svelte'),
     },
     {
       id: 'offices',
@@ -307,6 +383,21 @@ export const hrClientModule = defineClientModule({
       component: () => import('./settings/SchedulesSettings.svelte'),
     },
     {
+      // After schedules, because a roster is the other answer to "what was this person meant to
+      // work today" and the two are read together; before approvals, which is about a different
+      // thing entirely.
+      id: 'rosters',
+      get label() {
+        return t('settings_rosters')
+      },
+      icon: 'refresh-cw',
+      scope: 'workspace',
+      permission: HR_PERMISSIONS.attendanceManage,
+      capability: HR_CAPABILITIES.rosters,
+      order: 45,
+      component: () => import('./settings/RostersSettings.svelte'),
+    },
+    {
       // Between leave and schedules, because accrual is how a balance comes to exist and the leave
       // types it credits are the page above it.
       id: 'accrual',
@@ -345,6 +436,35 @@ export const hrClientModule = defineClientModule({
       capability: HR_CAPABILITIES.periods,
       order: 60,
       component: () => import('./settings/PeriodsSettings.svelte'),
+    },
+    {
+      // Last, and behind a key nobody holds by default. Retention, subject access and erasure are
+      // not a capability — a workspace that could switch privacy off would be one that stopped
+      // honouring subject requests — so there is no `capability` here, and there must not be.
+      id: 'privacy',
+      get label() {
+        return t('settings_privacy')
+      },
+      icon: 'shield',
+      scope: 'workspace',
+      permission: HR_PERMISSIONS.privacyManage,
+      order: 90,
+      component: () => import('./settings/PrivacySettings.svelte'),
+    },
+    {
+      // Straight after periods, because a closed period is what this hands over. The capability
+      // already implies `periods` and `attendance`; the permission ships granted to nobody, so on a
+      // fresh workspace only an owner sees this entry.
+      id: 'payroll',
+      get label() {
+        return t('settings_payroll')
+      },
+      icon: 'file-input',
+      scope: 'workspace',
+      permission: HR_PERMISSIONS.payrollExport,
+      capability: HR_CAPABILITIES.payrollExport,
+      order: 65,
+      component: () => import('./settings/PayrollSettings.svelte'),
     },
   ],
 

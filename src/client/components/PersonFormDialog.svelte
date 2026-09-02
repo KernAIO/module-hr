@@ -1,10 +1,12 @@
 <script lang="ts">
 import { Button, Dialog, Field, Input, navigation, Select, toast } from '@kernhq/ui'
-import { createMutation, useQueryClient } from '@tanstack/svelte-query'
+import { createMutation, createQuery, useQueryClient } from '@tanstack/svelte-query'
 import { getHrApi } from '../api-instance.js'
 import { t } from '../i18n.js'
 import { canHr } from '../permissions.js'
-import { isoDate } from '../query.js'
+import { hrKeys, isoDate } from '../query.js'
+import CustomFieldsForm from './CustomFieldsForm.svelte'
+import { type CustomValues, isBlank, missingRequired } from './custom-fields.js'
 
 /**
  * Hire someone into the directory.
@@ -12,6 +14,13 @@ import { isoDate } from '../query.js'
  * The Add person button already went to `?new=1`; this is the screen that URL was promising.
  * Office is optional: a workspace that never switched offices on still has a default one, and the
  * server assigns it. Asking for an office on that workspace would offer a feature it does not have.
+ *
+ * The workspace's own fields come after the built-in ones, non-sensitive only: a sensitive field
+ * is written where the sensitive record is, behind `hr.person.manage_sensitive`, and a hire form
+ * that asked for a passport number from anybody holding `hr.person.manage` would be the door that
+ * permission exists to close. `people.create` does not take `custom`, so the values go in a second
+ * call once the person exists — and if that second call fails, the person is still hired, and the
+ * toast says which half happened.
  */
 interface OfficeOpt {
   id: string
@@ -48,6 +57,7 @@ let employeeNo = $state('')
 let hiredOn = $state(isoDate())
 let officeId = $state('')
 let employmentType = $state('full_time')
+let custom = $state<CustomValues>({})
 
 const typeOptions = [
   { value: 'full_time', label: t('employment_full_time') },
@@ -63,6 +73,15 @@ const officeOptions = $derived(offices.map((o) => ({ value: o.id, label: o.name 
 $effect(() => {
   if (open && !officeId && offices[0]) officeId = offices[0].id
 })
+
+/** Live definitions only: an archived field has left every form, and this is one of them. */
+const fieldsQuery = createQuery(() => ({
+  queryKey: hrKeys.fields(workspaceId),
+  enabled: shown && Boolean(workspaceId),
+  queryFn: () => api.fields.list({ workspaceId }),
+}))
+const editableFields = $derived((fieldsQuery.data ?? []).filter((def) => !def.sensitive))
+const missing = $derived(missingRequired(editableFields, custom))
 
 const dismiss = () => {
   if (createdId) {
@@ -83,6 +102,7 @@ const reset = () => {
   hiredOn = isoDate()
   officeId = offices[0]?.id ?? ''
   employmentType = 'full_time'
+  custom = {}
 }
 
 /**
@@ -113,8 +133,8 @@ function explain(error: unknown, fallback: string): string {
 let creating = $state(false)
 
 const create = createMutation(() => ({
-  mutationFn: () =>
-    api.people.create({
+  mutationFn: async () => {
+    const person = await api.people.create({
       workspaceId,
       displayName: displayName.trim(),
       workEmail: workEmail.trim() || null,
@@ -128,10 +148,22 @@ const create = createMutation(() => ({
         | 'intern'
         | 'temporary'
         | 'freelance',
-    }),
-  onSuccess: (person) => {
+    })
+    // Only what was filled in: a map of nulls is a history row saying nothing changed. Snapshot
+    // rather than the `$state` proxy, which the API layer cannot clone.
+    const values = Object.fromEntries(Object.entries($state.snapshot(custom)).filter(([, v]) => !isBlank(v)))
+    if (Object.keys(values).length === 0) return { person, fieldsSaved: true }
+    try {
+      await api.people.update({ workspaceId, personId: person.id, custom: values })
+      return { person, fieldsSaved: true }
+    } catch {
+      return { person, fieldsSaved: false }
+    }
+  },
+  onSuccess: ({ person, fieldsSaved }) => {
     createdId = person.id
-    toast.success(t('person_created', { name: person.displayName }))
+    if (fieldsSaved) toast.success(t('person_created', { name: person.displayName }))
+    else toast.error(t('person_created_fields_error', { name: person.displayName }))
     void queryClient.invalidateQueries({ queryKey: ['hr', 'people'] })
     reset()
     shown = false
@@ -144,13 +176,13 @@ const create = createMutation(() => ({
 }))
 
 const submit = () => {
-  if (creating) return
+  if (creating || missing.length) return
   creating = true
   create.mutate()
 }
 
 const canManage = $derived(canHr('personManage'))
-const canSubmit = $derived(displayName.trim().length > 0 && canManage && !creating)
+const canSubmit = $derived(displayName.trim().length > 0 && canManage && !creating && missing.length === 0)
 </script>
 
 <Dialog
@@ -197,15 +229,23 @@ const canSubmit = $derived(displayName.trim().length > 0 && canManage && !creati
         <Select {id} bind:value={employmentType} options={typeOptions} />
       {/snippet}
     </Field>
+
+    {#if editableFields.length}
+      <CustomFieldsForm defs={editableFields} bind:values={custom} idPrefix="hr-person-new" />
+    {/if}
   </div>
 
   {#snippet footer()}
     <!--
       The URL reaches this dialog whether or not the person may use it — the Add person button is
       gated, a pasted `?new=1` is not — so the submit says why it is dead rather than looking
-      broken.
+      broken. A required field left empty is said the same way, by name.
     -->
-    {#if !canManage}<span class="note">{t('person_manage_denied')}</span>{/if}
+    {#if !canManage}
+      <span class="note">{t('person_manage_denied')}</span>
+    {:else if missing.length}
+      <span class="note">{t('field_required_missing', { name: missing[0]!.name })}</span>
+    {/if}
     <Button
       variant="ghost"
       onclick={() => {

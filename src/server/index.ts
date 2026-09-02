@@ -15,6 +15,7 @@ import { hrJobs } from './jobs.js'
 import { COUNTRY_PACKS, packDays } from './packs/index.js'
 import { implement_ } from './router.js'
 import { calendarDays, calendars, offices, people, schema } from './schema.js'
+import { HrSearchService } from './services/search.js'
 
 /**
  * What HR will interrupt somebody about.
@@ -90,6 +91,21 @@ export const hrModule = defineServerModule({
   migrationsFolder: join(dirname(fileURLToPath(import.meta.url)), '../../migrations'),
   router: implement_,
   jobs: hrJobs(),
+
+  /**
+   * The staff directory in the workspace-wide search index, so a colleague's name typed into the
+   * command palette opens their card. `HrSearchService` holds the one document shape both halves
+   * write, and says exactly which fields go in — the directory card, and nothing the card hides.
+   * `load` answers `null` for a terminated or erased person, which takes them back out.
+   */
+  search: [
+    {
+      types: ['person'],
+      load: (workspaceId: string, id: string, kernel: Kernel): Promise<core.SearchDocument | null> =>
+        new HrSearchService(kernel).load(workspaceId, id),
+      scan: (workspaceId: string, kernel: Kernel) => new HrSearchService(kernel).scan(workspaceId),
+    },
+  ],
 
   /**
    * A workspace that switches HR on gets one office and the calendar for its country.

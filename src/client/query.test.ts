@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { formatDays, formatDuration, hrKeys, monthRange } from './query.js'
+import { addDays, daysInclusive, formatDays, formatDuration, hrKeys, monthRange } from './query.js'
 
 const words = { hours: (n: string) => `${n}h`, minutes: (n: string) => `${n}m` }
 
@@ -66,5 +66,42 @@ describe('formatDays', () => {
   })
   it('uses the locale’s digits', () => {
     expect(formatDays(20, 'fa')).toBe('۲۰')
+  })
+})
+
+describe('roster keys', () => {
+  it('uses the entity names the server announces, so a realtime change reaches them', () => {
+    // `router.ts` emits `roster_shift`, `roster_pattern`, `roster_assignment` and `roster_day`;
+    // the realtime client invalidates by `[module, entity]`, so a key spelt any other way is one a
+    // colleague's edit never refreshes.
+    expect(hrKeys.rosterShifts('ws').slice(0, 2)).toEqual(['hr', 'roster_shift'])
+    expect(hrKeys.rosterPatterns('ws').slice(0, 2)).toEqual(['hr', 'roster_pattern'])
+    expect(hrKeys.rosterAssignments('ws').slice(0, 2)).toEqual(['hr', 'roster_assignment'])
+    expect(hrKeys.rosterDays('ws', undefined, '2026-01-01', '2026-01-07').slice(0, 2)).toEqual([
+      'hr',
+      'roster_day',
+    ])
+    expect(hrKeys.rosterCoverage('ws', '2026-01-01', '2026-01-07').slice(0, 2)).toEqual(['hr', 'roster_day'])
+  })
+  it('keeps my roster apart from a named person’s, and one office apart from all of them', () => {
+    expect(hrKeys.rosterDays('ws', undefined, '2026-01-01', '2026-01-07')).not.toEqual(
+      hrKeys.rosterDays('ws', 'alice', '2026-01-01', '2026-01-07'),
+    )
+    expect(hrKeys.rosterCoverage('ws', '2026-01-01', '2026-01-07')).not.toEqual(
+      hrKeys.rosterCoverage('ws', '2026-01-01', '2026-01-07', 'office'),
+    )
+  })
+})
+
+describe('addDays and daysInclusive', () => {
+  it('crosses a month and a year', () => {
+    expect(addDays('2026-01-31', 1)).toBe('2026-02-01')
+    expect(addDays('2026-12-31', 1)).toBe('2027-01-01')
+    expect(addDays('2026-03-01', -1)).toBe('2026-02-28')
+  })
+  it('counts both ends and goes to zero or below when reversed', () => {
+    expect(daysInclusive('2026-01-01', '2026-01-01')).toBe(1)
+    expect(daysInclusive('2026-01-01', '2026-01-07')).toBe(7)
+    expect(daysInclusive('2026-01-07', '2026-01-01')).toBeLessThanOrEqual(0)
   })
 })
