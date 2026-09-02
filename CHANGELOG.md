@@ -1,5 +1,11 @@
 # @kernhq/module-hr
 
+## 0.20.2
+
+### Patch Changes
+
+- 3d7e229: Peer @kernhq/ui ^0.14.0 so the declared range matches what the shell's design system actually publishes.
+
 ## 0.20.1
 
 ### Patch Changes
