@@ -1,5 +1,11 @@
 # @kernhq/module-hr
 
+## 0.20.3
+
+### Patch Changes
+
+- test(hr): tolerate the force-drop FATAL race at scratch-db teardown
+
 ## 0.20.2
 
 ### Patch Changes
