@@ -369,6 +369,13 @@ beforeAll(async () => {
   await client.end()
 
   pool = new pg.Pool({ connectionString: url.toString(), max: 4 })
+  // `drop database ... with (force)` in afterAll SIGTERMs every backend still attached to the scratch
+  // database, and `pool.end()` destroys a client's socket as soon as it has sent Terminate — so a backend
+  // that has not reaped its socket yet can still land a terminating FATAL (57P01) in the buffer of an
+  // idle pooled client. pg-pool re-emits an idle client's error on the pool, and an unlistened 'error'
+  // event fails the entire vitest run after every test in it has already passed. The database is on its
+  // way out by then, so there is nothing to do but swallow it.
+  pool.on('error', () => undefined)
   db = drizzle(pool)
 
   await inWs(WS, async (tx) => {
