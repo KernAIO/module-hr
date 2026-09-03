@@ -10,6 +10,8 @@ import { daysInMonth } from '../policy/calendar.js'
 import { hrSubjects } from './router.js'
 import {
   attendanceDays,
+  checklistItems,
+  checklists,
   employments,
   leaveLedger,
   leaveTypes,
@@ -24,6 +26,8 @@ import { todayIn } from './services/db.js'
 import { LedgerService } from './services/ledger.js'
 import { PolicyService } from './services/policies.js'
 import { ResolveService } from './services/resolve.js'
+import { announceRetentionSweep, RetentionSweep, type SweepOutcome } from './services/retention.js'
+import { HrSearchService } from './services/search.js'
 
 /**
  * How far back the auto clock-out sweep looks.
@@ -788,7 +792,220 @@ export function hrJobs(): JobDef[] {
           })
       },
     },
+
+    {
+      /**
+       * Checklist tasks past their date and still open.
+       *
+       * Told to the assignee, or — for a task in HR's pool — to whoever started the checklist,
+       * once per item ever: `overdue_notified_at` is the marker, cleared when the item is reopened
+       * or handed to somebody else, so the next person to hold it is told once too. A daily UTC
+       * cron is honest here for the reason `module-inventory`'s sweeps give: a due date is a day,
+       * an item is overdue for every day after it, and the hour it is noticed cannot change whether
+       * it is noticed.
+       *
+       * Asks the capability first: a workspace that has switched checklists off has no checklist
+       * surface, and a sweep that notified about rows behind a procedure answering 404 would be the
+       * feature refusing a person and emailing them about it.
+       */
+      name: 'checklist-overdue',
+      cron: '30 7 * * *',
+      handler: async (_input, { kernel }) => {
+        const today = new Date().toISOString().slice(0, 10)
+        for (const workspaceId of await activeWorkspaces(kernel)) {
+          try {
+            if (!(await kernel.capabilities(workspaceId, MODULE_ID)).has('checklists')) continue
+            const late = await kernel.database.withWorkspace(workspaceId, (tx) =>
+              tx
+                .select({
+                  itemId: checklistItems.id,
+                  title: checklistItems.title,
+                  dueOn: checklistItems.dueOn,
+                  assigneePersonId: checklistItems.assigneePersonId,
+                  checklistId: checklists.id,
+                  name: checklists.name,
+                  kind: checklists.kind,
+                  personId: checklists.personId,
+                  startedBy: checklists.startedBy,
+                })
+                .from(checklistItems)
+                .innerJoin(
+                  checklists,
+                  and(
+                    eq(checklists.id, checklistItems.checklistId),
+                    eq(checklists.workspaceId, checklistItems.workspaceId),
+                  ),
+                )
+                .where(
+                  and(
+                    eq(checklistItems.workspaceId, workspaceId),
+                    isNull(checklistItems.doneAt),
+                    isNull(checklistItems.overdueNotifiedAt),
+                    eq(checklists.status, 'open'),
+                    sql`${checklistItems.dueOn} < ${today}::date`,
+                  ),
+                )
+                .limit(500),
+            )
+            if (!late.length) continue
+
+            // The accounts behind the assignees, once per sweep rather than once per item.
+            const personIds = [
+              ...new Set(late.flatMap((r) => (r.assigneePersonId ? [r.assigneePersonId] : []))),
+            ]
+            const accounts = personIds.length
+              ? await kernel.database.withWorkspace(workspaceId, (tx) =>
+                  tx
+                    .select({ id: people.id, userId: people.userId })
+                    .from(people)
+                    .where(and(eq(people.workspaceId, workspaceId), inArray(people.id, personIds))),
+                )
+              : []
+            const userOf = new Map(accounts.flatMap((a) => (a.userId ? [[a.id, a.userId] as const] : [])))
+
+            let notified = 0
+            for (const row of late) {
+              const userId = row.assigneePersonId ? userOf.get(row.assigneePersonId) : row.startedBy
+              // Nobody to tell is not the same as told: the row stays unmarked and is looked at
+              // again tomorrow, when the item may have been handed to somebody with an account.
+              if (!userId) continue
+              try {
+                await kernel.call(
+                  'core.notifications.create',
+                  {
+                    userId,
+                    workspaceId,
+                    module: MODULE_ID,
+                    type: 'hr.checklist.item_overdue',
+                    title: `“${row.title}” on “${row.name}” is overdue`,
+                    body: null,
+                    object: { module: MODULE_ID, type: 'person', id: row.personId },
+                    url: `/hr/checklists?checklist=${row.checklistId}`,
+                    data: {
+                      checklistId: row.checklistId,
+                      itemId: row.itemId,
+                      personId: row.personId,
+                      kind: row.kind,
+                      dueOn: row.dueOn,
+                    },
+                    groupKey: `hr.checklist:${row.checklistId}`,
+                    actorId: null,
+                  },
+                  kernel.system,
+                )
+              } catch (err) {
+                kernel.log.warn(
+                  { module: MODULE_ID, workspaceId, itemId: row.itemId, err: (err as Error).message },
+                  'overdue checklist notice not delivered; it stays unmarked and goes again tomorrow',
+                )
+                continue
+              }
+              await kernel.database.withWorkspace(workspaceId, (tx) =>
+                tx
+                  .update(checklistItems)
+                  .set({ overdueNotifiedAt: new Date() })
+                  .where(and(eq(checklistItems.workspaceId, workspaceId), eq(checklistItems.id, row.itemId))),
+              )
+              notified++
+            }
+            if (notified)
+              kernel.log.info({ module: MODULE_ID, workspaceId, notified }, 'overdue checklist tasks')
+          } catch (err) {
+            kernel.log.warn(
+              { module: MODULE_ID, workspaceId, err: (err as Error).message },
+              'checklist overdue sweep failed; other workspaces continue',
+            )
+          }
+        }
+      },
+    },
+    {
+      /**
+       * Act on the retention horizons, where a workspace has asked for it.
+       *
+       * The one job here that deletes, so the one that runs nowhere until an administrator turns
+       * it on: `retention_settings.sweep_enabled` is asked before anything else, and a workspace
+       * that never set it is never visited. Daily, and honestly on a UTC cron: a horizon is a
+       * number of days and `retentionCutoff` measures it in UTC, so the hour the sweep fires
+       * cannot change which rows have passed it — only the date can, and the date is the same
+       * one the settings screen counted against.
+       *
+       * One transaction per workspace, through the same `RetentionSweep.run` a manual run uses,
+       * and a run record either way: a workspace that throws has changed nothing, is recorded as
+       * a failed run in its own transaction so the screen shows the failure, and the loop goes on
+       * to the next workspace rather than letting one tenant's data stop everybody's sweep. What
+       * committed is announced afterwards, never inside the transaction.
+       */
+      name: 'retention-sweep',
+      cron: '0 4 * * *',
+      handler: async (_input, { kernel }) => {
+        const sweep = new RetentionSweep()
+        const search = new HrSearchService(kernel)
+
+        for (const workspaceId of await sweepingWorkspaces(kernel)) {
+          const startedAt = new Date()
+          let outcome: SweepOutcome
+          try {
+            outcome = await kernel.database.withWorkspace(workspaceId, (tx) =>
+              sweep.run(tx, workspaceId, { dryRun: false, actorUserId: null, startedAt }),
+            )
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err)
+            kernel.log.error(
+              { module: MODULE_ID, workspaceId, err: message },
+              'retention sweep failed; nothing was changed and other workspaces continue',
+            )
+            await kernel.database
+              .withWorkspace(workspaceId, (tx) =>
+                sweep.recordFailure(tx, workspaceId, {
+                  startedAt,
+                  dryRun: false,
+                  actorUserId: null,
+                  error: message,
+                }),
+              )
+              .catch((recordErr: unknown) =>
+                kernel.log.error(
+                  { module: MODULE_ID, workspaceId, err: (recordErr as Error).message },
+                  'retention sweep failure could not be recorded',
+                ),
+              )
+            continue
+          }
+          await announceRetentionSweep(kernel, search, workspaceId, outcome)
+          kernel.log.info(
+            {
+              module: MODULE_ID,
+              workspaceId,
+              runId: outcome.run.id,
+              classes: Object.fromEntries(
+                outcome.run.perClass.map((c) => [
+                  c.class,
+                  { affected: c.affected, skippedLocked: c.skippedLocked },
+                ]),
+              ),
+              people: outcome.run.personIds.length,
+            },
+            'retention sweep',
+          )
+        }
+      },
+    },
   ]
+}
+
+/**
+ * Workspaces that turned the retention sweep on.
+ *
+ * Read from the switch itself rather than from `activeWorkspaces` and a settings read per tenant:
+ * the column exists so this question is one query, and a workspace with HR switched off cannot
+ * have a row here that anybody could have set.
+ */
+async function sweepingWorkspaces(kernel: Kernel): Promise<WorkspaceId[]> {
+  const { rows } = await kernel.database.pool.query<{ workspace_id: string }>(
+    `select workspace_id from mod_hr.retention_settings where sweep_enabled order by workspace_id`,
+  )
+  return rows.map((r) => r.workspace_id as WorkspaceId)
 }
 
 /**

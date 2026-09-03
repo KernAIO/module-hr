@@ -143,6 +143,17 @@ export const hrCapabilities = defineCapabilities([
     level: 2,
   },
   {
+    id: 'checklists',
+    label: 'Onboarding and offboarding',
+    description: 'Checklists started when somebody joins or leaves, with each task owned by a person',
+    dependsOn: ['core'],
+    // Off by default. A workspace with the switch on and no template sees a Checklists entry with
+    // an empty state pointing at settings; a workspace that never wanted it should not see the
+    // entry at all. Level 2, like documents: useful to many, universal to none.
+    defaultEnabled: false,
+    level: 2,
+  },
+  {
     id: 'payroll_export',
     label: 'Payroll export',
     description: 'Hand a closed period to a payroll provider as CSV, per legal entity',
@@ -226,6 +237,21 @@ export const hrCapabilityProcedures: Record<string, readonly string[]> = {
   ],
   documents: ['documents.list', 'documents.attach', 'documents.remove'],
   payroll_export: ['payroll.export.v1', 'payroll.export.preview'],
+  checklists: [
+    'checklists.templates.list',
+    'checklists.templates.create',
+    'checklists.templates.update',
+    'checklists.templates.archive',
+    'checklists.list',
+    'checklists.get',
+    'checklists.start',
+    'checklists.cancel',
+    'checklists.items.complete',
+    'checklists.items.reopen',
+    'checklists.items.assign',
+    'checklists.items.add',
+    'checklists.items.remove',
+  ],
   leave: [
     'leave.types.list',
     'leave.types.create',

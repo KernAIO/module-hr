@@ -101,6 +101,29 @@ export const HrRetention = z.object({
 })
 export type HrRetention = z.infer<typeof HrRetention>
 
+/**
+ * The shape a write takes: a class left out is unchanged, a class sent as `null` goes back to
+ * "keep indefinitely".
+ *
+ * Not `HrRetention.partial()`, and the difference is the whole feature. zod's `partial()` keeps
+ * each field's `.default(null)`, so `{ punches: 30 }` parsed through it comes out as `{ punches:
+ * 30, punchDetail: null, attendanceDays: null, … }` — a write naming one class silently reset the
+ * other seven to "keep indefinitely", from a screen that only ever sends what moved. This shape
+ * has no defaults, so what the caller did not say stays unsaid.
+ */
+const RetentionDaysPatch = z.number().int().min(1).max(36_500).nullable().optional()
+export const RetentionPatch = z.object({
+  punchDetail: RetentionDaysPatch,
+  punches: RetentionDaysPatch,
+  attendanceDays: RetentionDaysPatch,
+  leave: RetentionDaysPatch,
+  personHistory: RetentionDaysPatch,
+  personDocuments: RetentionDaysPatch,
+  terminatedPeople: RetentionDaysPatch,
+  sensitiveAccessLog: RetentionDaysPatch,
+})
+export type RetentionPatch = z.infer<typeof RetentionPatch>
+
 /** One class, its horizon, and what has already passed it. */
 export const RetentionClassState = z.object({
   class: RetentionClass,
@@ -123,18 +146,86 @@ export const RetentionSettings = z.object({
   updatedAt: Timestamp.nullable(),
   updatedBy: z.uuid().nullable(),
   /**
-   * Whether anything in HR deletes on these horizons yet. **It is false, and saying so is the
-   * point.**
+   * Whether the nightly sweep acts on these horizons. **Off until an administrator turns it on.**
    *
-   * The horizons are read in two places today: here, to count what has passed one, and by
-   * `privacy.erase`, to say under which horizon each surviving class was kept. No timed sweep acts
-   * on them. An unattended job that prunes personnel records is the one act in this module that
-   * cannot be undone by re-running anything, so it ships off, with a dry run and a per-run report
-   * naming every person it touched — and until it exists this field must not claim otherwise.
+   * This was a literal `false` until the sweep existed, because a field claiming a job that did
+   * not run would have been the same lie as a permission key nothing asks about. What exists now,
+   * and what the switch stands on: `privacy.retention.run` performs the sweep — a dry run by
+   * default, the act only when asked — `retention-sweep` runs it nightly for every workspace with
+   * this true, and every run of either kind is recorded in `privacy.retention.runs.list` with
+   * what each class matched, what was affected, what was skipped for sitting in a locked period,
+   * and every person a touched row belonged to. The switch changes only whether the job runs; a
+   * manual run is a deliberate act by somebody holding `hr.privacy.manage` and needs no switch.
    */
-  sweepEnabled: z.literal(false),
+  sweepEnabled: z.boolean(),
 })
 export type RetentionSettings = z.infer<typeof RetentionSettings>
+
+/**
+ * What a sweep did, or would do, to one class.
+ *
+ * `matched` is exactly the number `RetentionClassState.dueNow` shows for the same class on the same
+ * day — the sweep and the count are one predicate, in one place, so the screen cannot promise one
+ * thing and the run do another. `skippedLocked` is how many of those sit in a locked period and
+ * were left exactly as they are; `affected` is the rest. On a dry run `affected` is what the act
+ * would touch, computed by the same predicate; on a real run it is what the statements reported
+ * back, which is the only figure that cannot drift from what happened.
+ *
+ * Per class, and not per table, what "affected" means:
+ * - `punchDetail` clears where a punch happened, on what device and what was typed; the punch stays.
+ * - `punches` deletes the punch rows. A punch in a locked period is skipped.
+ * - `attendanceDays` deletes the day sheets. A locked day is skipped; a day the period says is
+ *   locked but the flag does not is skipped too, because the period is what decides.
+ * - `leave` deletes ledger entries only for a period year that lies **wholly** before the horizon,
+ *   together with that year's balance cursors, and deletes requests that ended before it with the
+ *   days behind them. A balance is the sum of one year's ledger, and the carry into the next year
+ *   is its own row in that next year — so a whole year can go without moving any balance that
+ *   remains, and a partial year cannot. The requests are what carry a reason, which is routinely
+ *   health data; the days follow their request and are not counted here.
+ * - `personHistory` clears the recorded values and keeps the rows: what changed and when survives,
+ *   what it changed to does not.
+ * - `personDocuments` deletes the metadata rows. The files stay in core's storage, and their ids
+ *   are recorded on the run — see `RetentionRun.fileIds`.
+ * - `terminatedPeople` runs the same redaction `privacy.erase` performs, on everybody who left
+ *   before the horizon and has not been erased.
+ * - `sensitiveAccessLog` deletes the rows.
+ */
+export const RetentionClassRun = z.object({
+  class: RetentionClass,
+  days: z.number().int(),
+  matched: z.number().int(),
+  affected: z.number().int(),
+  skippedLocked: z.number().int(),
+})
+export type RetentionClassRun = z.infer<typeof RetentionClassRun>
+
+/**
+ * One sweep, recorded.
+ *
+ * Every run is a row, dry or real, nightly or by hand: the preview somebody read before pressing
+ * the button is itself part of the record. A run that failed is a row with `error` set and no
+ * classes, because it rolled back and touched nothing. `classes` lists only the classes that had a
+ * horizon — a class kept indefinitely is not swept and not reported as swept.
+ */
+export const RetentionRun = z.object({
+  id: z.uuid(),
+  ...ws,
+  startedAt: Timestamp,
+  finishedAt: Timestamp.nullable(),
+  dryRun: z.boolean(),
+  /** The account that pressed the button. Null for the nightly job. */
+  startedBy: z.uuid().nullable(),
+  classes: z.array(RetentionClassRun),
+  /** Every person a touched row belonged to. On a dry run, every person one would have. */
+  personIds: z.array(z.uuid()),
+  /**
+   * Document files the run orphaned in core's storage. HR cannot delete a core object — there is
+   * no `files.delete` a module can reach — so the ids are kept here rather than lost.
+   */
+  fileIds: z.array(z.uuid()),
+  error: z.string().nullable(),
+})
+export type RetentionRun = z.infer<typeof RetentionRun>
 
 // =====================================================================================
 // erasure

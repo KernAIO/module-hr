@@ -66,6 +66,27 @@ const hrNotificationTypes: core.NotificationTypeDef[] = [
     defaults: { inapp: true, push: false, email: false },
     urgent: false,
   },
+  {
+    type: 'hr.checklist.item_assigned',
+    label: 'A checklist task is yours',
+    description: 'Somebody is joining or leaving and one of the tasks around it is yours to do.',
+    defaults: { inapp: true, push: true, email: true },
+    urgent: false,
+  },
+  {
+    type: 'hr.checklist.item_overdue',
+    label: 'A checklist task is overdue',
+    description: 'A task on an onboarding or offboarding checklist passed its date and is still open.',
+    defaults: { inapp: true, push: true, email: false },
+    urgent: false,
+  },
+  {
+    type: 'hr.checklist.completed',
+    label: 'A checklist is complete',
+    description: 'Every task on a checklist you started has been done.',
+    defaults: { inapp: true, push: false, email: false },
+    urgent: false,
+  },
 ]
 
 export const hrModule = defineServerModule({

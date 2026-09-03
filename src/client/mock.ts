@@ -16,6 +16,16 @@
 import { ORPCError } from '@orpc/contract'
 import type { ApprovalChain, ApprovalChainSpec } from '../contract/approvals.js'
 import type { Punch, Regularization, Schedule, ScheduleAssignment } from '../contract/attendance.js'
+import type {
+  Checklist,
+  ChecklistItem,
+  ChecklistItemInput,
+  ChecklistKind,
+  ChecklistStatus,
+  ChecklistSummary,
+  ChecklistTemplate,
+  ChecklistTemplateInput,
+} from '../contract/checklists.js'
 import {
   PAYROLL_EXPORT_CONTRACT,
   PAYROLL_HOURS_COLUMNS,
@@ -51,6 +61,7 @@ import type {
   ErasureRedaction,
   ErasureRetained,
   RetentionClass,
+  RetentionRun,
   SensitiveAccess,
 } from '../contract/privacy.js'
 import {
@@ -2157,9 +2168,46 @@ export function createMockHrApi() {
     }),
     updatedAt: retentionUpdatedAt,
     updatedBy: retentionUpdatedBy,
-    // False, and saying so is the point: nothing in HR deletes on these horizons yet.
-    sweepEnabled: false as const,
+    sweepEnabled: retentionSweepEnabled,
   })
+
+  /** Whether the nightly sweep acts here, and the runs it has left — the demo's own record. */
+  let retentionSweepEnabled = false
+  const retentionRuns: RetentionRun[] = []
+
+  /**
+   * A sweep as the demo performs it: the per-class counts the settings screen already shows, folded
+   * into a run record. A dry run writes nothing; a real run drops the matching rows from the seeds
+   * it can reach — the access log — and reports the rest as affected, which is what the server does
+   * with the tables this mock does not model row by row.
+   */
+  const sweep = (workspaceId: string, dryRun: boolean, startedBy: string | null): RetentionRun => {
+    const classes = RETENTION_CLASSES.flatMap((cls) => {
+      const days = retention[cls]
+      if (days === null) return []
+      const matched = pastHorizon(cls, day(-days))
+      return [{ class: cls, days, matched, affected: matched, skippedLocked: 0 }]
+    })
+    if (!dryRun && retention.sensitiveAccessLog !== null) {
+      const cutoff = day(-retention.sensitiveAccessLog)
+      for (let i = accessLog.length - 1; i >= 0; i--)
+        if (beforeCutoff(accessLog[i]!.at, cutoff)) accessLog.splice(i, 1)
+    }
+    const run: RetentionRun = {
+      id: crypto.randomUUID(),
+      workspaceId: workspaceId as RetentionRun['workspaceId'],
+      startedAt: iso(),
+      finishedAt: iso(),
+      dryRun,
+      startedBy,
+      classes,
+      personIds: classes.some((c) => c.matched > 0) ? [people[0]!.id] : [],
+      fileIds: [],
+      error: null,
+    }
+    retentionRuns.unshift(run)
+    return clone(run)
+  }
 
   // ---------------------------------------------------------------- rosters
 
@@ -2343,6 +2391,337 @@ export function createMockHrApi() {
           ? `This roster names a shift this workspace does not have: ${missing[0]}.`
           : `This roster names shifts this workspace does not have: ${missing.join(', ')}.`,
       )
+  }
+
+  // ---------------------------------------------------------------- checklists
+
+  /**
+   * One default template per kind, and the running lists copied from them.
+   *
+   * The onboarding template carries one item of each kind the screens have to draw: the person's
+   * own, their manager's, HR's pool, one named person, and one due *before* the anchor — so a demo
+   * shows an unassigned row, an overdue row and a row that is somebody else's without anyone having
+   * to construct them.
+   */
+  const checklistTemplates: Row<ChecklistTemplate>[] = [
+    {
+      id: id('c1a1'),
+      name: 'Onboarding',
+      kind: 'onboarding',
+      isDefault: true,
+      items: [
+        {
+          id: id('c1a1000001'),
+          title: 'Order the laptop',
+          description: 'Standard build for the role; ask the manager about anything beyond it.',
+          assignee: 'hr',
+          assigneePersonId: null,
+          dueOffsetDays: -5,
+          order: 0,
+        },
+        {
+          id: id('c1a1000002'),
+          title: 'Create accounts and email',
+          description: null,
+          assignee: 'hr',
+          assigneePersonId: null,
+          dueOffsetDays: -1,
+          order: 1,
+        },
+        {
+          id: id('c1a1000003'),
+          title: 'Welcome and team introduction',
+          description: 'First morning: the team, the week ahead, and who to ask.',
+          assignee: 'manager',
+          assigneePersonId: null,
+          dueOffsetDays: 0,
+          order: 2,
+        },
+        {
+          id: id('c1a1000004'),
+          title: 'Read the handbook and sign the policies',
+          description: null,
+          assignee: 'person',
+          assigneePersonId: null,
+          dueOffsetDays: 1,
+          order: 3,
+        },
+        {
+          id: id('c1a1000005'),
+          title: 'Security briefing',
+          description: null,
+          assignee: 'specific',
+          assigneePersonId: people[0]!.id,
+          dueOffsetDays: 2,
+          order: 4,
+        },
+      ],
+      archivedAt: null,
+      createdAt: iso(300 * 86_400_000),
+      updatedAt: iso(300 * 86_400_000),
+    },
+    {
+      id: id('c1a2'),
+      name: 'Offboarding',
+      kind: 'offboarding',
+      isDefault: true,
+      items: [
+        {
+          id: id('c1a2000001'),
+          title: 'Exit conversation',
+          description: null,
+          assignee: 'manager',
+          assigneePersonId: null,
+          dueOffsetDays: -2,
+          order: 0,
+        },
+        {
+          id: id('c1a2000002'),
+          title: 'Collect the laptop and badge',
+          description: null,
+          assignee: 'hr',
+          assigneePersonId: null,
+          dueOffsetDays: -1,
+          order: 1,
+        },
+        {
+          id: id('c1a2000003'),
+          title: 'Revoke access',
+          description: 'Every account, the day they leave — not the day after.',
+          assignee: 'specific',
+          assigneePersonId: people[0]!.id,
+          dueOffsetDays: 0,
+          order: 2,
+        },
+        {
+          id: id('c1a2000004'),
+          title: 'Hand over open work',
+          description: null,
+          assignee: 'person',
+          assigneePersonId: null,
+          dueOffsetDays: -3,
+          order: 3,
+        },
+      ],
+      archivedAt: null,
+      createdAt: iso(300 * 86_400_000),
+      updatedAt: iso(300 * 86_400_000),
+    },
+  ]
+
+  type ChecklistRow = Omit<Row<Checklist>, 'items' | 'progress'> & { items: Row<ChecklistItem>[] }
+
+  /** The manager in force today, the way `start` resolves one; null for a person with no employment. */
+  const managerOf = (personId: string): string | null =>
+    employments.find((e) => e.personId === personId && e.effectiveTo === null)?.managerPersonId ?? null
+
+  /**
+   * Two lists: Leyla's onboarding, running with two of five done, and Jonas's, finished.
+   *
+   * Leyla has no employment row, so her manager's item landed in the pool — which is what a demo
+   * needs to show a pooled row she may tick herself. `people[0]` (who `people.me` answers with) holds
+   * the security briefing, so the dashboard card and My tasks are not empty on first load.
+   */
+  const checklistRows: ChecklistRow[] = [
+    {
+      id: id('c1b1'),
+      personId: people[4]!.id,
+      templateId: id('c1a1'),
+      name: 'Onboarding',
+      kind: 'onboarding',
+      anchorDate: day(-2),
+      status: 'open',
+      startedBy: null,
+      startedAt: iso(7 * 86_400_000),
+      completedAt: null,
+      cancelledAt: null,
+      items: [
+        {
+          id: id('c1b1000001'),
+          checklistId: id('c1b1'),
+          title: 'Order the laptop',
+          description: 'Standard build for the role; ask the manager about anything beyond it.',
+          assigneePersonId: null,
+          dueOn: day(-7),
+          order: 0,
+          doneAt: iso(6 * 86_400_000),
+          doneBy: null,
+          note: 'Ordered the 14-inch; arrives Thursday.',
+        },
+        {
+          id: id('c1b1000002'),
+          checklistId: id('c1b1'),
+          title: 'Create accounts and email',
+          description: null,
+          assigneePersonId: null,
+          dueOn: day(-3),
+          order: 1,
+          doneAt: iso(3 * 86_400_000),
+          doneBy: null,
+          note: null,
+        },
+        {
+          id: id('c1b1000003'),
+          checklistId: id('c1b1'),
+          title: 'Welcome and team introduction',
+          description: 'First morning: the team, the week ahead, and who to ask.',
+          assigneePersonId: managerOf(people[4]!.id),
+          dueOn: day(-2),
+          order: 2,
+          doneAt: null,
+          doneBy: null,
+          note: null,
+        },
+        {
+          id: id('c1b1000004'),
+          checklistId: id('c1b1'),
+          title: 'Read the handbook and sign the policies',
+          description: null,
+          assigneePersonId: people[4]!.id,
+          dueOn: day(-1),
+          order: 3,
+          doneAt: null,
+          doneBy: null,
+          note: null,
+        },
+        {
+          id: id('c1b1000005'),
+          checklistId: id('c1b1'),
+          title: 'Security briefing',
+          description: null,
+          assigneePersonId: people[0]!.id,
+          dueOn: day(0),
+          order: 4,
+          doneAt: null,
+          doneBy: null,
+          note: null,
+        },
+      ],
+    },
+    {
+      id: id('c1b2'),
+      personId: people[3]!.id,
+      templateId: id('c1a1'),
+      name: 'Onboarding',
+      kind: 'onboarding',
+      anchorDate: day(-80),
+      status: 'done',
+      startedBy: null,
+      startedAt: iso(85 * 86_400_000),
+      completedAt: iso(77 * 86_400_000),
+      cancelledAt: null,
+      items: [
+        {
+          id: id('c1b2000001'),
+          checklistId: id('c1b2'),
+          title: 'Order the laptop',
+          description: null,
+          assigneePersonId: null,
+          dueOn: day(-85),
+          order: 0,
+          doneAt: iso(84 * 86_400_000),
+          doneBy: null,
+          note: null,
+        },
+        {
+          id: id('c1b2000002'),
+          checklistId: id('c1b2'),
+          title: 'Welcome and team introduction',
+          description: null,
+          assigneePersonId: people[0]!.id,
+          dueOn: day(-80),
+          order: 1,
+          doneAt: iso(80 * 86_400_000),
+          doneBy: null,
+          note: null,
+        },
+        {
+          id: id('c1b2000003'),
+          checklistId: id('c1b2'),
+          title: 'Security briefing',
+          description: null,
+          assigneePersonId: people[0]!.id,
+          dueOn: day(-78),
+          order: 2,
+          doneAt: iso(77 * 86_400_000),
+          doneBy: null,
+          note: null,
+        },
+      ],
+    },
+  ]
+
+  const checklistSummary = (row: ChecklistRow, workspaceId: string): ChecklistSummary => {
+    const { items, ...rest } = row
+    return {
+      ...rest,
+      workspaceId: workspaceId as ChecklistSummary['workspaceId'],
+      progress: { done: items.filter((i) => i.doneAt).length, total: items.length },
+    }
+  }
+  const checklistOut = (row: ChecklistRow, workspaceId: string): Checklist => ({
+    ...checklistSummary(row, workspaceId),
+    items: [...row.items]
+      .sort((a, b) => a.order - b.order)
+      .map((i) => ({ ...i, workspaceId: workspaceId as ChecklistItem['workspaceId'] })),
+  })
+
+  /** The two refusals `checkItems` raises, in its words: a `specific` item names somebody, nothing else does. */
+  const checkTemplateItems = (items: ChecklistTemplateInput['items']) => {
+    for (const item of items) {
+      if (item.assignee === 'specific' && !item.assigneePersonId)
+        refuse(
+          'BAD_REQUEST',
+          `“${item.title}” is assigned to a specific person but names nobody.`,
+          'hr.checklist.assignee_missing',
+        )
+      if (item.assignee !== 'specific' && item.assigneePersonId)
+        refuse(
+          'BAD_REQUEST',
+          `“${item.title}” names a person but is not assigned to a specific one.`,
+          'hr.checklist.assignee_unexpected',
+        )
+      if (item.assigneePersonId && !people.some((p) => p.id === item.assigneePersonId))
+        refuse('NOT_FOUND', 'Person not found')
+    }
+  }
+  const clearDefaultTemplate = (kind: ChecklistKind, except: string) => {
+    for (const tpl of checklistTemplates) if (tpl.kind === kind && tpl.id !== except) tpl.isDefault = false
+  }
+  const templateItemsFrom = (items: ChecklistTemplateInput['items']): ChecklistTemplate['items'] =>
+    items.map((item, order) => ({
+      id: crypto.randomUUID(),
+      title: item.title,
+      description: item.description ?? null,
+      assignee: item.assignee,
+      assigneePersonId: item.assignee === 'specific' ? (item.assigneePersonId ?? null) : null,
+      dueOffsetDays: item.dueOffsetDays ?? 0,
+      order,
+    }))
+  const loadOpenChecklist = (checklistId: string): ChecklistRow => {
+    const found = checklistRows.find((c) => c.id === checklistId)
+    if (!found) refuse('NOT_FOUND', 'Checklist not found')
+    if (found.status === 'cancelled')
+      refuse('CONFLICT', 'This checklist was cancelled; nothing on it can change.', 'hr.checklist.cancelled')
+    return found
+  }
+  const loadChecklistItem = (itemId: string): { item: Row<ChecklistItem>; checklist: ChecklistRow } => {
+    for (const checklist of checklistRows) {
+      const item = checklist.items.find((i) => i.id === itemId)
+      if (item) return { item, checklist: loadOpenChecklist(checklist.id) }
+    }
+    return refuse('NOT_FOUND', 'Checklist item not found')
+  }
+  /** The list's status follows its items: every one done closes it, any one reopened reopens it. */
+  const settleChecklist = (checklist: ChecklistRow) => {
+    const allDone = checklist.items.every((i) => i.doneAt)
+    checklist.status = allDone ? 'done' : 'open'
+    checklist.completedAt = allDone ? (checklist.completedAt ?? iso()) : null
+  }
+  /** `mine`, the way the server's `visibleTo` reads it for `people.me`: about me, or with an item of mine. */
+  const checklistIsMine = (row: ChecklistRow) => {
+    const me = people[0]!.id
+    return row.personId === me || row.items.some((i) => i.assigneePersonId === me)
   }
 
   return {
@@ -5391,6 +5770,261 @@ export function createMockHrApi() {
     },
 
     /**
+     * Onboarding and offboarding checklists, on the service's three positions: a template is copied
+     * at start and never read again, the list's status follows its items, and every refusal is the
+     * server's own sentence with the server's own reason. The reader is `people.me` and manages
+     * checklists, which is what a demo account does; the visibility narrowing `mine` performs is
+     * still applied, because the widget and My tasks are built on it.
+     */
+    checklists: {
+      templates: {
+        list: async ({
+          workspaceId,
+          includeArchived = false,
+        }: {
+          workspaceId: string
+          includeArchived?: boolean
+        }) =>
+          checklistTemplates
+            .filter((tpl) => includeArchived || tpl.archivedAt === null)
+            .map((tpl) => ({ ...clone(tpl), workspaceId })),
+
+        create: async (input: { workspaceId: string } & ChecklistTemplateInput) => {
+          checkTemplateItems(input.items)
+          const created: Row<ChecklistTemplate> = {
+            id: crypto.randomUUID(),
+            name: input.name,
+            kind: input.kind,
+            isDefault: input.isDefault ?? false,
+            items: templateItemsFrom(input.items),
+            archivedAt: null,
+            createdAt: iso(),
+            updatedAt: iso(),
+          }
+          if (created.isDefault) clearDefaultTemplate(created.kind, created.id)
+          checklistTemplates.push(created)
+          return { ...clone(created), workspaceId: input.workspaceId }
+        },
+
+        update: async (
+          input: { workspaceId: string; templateId: string } & Partial<ChecklistTemplateInput>,
+        ) => {
+          const found = checklistTemplates.find((tpl) => tpl.id === input.templateId)
+          if (!found) refuse('NOT_FOUND', 'Checklist template not found')
+          if (input.items) checkTemplateItems(input.items)
+          const isDefault = input.isDefault ?? found.isDefault
+          if (isDefault && found.archivedAt)
+            refuse(
+              'CONFLICT',
+              'An archived template cannot be the default. Restore it first.',
+              'hr.checklist.template_archived',
+            )
+          if (input.name !== undefined) found.name = input.name
+          if (input.kind !== undefined) found.kind = input.kind
+          found.isDefault = isDefault
+          if (isDefault) clearDefaultTemplate(found.kind, found.id)
+          if (input.items) found.items = templateItemsFrom(input.items)
+          found.updatedAt = iso()
+          return { ...clone(found), workspaceId: input.workspaceId }
+        },
+
+        /** Archiving takes the default flag with it; nothing auto-starts from a template nobody can see. */
+        archive: async ({
+          workspaceId,
+          templateId,
+          archived = true,
+        }: {
+          workspaceId: string
+          templateId: string
+          archived?: boolean
+        }) => {
+          const found = checklistTemplates.find((tpl) => tpl.id === templateId)
+          if (!found) refuse('NOT_FOUND', 'Checklist template not found')
+          found.archivedAt = archived ? iso() : null
+          if (archived) found.isDefault = false
+          found.updatedAt = iso()
+          return { ...clone(found), workspaceId }
+        },
+      },
+
+      list: async ({
+        workspaceId,
+        personId,
+        status,
+        kind,
+        mine = false,
+        limit = 50,
+      }: {
+        workspaceId: string
+        personId?: string
+        status?: ChecklistStatus
+        kind?: ChecklistKind
+        mine?: boolean
+        limit?: number
+      }) =>
+        checklistRows
+          .filter((row) => !personId || row.personId === personId)
+          .filter((row) => !status || row.status === status)
+          .filter((row) => !kind || row.kind === kind)
+          .filter((row) => !mine || checklistIsMine(row))
+          .sort((a, b) => (a.startedAt < b.startedAt ? 1 : -1))
+          .slice(0, limit)
+          .map((row) => checklistSummary(row, workspaceId)),
+
+      get: async ({ workspaceId, checklistId }: { workspaceId: string; checklistId: string }) => {
+        const found = checklistRows.find((row) => row.id === checklistId)
+        if (!found) refuse('NOT_FOUND', 'Checklist not found')
+        return checklistOut(found, workspaceId)
+      },
+
+      /**
+       * The template as it stands today, copied: assignees resolved now, due dates counted from the
+       * anchor — the hire date for onboarding, today for offboarding (nobody here has a leaving date).
+       */
+      start: async ({
+        workspaceId,
+        personId,
+        templateId,
+        anchorDate,
+      }: {
+        workspaceId: string
+        personId: string
+        templateId: string
+        anchorDate?: string
+      }) => {
+        const template = checklistTemplates.find((tpl) => tpl.id === templateId)
+        if (!template) refuse('NOT_FOUND', 'Checklist template not found')
+        if (template.archivedAt)
+          refuse(
+            'CONFLICT',
+            'This template is archived. Restore it before starting a checklist from it.',
+            'hr.checklist.template_archived',
+          )
+        const subject = people.find((p) => p.id === personId)
+        if (!subject) refuse('NOT_FOUND', 'Person not found')
+        const anchor = anchorDate ?? (template.kind === 'onboarding' ? (subject.hiredOn ?? day(0)) : day(0))
+        const managerId = managerOf(personId)
+        const checklistId = crypto.randomUUID()
+        const created: ChecklistRow = {
+          id: checklistId,
+          personId,
+          templateId: template.id,
+          name: template.name,
+          kind: template.kind,
+          anchorDate: anchor,
+          status: template.items.length ? 'open' : 'done',
+          startedBy: null,
+          startedAt: iso(),
+          completedAt: template.items.length ? null : iso(),
+          cancelledAt: null,
+          items: template.items.map((item) => ({
+            id: crypto.randomUUID(),
+            checklistId,
+            title: item.title,
+            description: item.description,
+            assigneePersonId:
+              item.assignee === 'person'
+                ? personId
+                : item.assignee === 'manager'
+                  ? managerId
+                  : item.assignee === 'specific'
+                    ? item.assigneePersonId
+                    : null,
+            dueOn: new Date(Date.parse(`${anchor}T00:00:00Z`) + item.dueOffsetDays * 86_400_000)
+              .toISOString()
+              .slice(0, 10),
+            order: item.order,
+            doneAt: null,
+            doneBy: null,
+            note: null,
+          })),
+        }
+        checklistRows.push(created)
+        return checklistOut(created, workspaceId)
+      },
+
+      /** Nothing is deleted: the list stays, marked cancelled, with whatever was ticked. */
+      cancel: async ({ workspaceId, checklistId }: { workspaceId: string; checklistId: string }) => {
+        const found = loadOpenChecklist(checklistId)
+        found.status = 'cancelled'
+        found.cancelledAt = iso()
+        return checklistOut(found, workspaceId)
+      },
+
+      items: {
+        complete: async ({
+          workspaceId,
+          itemId,
+          note = null,
+        }: {
+          workspaceId: string
+          itemId: string
+          note?: string | null
+        }) => {
+          const { item, checklist } = loadChecklistItem(itemId)
+          if (item.doneAt) refuse('CONFLICT', 'This task is already done.', 'hr.checklist.already_done')
+          item.doneAt = iso()
+          item.note = note ?? item.note
+          settleChecklist(checklist)
+          return checklistOut(checklist, workspaceId)
+        },
+
+        reopen: async ({ workspaceId, itemId }: { workspaceId: string; itemId: string }) => {
+          const { item, checklist } = loadChecklistItem(itemId)
+          if (!item.doneAt) refuse('CONFLICT', 'This task is not done yet.', 'hr.checklist.not_done')
+          item.doneAt = null
+          item.doneBy = null
+          settleChecklist(checklist)
+          return checklistOut(checklist, workspaceId)
+        },
+
+        assign: async ({
+          workspaceId,
+          itemId,
+          assigneePersonId,
+        }: {
+          workspaceId: string
+          itemId: string
+          assigneePersonId: string | null
+        }) => {
+          const { item, checklist } = loadChecklistItem(itemId)
+          if (assigneePersonId && !people.some((p) => p.id === assigneePersonId))
+            refuse('NOT_FOUND', 'Person not found')
+          item.assigneePersonId = assigneePersonId
+          return checklistOut(checklist, workspaceId)
+        },
+
+        /** A finished list that gains a task is open again; `settleChecklist` says so. */
+        add: async (input: { workspaceId: string; checklistId: string } & ChecklistItemInput) => {
+          const checklist = loadOpenChecklist(input.checklistId)
+          if (input.assigneePersonId && !people.some((p) => p.id === input.assigneePersonId))
+            refuse('NOT_FOUND', 'Person not found')
+          checklist.items.push({
+            id: crypto.randomUUID(),
+            checklistId: checklist.id,
+            title: input.title,
+            description: input.description ?? null,
+            assigneePersonId: input.assigneePersonId ?? null,
+            dueOn: input.dueOn ?? null,
+            order: Math.max(-1, ...checklist.items.map((i) => i.order)) + 1,
+            doneAt: null,
+            doneBy: null,
+            note: null,
+          })
+          settleChecklist(checklist)
+          return checklistOut(checklist, input.workspaceId)
+        },
+
+        remove: async ({ workspaceId, itemId }: { workspaceId: string; itemId: string }) => {
+          const { item, checklist } = loadChecklistItem(itemId)
+          checklist.items.splice(checklist.items.indexOf(item), 1)
+          settleChecklist(checklist)
+          return checklistOut(checklist, workspaceId)
+        },
+      },
+    },
+
+    /**
      * Subject access, erasure and retention, on the same positions the server takes: nothing is
      * deleted, an erasure clears columns and reports what stayed, a preview and a run are one
      * predicate, and an export is a logged read of the sensitive record.
@@ -5401,16 +6035,28 @@ export function createMockHrApi() {
           retentionState(workspaceId, withCounts),
         set: async ({
           workspaceId,
-          retention: patch,
+          retention: patch = {},
+          sweepEnabled,
         }: {
           workspaceId: string
-          retention: Partial<Record<RetentionClass, number | null>>
+          retention?: Partial<Record<RetentionClass, number | null>>
+          sweepEnabled?: boolean
         }) => {
           // A field left out is unchanged; a field sent as null goes back to "keep indefinitely".
           for (const [key, value] of Object.entries(patch)) retention[key as RetentionClass] = value ?? null
+          if (sweepEnabled !== undefined) retentionSweepEnabled = sweepEnabled
           retentionUpdatedAt = iso()
           retentionUpdatedBy = HR_ACCOUNT
           return retentionState(workspaceId, false)
+        },
+        run: async ({ workspaceId, dryRun = true }: { workspaceId: string; dryRun?: boolean }) =>
+          sweep(workspaceId, dryRun, HR_ACCOUNT),
+        runs: {
+          list: async ({ workspaceId, limit = 50 }: { workspaceId: string; limit?: number }) =>
+            retentionRuns
+              .filter((r) => r.workspaceId === workspaceId)
+              .slice(0, limit)
+              .map(clone),
         },
       },
 

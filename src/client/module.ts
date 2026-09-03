@@ -79,6 +79,17 @@ export const hrClientModule = defineClientModule({
       },
     },
     {
+      path: '/hr/checklists',
+      component: () => import('./pages/ChecklistsPage.svelte'),
+      get title() {
+        return t('checklists_title')
+      },
+      // `checklistView` ships to everybody: the page is "my tasks" for most readers, and the
+      // server narrows what a non-manager sees rather than the route refusing them.
+      permission: HR_PERMISSIONS.checklistView,
+      capability: HR_CAPABILITIES.checklists,
+    },
+    {
       path: '/hr/offices',
       component: () => import('./pages/OfficesPage.svelte'),
       get title() {
@@ -184,6 +195,22 @@ export const hrClientModule = defineClientModule({
       component: () => import('./widgets/ApprovalsWidget.svelte'),
     },
     {
+      id: 'hr.checklist-tasks',
+      get title() {
+        return t('widget_checklist_title')
+      },
+      get description() {
+        return t('widget_checklist_desc')
+      },
+      icon: 'list-checks',
+      permission: HR_PERMISSIONS.checklistView,
+      capability: HR_CAPABILITIES.checklists,
+      sizes: ['s', 'm', 'l'],
+      defaultSize: 'm',
+      order: 45,
+      component: () => import('./widgets/ChecklistTasksWidget.svelte'),
+    },
+    {
       id: 'hr.headcount',
       get title() {
         return t('widget_headcount_title')
@@ -238,6 +265,16 @@ export const hrClientModule = defineClientModule({
       },
       icon: 'check-check',
       run: (ctx) => ctx.navigate('/hr/approvals'),
+    },
+    {
+      id: 'hr.checklists',
+      get label() {
+        return t('cmd_checklists')
+      },
+      icon: 'list-checks',
+      permission: HR_PERMISSIONS.checklistView,
+      capability: HR_CAPABILITIES.checklists,
+      run: (ctx) => ctx.navigate('/hr/checklists'),
     },
     {
       id: 'hr.reports',
@@ -428,6 +465,21 @@ export const hrClientModule = defineClientModule({
       capability: HR_CAPABILITIES.leaveAccrual,
       order: 35,
       component: () => import('./settings/AccrualSettings.svelte'),
+    },
+    {
+      // Between rosters and approvals: a template is about people joining and leaving, which is the
+      // directory's business rather than attendance's, and it is read before anybody thinks about
+      // who signs what.
+      id: 'checklists',
+      get label() {
+        return t('settings_checklists')
+      },
+      icon: 'clipboard-list',
+      scope: 'workspace',
+      permission: HR_PERMISSIONS.checklistManage,
+      capability: HR_CAPABILITIES.checklists,
+      order: 55,
+      component: () => import('./settings/ChecklistsSettings.svelte'),
     },
     {
       id: 'approvals',

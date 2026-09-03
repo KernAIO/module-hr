@@ -361,6 +361,35 @@ describe('the privacy surface', () => {
     expect(parsed.keepNationalIdForAudit).toBe(false)
   })
 
+  it('leaves the classes a retention write does not name alone', () => {
+    // `HrRetention.partial()` keeps every field's `.default(null)`, so a write naming one class
+    // came out of the parser naming all eight — seven of them as "keep indefinitely". The screen
+    // only ever sends what moved, so saving one horizon reset the rest. The write shape has no
+    // defaults, and this is the assertion that it stays that way.
+    const input = hrContract.privacy.retention.set['~orpc'].inputSchema as {
+      parse: (v: unknown) => { retention: Record<string, unknown>; sweepEnabled?: boolean }
+    }
+    const one = input.parse({
+      workspaceId: '0193f2a1-0000-7000-8000-000000000000',
+      retention: { punches: 30 },
+    })
+    expect(one.retention).toEqual({ punches: 30 })
+    expect(one.sweepEnabled).toBeUndefined()
+    // And the switch alone says nothing about any horizon.
+    const flag = input.parse({ workspaceId: '0193f2a1-0000-7000-8000-000000000000', sweepEnabled: true })
+    expect(flag.retention).toEqual({})
+    expect(flag.sweepEnabled).toBe(true)
+  })
+
+  it('makes the sweep a dry run unless the caller asks for the act', () => {
+    // The same property `erase` has, for the same reason: `POST /privacy/retention/run` is
+    // agent-callable the day it ships, and with no arguments it must preview and not prune.
+    const input = hrContract.privacy.retention.run['~orpc'].inputSchema as {
+      parse: (v: unknown) => { dryRun: boolean }
+    }
+    expect(input.parse({ workspaceId: '0193f2a1-0000-7000-8000-000000000000' }).dryRun).toBe(true)
+  })
+
   it('puts none of it behind a capability', () => {
     // A workspace that could switch privacy off would be one that stopped honouring subject
     // requests, which fails the capability registry's own rule that a switch must be reversible
@@ -373,6 +402,8 @@ describe('the privacy surface', () => {
       'privacy.accessLog.list',
       'privacy.retention.get',
       'privacy.retention.set',
+      'privacy.retention.run',
+      'privacy.retention.runs.list',
     ])
       expect(gated.has(name), name).toBe(false)
   })

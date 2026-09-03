@@ -31,6 +31,8 @@ import type {
   ErasureReport,
   RetentionBasis,
   RetentionClass,
+  RetentionClassRun,
+  RetentionRun,
   SubjectAccessManifest,
 } from '../../contract/privacy.js'
 import { getHrApi } from '../api-instance.js'
@@ -46,8 +48,9 @@ import { hrKeys, isoDate } from '../query.js'
  * This is the most consequential screen in the module and it is built on three positions the
  * server already took, each of which the page has to keep visible rather than merely obey:
  *
- * - **Nothing here deletes.** Retention horizons are counted, not acted on — `sweepEnabled` is
- *   `false` and the page says so in a sentence rather than hiding the fact in a tooltip. Erasure
+ * - **Nothing here deletes unless the sweep is on.** Retention horizons are counted; acting on them
+ *   is a switch an administrator turns, and the page says which it is in a sentence rather than
+ *   hiding the fact in a tooltip. The sweep itself previews first, like the erasure. Erasure
  *   clears the columns that identify a person and leaves every record a wage, an entitlement or an
  *   authorisation was computed from; the report's `kept` half is rendered as prominently as its
  *   `redacted` half, because an erasure that silently retains is the same failure as an export that
@@ -258,6 +261,122 @@ function runSaveRetention() {
   saveError = null
   saveRetention.mutate()
 }
+
+// ====================================================================================
+// the sweep
+// ====================================================================================
+
+/**
+ * The one unattended act in HR that re-running nothing can undo, so the screen is built the way the
+ * erasure below is: a dry run first, a preview that names every class and every count, a
+ * confirmation that restates what goes, and a list of every run — dry, real, nightly, by hand — so
+ * "what did the sweep do last night" is answered here and not in a log.
+ *
+ * The dry run is pinned to the horizons it was computed against. Change a horizon and the preview
+ * is stale: **Run now** is withdrawn until it is run again, because the sentence on the confirm
+ * dialog says "the last dry run says", and that has to be true of the horizons in force.
+ */
+const sweepOn = $derived(retention?.sweepEnabled ?? false)
+/** Whether any class has a horizon at all — a sweep with none set does nothing, and says so. */
+const anyHorizon = $derived(CLASSES.some((c) => stored[c] !== null))
+
+let switching = $state(false)
+let switchError = $state<string | null>(null)
+
+const setSweep = createMutation(() => ({
+  mutationFn: (enabled: boolean) =>
+    api.privacy.retention.set({ workspaceId, retention: {}, sweepEnabled: enabled }),
+  onSuccess: (data) => {
+    switchError = null
+    queryClient.setQueryData(hrKeys.retention(workspaceId), data)
+    void queryClient.invalidateQueries({ queryKey: hrKeys.retention(workspaceId) })
+    toast.success(t(data.sweepEnabled ? 'privacy_sweep_on' : 'privacy_sweep_off'))
+  },
+  onError: (err) => {
+    switchError = explainRefusal(err, t('privacy_sweep_switch_error'))
+  },
+  onSettled: () => {
+    switching = false
+  },
+}))
+
+function toggleSweep(enabled: boolean) {
+  if (switching || !manage) return
+  switching = true
+  switchError = null
+  setSweep.mutate(enabled)
+}
+
+/** The last dry run, and the horizons it was computed against. */
+let sweepPreview = $state<RetentionRun | null>(null)
+let sweepPreviewAgainst = $state<string>('')
+/** The last real run this screen performed, shown until the next dry run replaces it. */
+let swept = $state<RetentionRun | null>(null)
+let sweeping = $state<'dry' | 'real' | null>(null)
+let sweepError = $state<string | null>(null)
+let confirmSweep = $state(false)
+
+const horizonKey = $derived(CLASSES.map((c) => `${c}=${stored[c] ?? ''}`).join(','))
+const sweepPreviewStale = $derived(sweepPreview !== null && sweepPreviewAgainst !== horizonKey)
+/** Anything at all would go: the confirm button is offered only when the dry run found something. */
+const sweepPreviewHasWork = $derived((sweepPreview?.classes ?? []).some((c) => c.affected > 0))
+
+const runSweep = createMutation(() => ({
+  mutationFn: (dryRun: boolean) => api.privacy.retention.run({ workspaceId, dryRun }),
+  onSuccess: (run, dryRun) => {
+    sweepError = null
+    if (dryRun) {
+      sweepPreview = run
+      sweepPreviewAgainst = horizonKey
+      swept = null
+    } else {
+      swept = run
+      sweepPreview = null
+      confirmSweep = false
+      // Rows are gone: the counts beside every horizon, the runs list, and any person card the
+      // sweep redacted all have to be read again.
+      void queryClient.invalidateQueries({ queryKey: hrKeys.retention(workspaceId) })
+      void queryClient.invalidateQueries({ queryKey: hrKeys.people(workspaceId) })
+    }
+    void queryClient.invalidateQueries({ queryKey: hrKeys.retentionRuns(workspaceId) })
+  },
+  onError: (err, dryRun) => {
+    sweepError = explainRefusal(err, t(dryRun ? 'privacy_sweep_dry_error' : 'privacy_sweep_run_error'))
+    confirmSweep = false
+    void queryClient.invalidateQueries({ queryKey: hrKeys.retentionRuns(workspaceId) })
+  },
+  onSettled: () => {
+    sweeping = null
+  },
+}))
+
+function dryRunNow() {
+  if (sweeping || !manage) return
+  sweeping = 'dry'
+  sweepError = null
+  runSweep.mutate(true)
+}
+
+function sweepNow() {
+  if (sweeping || !manage || !sweepPreview || sweepPreviewStale) return
+  sweeping = 'real'
+  sweepError = null
+  runSweep.mutate(false)
+}
+
+const runsQuery = createQuery(() => ({
+  queryKey: hrKeys.retentionRuns(workspaceId),
+  enabled: Boolean(workspaceId) && manage,
+  queryFn: () => api.privacy.retention.runs.list({ workspaceId, limit: 20 }),
+}))
+const runs = $derived<RetentionRun[]>(runsQuery.data ?? [])
+
+/** "3 punches · 12 day sheets", the classes a run touched, in the order the table above shows them. */
+const affectedSummary = (classes: RetentionClassRun[]): string =>
+  classes
+    .filter((c) => c.affected > 0)
+    .map((c) => `${CLASS_LABEL[c.class]()} ${num(c.affected)}`)
+    .join(' · ')
 
 // ====================================================================================
 // the person pickers
@@ -585,6 +704,136 @@ const withRows = (rows: ErasureReport['redacted']) =>
     {/if}
   </SettingsSection>
 
+  <!-- ================================================================ the sweep -->
+  {#if manage && retention}
+    <SettingsSection title={t('privacy_sweep_title')} description={t('privacy_sweep_switch_desc')}>
+      <div class="sweep-switch">
+        <Switch
+          checked={sweepOn}
+          label={t('privacy_sweep_switch')}
+          disabled={!manage}
+          onCheckedChange={(next) => toggleSweep(next)}
+        />
+      </div>
+      {#if switchError}
+        <p class="save-error" role="alert">{switchError}</p>
+      {/if}
+      {#if sweepOn}
+        <p class="note warn">
+          <Icon name="info" size={14} strokeWidth={1.7} />
+          <span>{t('privacy_sweep_active')}</span>
+        </p>
+      {/if}
+      {#if !anyHorizon}
+        <p class="note">{t('privacy_sweep_none')}</p>
+      {/if}
+
+      <div class="sweep-actions">
+        <Button size="sm" variant="secondary" onclick={dryRunNow} loading={sweeping === 'dry'} disabled={!anyHorizon}>
+          {t('privacy_sweep_dry_run')}
+        </Button>
+        {#if sweepPreview && sweepPreviewHasWork && !sweepPreviewStale}
+          <Button size="sm" variant="danger" onclick={() => (confirmSweep = true)} loading={sweeping === 'real'}>
+            {t('privacy_sweep_run')}
+          </Button>
+        {/if}
+      </div>
+      {#if sweepError}
+        <p class="save-error" role="alert">{sweepError}</p>
+      {/if}
+
+      {#if sweepPreview}
+        <div class="report">
+          <p class="report-lead">
+            <Icon name="eye" size={14} strokeWidth={1.8} />
+            <span>{t('privacy_sweep_dry_lead')}</span>
+          </p>
+          {#if sweepPreviewStale}
+            <p class="note warn"><span>{t('privacy_sweep_stale')}</span></p>
+          {/if}
+          {#if sweepPreview.classes.length === 0 || !sweepPreviewHasWork}
+            <p class="note">{t('privacy_sweep_nothing')}</p>
+          {:else}
+            <Table columns="minmax(0, 2fr) 1fr 1fr 1fr" ariaLabel={t('privacy_sweep_dry_lead')}>
+              <TableHeader>
+                <TableCell header>{t('privacy_col_class')}</TableCell>
+                <TableCell header end>{t('privacy_sweep_col_matched')}</TableCell>
+                <TableCell header end>{t('privacy_sweep_col_would')}</TableCell>
+                <TableCell header end>{t('privacy_sweep_col_locked')}</TableCell>
+              </TableHeader>
+              {#each sweepPreview.classes as row (row.class)}
+                <TableRow>
+                  <TableCell>{CLASS_LABEL[row.class]()}</TableCell>
+                  <TableCell end><span class="tabular">{num(row.matched)}</span></TableCell>
+                  <TableCell end><span class="tabular" class:hot={row.affected > 0}>{num(row.affected)}</span></TableCell>
+                  <TableCell end><span class="tabular">{num(row.skippedLocked)}</span></TableCell>
+                </TableRow>
+              {/each}
+            </Table>
+            <p class="note">{t('privacy_sweep_people', { count: sweepPreview.personIds.length })}</p>
+          {/if}
+        </div>
+      {/if}
+
+      {#if swept}
+        <div class="report final">
+          <p class="report-lead">
+            <Icon name="check" size={14} strokeWidth={1.8} />
+            <span>{t('privacy_sweep_done_lead', { when: formatDateTime(swept.finishedAt ?? swept.startedAt) })}</span>
+          </p>
+          <p class="note">{affectedSummary(swept.classes) || t('privacy_sweep_nothing')}</p>
+          <p class="note">{t('privacy_sweep_people', { count: swept.personIds.length })}</p>
+          {#if swept.fileIds.length}
+            <p class="note">{t('privacy_sweep_files', { count: swept.fileIds.length })}</p>
+          {/if}
+        </div>
+      {/if}
+
+      <h3 class="kern-sublabel runs-title">{t('privacy_sweep_runs_title')}</h3>
+      {#if runsQuery.isLoading}
+        <Skeleton lines={3} />
+      {:else if runsQuery.isError}
+        <EmptyState compact icon="triangle-alert" title={t('privacy_sweep_runs_error')}>
+          {#snippet actions()}
+            <Button size="sm" variant="secondary" onclick={() => void runsQuery.refetch()}>{t('retry')}</Button>
+          {/snippet}
+        </EmptyState>
+      {:else if runs.length === 0}
+        <p class="note">{t('privacy_sweep_runs_empty')}</p>
+      {:else}
+        <Table columns="minmax(0, 1.2fr) 0.8fr minmax(0, 2fr) 0.7fr" ariaLabel={t('privacy_sweep_runs_title')}>
+          <TableHeader>
+            <TableCell header>{t('privacy_sweep_col_when')}</TableCell>
+            <TableCell header>{t('privacy_sweep_col_kind')}</TableCell>
+            <TableCell header>{t('privacy_sweep_col_classes')}</TableCell>
+            <TableCell header end>{t('privacy_sweep_col_people')}</TableCell>
+          </TableHeader>
+          {#each runs as run (run.id)}
+            <TableRow>
+              <TableCell>
+                <span class="stack">
+                  <span>{formatDateTime(run.startedAt)}</span>
+                  <span class="muted">{run.startedBy ? t('privacy_sweep_by_hand') : t('privacy_sweep_by_job')}</span>
+                </span>
+              </TableCell>
+              <TableCell>
+                {#if run.error}
+                  <span class="hot">{t('privacy_sweep_failed')}</span>
+                {:else}
+                  {t(run.dryRun ? 'privacy_sweep_kind_dry' : 'privacy_sweep_kind_real')}
+                {/if}
+              </TableCell>
+              <TableCell>
+                <span class="wrap">{run.error ?? (affectedSummary(run.classes) || t('privacy_sweep_nothing'))}</span>
+              </TableCell>
+              <TableCell end><span class="tabular">{num(run.personIds.length)}</span></TableCell>
+            </TableRow>
+          {/each}
+        </Table>
+      {/if}
+    </SettingsSection>
+  {/if}
+
   <!-- ================================================================ subject access -->
   <SettingsSection title={t('privacy_sar_title')} description={t('privacy_sar_desc')}>
     <div class="form">
@@ -720,6 +969,39 @@ const withRows = (rows: ErasureReport['redacted']) =>
     </div>
   </SettingsSection>
 </SettingsPage>
+
+<!-- The sweep's confirmation: what the last dry run said will go, class by class, and no undo. -->
+<Dialog
+  open={confirmSweep}
+  size="sm"
+  title={t('privacy_sweep_confirm_title')}
+  onOpenChange={(open) => {
+    if (!open && sweeping !== 'real') confirmSweep = false
+  }}
+>
+  <div class="form">
+    <p class="note">{t('privacy_sweep_confirm_body')}</p>
+    {#if sweepPreview}
+      <ul class="sweep-list">
+        {#each sweepPreview.classes.filter((c) => c.affected > 0) as row (row.class)}
+          <li>
+            <span>{CLASS_LABEL[row.class]()}</span>
+            <span class="tabular hot">{num(row.affected)}</span>
+          </li>
+        {/each}
+      </ul>
+      <p class="note">{t('privacy_sweep_people', { count: sweepPreview.personIds.length })}</p>
+    {/if}
+  </div>
+  {#snippet footer()}
+    <Button variant="ghost" onclick={() => (confirmSweep = false)} disabled={sweeping === 'real'}>
+      {t('common.cancel')}
+    </Button>
+    <Button variant="danger" onclick={sweepNow} loading={sweeping === 'real'}>
+      {t('privacy_sweep_confirm_button')}
+    </Button>
+  {/snippet}
+</Dialog>
 
 <Dialog
   open={confirmOpen}
@@ -1033,4 +1315,39 @@ const withRows = (rows: ErasureReport['redacted']) =>
   font-weight: 600;
   color: var(--kern-ink-900);
 }
+  .sweep-switch {
+    padding: 4px 0 8px;
+  }
+  .sweep-actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin: 10px 0 4px;
+  }
+  .runs-title {
+    margin: 18px 0 8px;
+  }
+  .stack {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+  }
+  .wrap {
+    overflow-wrap: anywhere;
+  }
+  .sweep-list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    font-size: 13px;
+  }
+  .sweep-list li {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+  }
 </style>

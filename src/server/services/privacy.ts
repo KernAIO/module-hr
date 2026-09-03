@@ -191,6 +191,78 @@ export const RETENTION_CLASSES = [
   'sensitiveAccessLog',
 ] as const
 
+/** A workspace's horizons as stored, with the switch and the last write. */
+export interface RetentionRow {
+  retention: HrRetention
+  updatedAt: Date | null
+  updatedBy: string | null
+  sweepEnabled: boolean
+}
+
+/** One workspace, one day: the boundary a class is measured against. */
+export interface RetentionScope {
+  workspaceId: string
+  /** `YYYY-MM-DD`. A row dated strictly before it has passed the horizon. */
+  cutoff: string
+}
+
+/** A `date` column is compared as a date; a `timestamptz` column as the UTC midnight that opens it. */
+const opens = (cutoff: string): Date => new Date(`${cutoff}T00:00:00Z`)
+
+/**
+ * What is past a horizon, per class — **the one predicate each class has.**
+ *
+ * `retentionCounts` counts these and `RetentionSweep` acts on them, and there is no third copy: a
+ * settings screen that says "412 already past" and a sweep that then touches 380 is the retention
+ * version of a preview that lies, which is the defect `accrual.preview` and `privacy.erase` are both
+ * written against. So the predicates live here, once, and the two readers import them.
+ *
+ * `leave` is two tables, and the ledger half is measured in **whole period years** rather than by
+ * `effective_on`. A balance is the sum of one year's ledger and nothing else; the carry into the
+ * next year is written as a `carry_in` row *in that next year*, so a year that lies wholly before
+ * the horizon can go without moving any balance that remains, and a year cut part-way through
+ * cannot — its sum would be wrong for as long as it was still readable. `period_year < year(cutoff)`
+ * is exactly "every entry of this year is dated before the cutoff". Requests are measured by the
+ * day they ended, which is the ordinary reading; the days behind a request follow it.
+ */
+export const retentionWhere = {
+  punchDetail: ({ workspaceId, cutoff }: RetentionScope) =>
+    and(
+      eq(punches.workspaceId, workspaceId),
+      lt(punches.businessDate, cutoff),
+      or(isNotNull(punches.geo), isNotNull(punches.deviceId), isNotNull(punches.note)),
+    ),
+  punches: ({ workspaceId, cutoff }: RetentionScope) =>
+    and(eq(punches.workspaceId, workspaceId), lt(punches.businessDate, cutoff)),
+  attendanceDays: ({ workspaceId, cutoff }: RetentionScope) =>
+    and(
+      eq(attendanceDays.workspaceId, workspaceId),
+      lt(attendanceDays.businessDate, cutoff),
+      eq(attendanceDays.locked, false),
+    ),
+  leaveLedger: ({ workspaceId, cutoff }: RetentionScope) =>
+    and(eq(leaveLedger.workspaceId, workspaceId), lt(leaveLedger.periodYear, Number(cutoff.slice(0, 4)))),
+  leaveRequests: ({ workspaceId, cutoff }: RetentionScope) =>
+    and(eq(leaveRequests.workspaceId, workspaceId), lt(leaveRequests.endsOn, cutoff)),
+  personHistory: ({ workspaceId, cutoff }: RetentionScope) =>
+    and(
+      eq(personHistory.workspaceId, workspaceId),
+      lt(personHistory.at, opens(cutoff)),
+      or(isNotNull(personHistory.from), isNotNull(personHistory.to)),
+    ),
+  personDocuments: ({ workspaceId, cutoff }: RetentionScope) =>
+    and(eq(personDocuments.workspaceId, workspaceId), lt(personDocuments.createdAt, opens(cutoff))),
+  terminatedPeople: ({ workspaceId, cutoff }: RetentionScope) =>
+    and(
+      eq(people.workspaceId, workspaceId),
+      isNotNull(people.terminatedOn),
+      lt(people.terminatedOn, cutoff),
+      isNull(people.erasedAt),
+    ),
+  sensitiveAccessLog: ({ workspaceId, cutoff }: RetentionScope) =>
+    and(eq(sensitiveAccessLog.workspaceId, workspaceId), lt(sensitiveAccessLog.at, opens(cutoff))),
+}
+
 /** Null everywhere: the shipped state, and the one this module refuses to guess a number for. */
 export const EMPTY_RETENTION: HrRetention = {
   punchDetail: null,
@@ -275,10 +347,7 @@ export class PrivacyService {
   // ------------------------------------------------------------------ retention
 
   /** The stored horizons, defaulted. A workspace that has never set one gets nulls, not numbers. */
-  async retention(
-    tx: Tx,
-    workspaceId: string,
-  ): Promise<{ retention: HrRetention; updatedAt: Date | null; updatedBy: string | null }> {
+  async retention(tx: Tx, workspaceId: string): Promise<RetentionRow> {
     const [row] = await tx
       .select()
       .from(retentionSettings)
@@ -288,46 +357,58 @@ export class PrivacyService {
       retention: { ...EMPTY_RETENTION, ...(row?.config ?? {}) },
       updatedAt: row?.updatedAt ?? null,
       updatedBy: row?.updatedBy ?? null,
+      sweepEnabled: row?.sweepEnabled ?? false,
     }
   }
 
   /**
-   * Patch the horizons.
+   * Patch the horizons, and the switch.
    *
    * A field left out is unchanged and a field sent as `null` goes back to "keep indefinitely", which
    * is the same reading `core.settings.setModule` gives a partial write — a caller that has nothing
-   * to say about a class must not silently reset it.
+   * to say about a class must not silently reset it. `sweepEnabled` left out is unchanged for the
+   * same reason: the screen that saves horizons is not the control that turns the sweep on.
    */
   async setRetention(
     tx: Tx,
     workspaceId: string,
     patch: Partial<HrRetention>,
     actorUserId: string | null,
-  ): Promise<{ retention: HrRetention; updatedAt: Date | null; updatedBy: string | null }> {
+    sweepEnabled?: boolean,
+  ): Promise<RetentionRow> {
     const current = await this.retention(tx, workspaceId)
     const config: Record<string, number | null> = { ...current.retention }
     for (const [key, value] of Object.entries(patch)) config[key] = value ?? null
+    const enabled = sweepEnabled ?? current.sweepEnabled
     const updatedAt = new Date()
     await tx
       .insert(retentionSettings)
-      .values({ workspaceId, config, updatedAt, updatedBy: actorUserId })
+      .values({ workspaceId, config, updatedAt, updatedBy: actorUserId, sweepEnabled: enabled })
       .onConflictDoUpdate({
         target: retentionSettings.workspaceId,
-        set: { config, updatedAt, updatedBy: actorUserId },
+        set: { config, updatedAt, updatedBy: actorUserId, sweepEnabled: enabled },
       })
-    return { retention: { ...EMPTY_RETENTION, ...config }, updatedAt, updatedBy: actorUserId }
+    return {
+      retention: { ...EMPTY_RETENTION, ...config },
+      updatedAt,
+      updatedBy: actorUserId,
+      sweepEnabled: enabled,
+    }
   }
 
   /**
-   * How much is already past each horizon — the dry run a retention screen shows before anything
-   * runs, and the only thing that reads these numbers today.
+   * How much is already past each horizon — the dry run a retention screen shows beside every
+   * horizon, and the number `RetentionSweep` will report as `matched` on the day it runs.
    *
    * Null for a class with no horizon set: there is nothing to be past. One query per class that has
    * one, which is why the caller asks for this rather than getting it on every read.
    *
-   * `attendanceDays` deliberately excludes locked days and `terminatedPeople` excludes anybody
-   * already erased, so the number is what a sweep *could* act on rather than what merely matches a
-   * date. A count that overstates is a count nobody trusts the second time they check it.
+   * Each count is `retentionWhere` for its class and nothing else, and the sweep reads the same
+   * table. `attendanceDays` therefore excludes days flagged locked and `terminatedPeople` excludes
+   * anybody already erased, so the number is what a sweep *could* act on rather than what merely
+   * matches a date. A count that overstates is a count nobody trusts the second time they check it.
+   * `punches` and `punchDetail` do not know about periods here — the sweep asks that question of
+   * each row and reports what it skipped, so the two numbers stay reconcilable on the run record.
    */
   async retentionCounts(
     tx: Tx,
@@ -338,110 +419,39 @@ export class PrivacyService {
     const out = {} as Record<RetentionClass, number | null>
     for (const cls of RETENTION_CLASSES) out[cls] = null
 
-    const one = async (cls: RetentionClass, run: (cutoff: string) => Promise<number>) => {
+    const one = async (cls: RetentionClass, run: (scope: RetentionScope) => Promise<number>) => {
       const days = retention[cls]
       if (days === null) return
-      out[cls] = await run(retentionCutoff(days, today))
+      out[cls] = await run({ workspaceId, cutoff: retentionCutoff(days, today) })
     }
+    const rows = (query: Promise<Array<{ n: number }>>) => total(query)
 
-    await one('punchDetail', (cutoff) =>
-      total(
-        tx
-          .select({ n: count() })
-          .from(punches)
-          .where(
-            and(
-              eq(punches.workspaceId, workspaceId),
-              lt(punches.businessDate, cutoff),
-              or(isNotNull(punches.geo), isNotNull(punches.deviceId), isNotNull(punches.note)),
-            ),
-          ),
-      ),
+    await one('punchDetail', (s) =>
+      rows(tx.select({ n: count() }).from(punches).where(retentionWhere.punchDetail(s))),
     )
-    await one('punches', (cutoff) =>
-      total(
-        tx
-          .select({ n: count() })
-          .from(punches)
-          .where(and(eq(punches.workspaceId, workspaceId), lt(punches.businessDate, cutoff))),
-      ),
+    await one('punches', (s) =>
+      rows(tx.select({ n: count() }).from(punches).where(retentionWhere.punches(s))),
     )
-    await one('attendanceDays', (cutoff) =>
-      total(
-        tx
-          .select({ n: count() })
-          .from(attendanceDays)
-          .where(
-            and(
-              eq(attendanceDays.workspaceId, workspaceId),
-              lt(attendanceDays.businessDate, cutoff),
-              eq(attendanceDays.locked, false),
-            ),
-          ),
-      ),
+    await one('attendanceDays', (s) =>
+      rows(tx.select({ n: count() }).from(attendanceDays).where(retentionWhere.attendanceDays(s))),
     )
-    await one('leave', (cutoff) =>
-      total(
-        tx
-          .select({ n: count() })
-          .from(leaveLedger)
-          .where(and(eq(leaveLedger.workspaceId, workspaceId), lt(leaveLedger.effectiveOn, cutoff))),
-      ),
+    await one(
+      'leave',
+      async (s) =>
+        (await rows(tx.select({ n: count() }).from(leaveLedger).where(retentionWhere.leaveLedger(s)))) +
+        (await rows(tx.select({ n: count() }).from(leaveRequests).where(retentionWhere.leaveRequests(s)))),
     )
-    await one('personHistory', (cutoff) =>
-      total(
-        tx
-          .select({ n: count() })
-          .from(personHistory)
-          .where(
-            and(
-              eq(personHistory.workspaceId, workspaceId),
-              lt(personHistory.at, new Date(`${cutoff}T00:00:00Z`)),
-              or(isNotNull(personHistory.from), isNotNull(personHistory.to)),
-            ),
-          ),
-      ),
+    await one('personHistory', (s) =>
+      rows(tx.select({ n: count() }).from(personHistory).where(retentionWhere.personHistory(s))),
     )
-    await one('personDocuments', (cutoff) =>
-      total(
-        tx
-          .select({ n: count() })
-          .from(personDocuments)
-          .where(
-            and(
-              eq(personDocuments.workspaceId, workspaceId),
-              lt(personDocuments.createdAt, new Date(`${cutoff}T00:00:00Z`)),
-            ),
-          ),
-      ),
+    await one('personDocuments', (s) =>
+      rows(tx.select({ n: count() }).from(personDocuments).where(retentionWhere.personDocuments(s))),
     )
-    await one('terminatedPeople', (cutoff) =>
-      total(
-        tx
-          .select({ n: count() })
-          .from(people)
-          .where(
-            and(
-              eq(people.workspaceId, workspaceId),
-              isNotNull(people.terminatedOn),
-              lt(people.terminatedOn, cutoff),
-              isNull(people.erasedAt),
-            ),
-          ),
-      ),
+    await one('terminatedPeople', (s) =>
+      rows(tx.select({ n: count() }).from(people).where(retentionWhere.terminatedPeople(s))),
     )
-    await one('sensitiveAccessLog', (cutoff) =>
-      total(
-        tx
-          .select({ n: count() })
-          .from(sensitiveAccessLog)
-          .where(
-            and(
-              eq(sensitiveAccessLog.workspaceId, workspaceId),
-              lt(sensitiveAccessLog.at, new Date(`${cutoff}T00:00:00Z`)),
-            ),
-          ),
-      ),
+    await one('sensitiveAccessLog', (s) =>
+      rows(tx.select({ n: count() }).from(sensitiveAccessLog).where(retentionWhere.sensitiveAccessLog(s))),
     )
     return out
   }

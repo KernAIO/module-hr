@@ -85,6 +85,20 @@
       "when": 1787864979651,
       "tag": "0012_rosters",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1788387758976,
+      "tag": "0013_checklists",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1788388558653,
+      "tag": "0014_retention_runs",
+      "breakpoints": true
     }
   ]
 }

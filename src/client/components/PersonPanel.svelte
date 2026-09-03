@@ -32,6 +32,7 @@ import {
   sameCustom,
 } from './custom-fields.js'
 import PersonAccessLogSection from './PersonAccessLogSection.svelte'
+import PersonChecklistsSection from './PersonChecklistsSection.svelte'
 import PersonDocumentsSection from './PersonDocumentsSection.svelte'
 import PersonJobSection from './PersonJobSection.svelte'
 import PersonSensitiveSection from './PersonSensitiveSection.svelte'
@@ -403,6 +404,7 @@ const hiddenHere = $derived(withheld && (!person?.phone || !person?.hiredOn))
     >
 
     <PersonJobSection {personId} {workspaceId} personName={person.displayName} />
+    <PersonChecklistsSection {personId} {workspaceId} personName={person.displayName} />
     <PersonSensitiveSection
       {personId}
       {workspaceId}

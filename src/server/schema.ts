@@ -1107,6 +1107,118 @@ export const rosterOverrides = schema.table(
 )
 
 // =====================================================================================
+// onboarding and offboarding checklists
+// =====================================================================================
+
+/**
+ * What a company does around somebody joining or leaving, as a template. `src/contract/checklists.ts`
+ * argues the shape; the one thing worth restating here is that a template is **copied** into
+ * `checklists` + `checklist_items` when it starts, so nothing below joins back to these two tables
+ * to render a running list, and editing a template touches no checklist.
+ */
+export const checklistTemplates = schema.table(
+  'checklist_templates',
+  {
+    id: id(),
+    workspaceId: ws(),
+    name: text('name').notNull(),
+    /** `ChecklistKind`: onboarding | offboarding. Text, not a pg enum, like every status here. */
+    kind: text('kind').notNull(),
+    /** Started automatically for a hire or a leaver. At most one per kind per workspace, enforced below. */
+    isDefault: boolean('is_default').notNull().default(false),
+    archivedAt: ts('archived_at'),
+    createdAt: created(),
+    updatedAt: updated(),
+  },
+  (t) => [
+    index('hr_checklist_templates_ws_idx').on(t.workspaceId, t.kind, t.name),
+    /**
+     * One default per kind, over the live rows — an archived template keeps its flag and is not
+     * a default of anything. The service clears the previous default in the same transaction;
+     * this is what makes that true whatever else reaches the table.
+     */
+    uniqueIndex('hr_checklist_templates_default_uq')
+      .on(t.workspaceId, t.kind)
+      .where(sql`is_default and archived_at is null`),
+  ],
+)
+
+export const checklistTemplateItems = schema.table(
+  'checklist_template_items',
+  {
+    id: id(),
+    workspaceId: ws(),
+    templateId: uuid('template_id').notNull(),
+    title: text('title').notNull(),
+    description: text('description'),
+    /** `ChecklistAssignee`: person | manager | hr | specific. */
+    assignee: text('assignee').notNull().default('hr'),
+    assigneePersonId: uuid('assignee_person_id'),
+    dueOffsetDays: integer('due_offset_days').notNull().default(0),
+    order: integer('order').notNull().default(0),
+  },
+  (t) => [index('hr_checklist_template_items_idx').on(t.workspaceId, t.templateId, t.order)],
+)
+
+export const checklists = schema.table(
+  'checklists',
+  {
+    id: id(),
+    workspaceId: ws(),
+    personId: uuid('person_id').notNull(),
+    /** Kept for "which template was this from"; nothing renders through it. */
+    templateId: uuid('template_id'),
+    name: text('name').notNull(),
+    kind: text('kind').notNull(),
+    anchorDate: date('anchor_date').notNull(),
+    /** `ChecklistStatus`: open | done | cancelled. */
+    status: text('status').notNull().default('open'),
+    startedBy: uuid('started_by'),
+    startedAt: created(),
+    completedAt: ts('completed_at'),
+    cancelledAt: ts('cancelled_at'),
+    updatedAt: updated(),
+  },
+  (t) => [
+    index('hr_checklists_person_idx').on(t.workspaceId, t.personId, t.status),
+    index('hr_checklists_status_idx').on(t.workspaceId, t.status, t.startedAt),
+  ],
+)
+
+export const checklistItems = schema.table(
+  'checklist_items',
+  {
+    id: id(),
+    workspaceId: ws(),
+    checklistId: uuid('checklist_id').notNull(),
+    title: text('title').notNull(),
+    description: text('description'),
+    /** Null is HR's pool: done by anybody who may manage checklists. */
+    assigneePersonId: uuid('assignee_person_id'),
+    dueOn: date('due_on'),
+    order: integer('order').notNull().default(0),
+    doneAt: ts('done_at'),
+    doneBy: uuid('done_by'),
+    note: text('note'),
+    /**
+     * When the overdue sweep last said this one is late — once per item, ever, the same marker
+     * `module-inventory` keeps on a warranty. Cleared when the item is reopened or re-dated.
+     */
+    overdueNotifiedAt: ts('overdue_notified_at'),
+    createdAt: created(),
+  },
+  (t) => [
+    index('hr_checklist_items_list_idx').on(t.workspaceId, t.checklistId, t.order),
+    /** "What is mine to do": one person's open items, which the widget and the page both ask. */
+    index('hr_checklist_items_assignee_idx')
+      .on(t.workspaceId, t.assigneePersonId, t.dueOn)
+      .where(sql`done_at is null`),
+    /** What the overdue sweep reads: a workspace's open items by due date. */
+    index('hr_checklist_items_due_idx').on(t.workspaceId, t.dueOn).where(sql`done_at is null`),
+  ],
+)
+
+// =====================================================================================
 // policies and periods
 // =====================================================================================
 
@@ -1225,7 +1337,58 @@ export const retentionSettings = schema.table('retention_settings', {
   config: jsonb('config').$type<Record<string, number | null>>().notNull().default(sql`'{}'::jsonb`),
   updatedAt: updated(),
   updatedBy: uuid('updated_by'),
+  /**
+   * Whether the nightly sweep acts on these horizons. Off until an administrator turns it on.
+   *
+   * A column beside the horizons rather than a key inside `config`, because the two are read by
+   * different things: `config` is parsed through `HrRetention`, which would strip an unknown key,
+   * and the job asks the question without parsing anything — `where sweep_enabled`.
+   */
+  sweepEnabled: boolean('sweep_enabled').notNull().default(false),
 })
+
+/** One class in a recorded sweep: the horizon it ran under and the three numbers it produced. */
+export interface RetentionRunClass {
+  class: string
+  days: number
+  matched: number
+  affected: number
+  skippedLocked: number
+}
+
+/**
+ * Every retention sweep that ran, dry or real, and what it did.
+ *
+ * The one unattended act in this module that re-running nothing can undo, so it is the one that
+ * has to be able to say afterwards exactly what it touched. A row is written for every run,
+ * including a dry one — the preview an administrator read before pressing the button is itself
+ * part of the record — and for a run that failed, with the error in `error` and nothing in the
+ * counts, because a failed sweep rolled back and touched nothing.
+ *
+ * `started_by` is null for the nightly job and the account for a manual run. `person_ids` names
+ * every person any touched row belonged to, and `file_ids` every document object the sweep
+ * orphaned in core's storage — the same list `people.erased_file_ids` keeps for an erasure, and for
+ * the same reason: a module cannot delete a core file, so the ids are recorded here so a later
+ * release can finish the job rather than losing them.
+ */
+export const retentionRuns = schema.table(
+  'retention_runs',
+  {
+    id: id(),
+    workspaceId: ws(),
+    startedAt: ts('started_at').notNull().defaultNow(),
+    finishedAt: ts('finished_at'),
+    dryRun: boolean('dry_run').notNull().default(true),
+    startedBy: uuid('started_by'),
+    perClass: jsonb('per_class').$type<RetentionRunClass[]>().notNull().default(sql`'[]'::jsonb`),
+    personIds: uuid('person_ids').array().notNull().default(sql`'{}'::uuid[]`),
+    fileIds: uuid('file_ids').array().notNull().default(sql`'{}'::uuid[]`),
+    error: text('error'),
+  },
+  // Newest first, which is the only order anybody reads a run log in. `t.startedAt.desc()` and
+  // never `desc(t.startedAt)` — see `hr_sens_access_subject_idx` for why the two differ.
+  (t) => [index('hr_retention_runs_ws_idx').on(t.workspaceId, t.startedAt.desc())],
+)
 
 /** Every tenant table, so the RLS migration is checked against one list rather than memory. */
 export const TENANT_TABLES = [
@@ -1263,8 +1426,13 @@ export const TENANT_TABLES = [
   'roster_patterns',
   'roster_assignments',
   'roster_overrides',
+  'checklist_templates',
+  'checklist_template_items',
+  'checklists',
+  'checklist_items',
   'policies',
   'policy_assignments',
   'periods',
   'retention_settings',
+  'retention_runs',
 ] as const

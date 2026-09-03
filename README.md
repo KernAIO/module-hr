@@ -60,6 +60,15 @@ The capabilities, and what each one puts behind itself:
   coverage grid answering "who is on Early on Tuesday" and "who could I call in".
 - **Employee documents** — contracts, identity documents and certificates against a person, held
   in core's file storage; HR records that a person has a file and never holds a byte.
+- **Onboarding and offboarding** — checklists of the tasks a company performs around somebody
+  joining or leaving. A template names each task, who it falls to in the abstract (the person, their
+  manager, HR's pool, or one named person) and when it is due as days from the anchor — the hire
+  date or the last day, negative allowed. The default template of each kind starts itself when
+  somebody is hired, moved to `offboarding` or offboarded, and a template is **copied** at that
+  moment: editing it afterwards changes what the next joiner gets and leaves every running list as
+  it was. Assignees are told, overdue tasks are chased once each by a nightly sweep, the last tick
+  closes the list, and a person sees the lists about themselves and the tasks that are theirs
+  without holding any key beyond membership.
 - **Payroll export** — a closed period handed to a payroll provider as CSV, per legal entity, in a
   frozen v1 shape: identity, the period, the employment facts a provider picks a rate from, and
   quantities in minutes and days. **Kern computes no pay.** There is no gross, no net, no rate and no
@@ -82,6 +91,17 @@ Two things are not capabilities, on purpose:
   bank details is written in the same transaction as the read, and the subject can read their own
   log without asking anybody. A workspace that could switch privacy off would be a workspace that
   stopped honouring subject requests, so there is no switch.
+- **The retention sweep** acts on those horizons, and it is the one unattended act in HR that
+  re-running nothing can undo — so it ships off, and is built like the erasure: a dry run first by
+  the same code, a preview naming every class and every count, a confirmation that restates what
+  goes, and a record of every run — dry, real, nightly, by hand — with the people it touched.
+  Nothing in a locked payroll period is touched; it is skipped and counted. Each class does what its
+  name says: punch detail clears where and on what device, punches and day sheets are deleted, leave
+  goes by whole ledger years (a balance is the sum of one year's ledger, so a year is the smallest
+  thing that can go) together with the requests that ended before the horizon, history keeps its
+  rows and loses its values, document rows go and the files they pointed at are listed on the run
+  because a module cannot delete a core object, leavers past the horizon are redacted exactly as an
+  erasure would redact them, and the access log is deleted.
 
 Also always on: **custom fields** on a person (text, number, date, select, multi-select, yes/no,
 URL; per section; optionally *sensitive*, which puts the value behind the same key as a national
@@ -90,7 +110,7 @@ the directory card shows everybody and nothing it hides.
 
 ## Permissions
 
-Thirty-nine keys, and the shape worth knowing is the **widening ladder** on a person's record:
+Forty-one keys, and the shape worth knowing is the **widening ladder** on a person's record:
 `hr.person.view` is a `member` default and stays one — a staff directory a colleague cannot open is
 a worse product, not a safer one — and what the three widening keys (`view_team`, `view_office`,
 `view_all`) decide is how much of each row comes back. Everybody gets the card; the personnel
@@ -98,33 +118,29 @@ fields (personal email, phone, hire and termination dates) arrive only for the p
 may see the file of. `hr.person.view_sensitive` is held by nobody by default, and every read under
 it is logged. Reports cost `hr.report.view` *and* the key that already guards the rows they sum, so
 a report can never answer a question its row-level procedure would refuse. `hr.privacy.manage` is
-granted to nobody by default.
+granted to nobody by default. `hr.checklist.view` is held by every member and narrowed by the
+handler — a person sees the lists about themselves and the tasks that are theirs — while
+`hr.checklist.manage` defines templates and runs lists.
 
 ## The API
 
-One hundred and thirty-seven procedures under `/api/hr`, in groups: `people`, `employment`, `org`,
+One hundred and fifty-two procedures under `/api/hr`, in groups: `people`, `employment`, `org`,
 `offices`, `entities`, `calendars`, `documents`, `policies`, `accrual`, `periods`, `attendance`,
-`rosters`, `leave`, `approvals`, `fields`, `reports`, `payroll` and `privacy`. Every procedure sits
+`rosters`, `leave`, `approvals`, `fields`, `checklists`, `reports`, `payroll` and `privacy`. Every procedure sits
 behind the workspace gate, its capability where it has one, and a permission this module declares;
 `src/module.test.ts` walks the contract and the router as data and fails when any of the three is
 missing. Two more answers are reachable only from another service over `kernel.call` —
 `hr.person.byUserId` and `hr.person.get` — so a module holding an id never has to learn the shape of
 `mod_hr`.
 
-Six scheduled jobs: partition maintenance for the punch table, leave accrual, carry-forward and
-expiry, auto-clock-out, approval reminders and timeouts, and the nightly reconciliation of open
-day sheets. Thirteen events, from `hr.person.created` to `hr.calendar.changed`, carry ids and never
-rows.
+Eight scheduled jobs: partition maintenance for the punch table, leave accrual, carry-forward and
+expiry, auto-clock-out, approval reminders and timeouts, the nightly reconciliation of open day
+sheets, overdue checklist tasks, and the retention sweep where a workspace has switched it on.
+Fifteen events, from `hr.person.created` to `hr.checklist.completed`, carry ids and never rows.
 
 ## Not built
 
-- **Onboarding and offboarding checklists.** A person has a status, and a leaver raises a return
-  list in the inventory module; there is no task list attached to either transition.
 - **Performance reviews.**
-- **Retention sweeps.** The horizons are set and counted; no job acts on them yet. An unattended
-  job that prunes personnel records is the one act here that re-running nothing can undo, so it
-  ships off until it has a dry run and a per-run report naming every person it touched — and
-  `sweepEnabled: false` on the settings says so rather than claiming otherwise.
 - **Retention per legal entity.** Horizons are workspace-wide today; a Dutch and a Turkish entity
   have different obligations, and the row already carries the config to make that an added column.
 - **Computed moving holidays.** Islamic and Easter dates are published per year in the packs.
@@ -140,7 +156,7 @@ pnpm build
 pnpm db:generate # drizzle-kit → migrations/ (RLS policies are hand-written)
 ```
 
-Twelve migrations, every one of them replayable: `src/server/migrations.test.ts` applies the folder
+Fourteen migrations, every one of them replayable: `src/server/migrations.test.ts` applies the folder
 to a database created from nothing and then applies it again, `journal.test.ts` keeps the journal's
 timestamps in order (a later entry with an earlier timestamp is skipped silently, and only on
 databases that already exist), and `scripts/check-snapshot-drift.mjs` asks Postgres to build what the

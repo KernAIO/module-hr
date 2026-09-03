@@ -400,6 +400,27 @@ export const hrPermissions = definePermissions([
     defaultRoles: ['owner', 'admin'],
     dangerous: false,
   },
+  // ---------------------------------------------------------------- checklists
+  {
+    /**
+     * Held by every member, and narrowed by the handler rather than by the key: without
+     * `checklist.manage` a reader sees the checklists about themselves and the items assigned to
+     * them, which is the whole reason a joiner and their manager can open the list at all. The
+     * same widening-by-handler shape as `hr.person.view`.
+     */
+    key: 'hr.checklist.view',
+    label: 'See onboarding and offboarding checklists',
+    scope: 'workspace',
+    defaultRoles: ['owner', 'admin', 'member'],
+    dangerous: false,
+  },
+  {
+    key: 'hr.checklist.manage',
+    label: 'Define checklist templates and run checklists',
+    scope: 'workspace',
+    defaultRoles: ['owner', 'admin'],
+    dangerous: false,
+  },
 ])
 
 /** The keys, so nothing gates on a string somebody retyped. */
@@ -437,6 +458,8 @@ export const HR_PERMISSIONS = {
   attendanceManage: 'hr.attendance.manage',
   reportView: 'hr.report.view',
   payrollExport: 'hr.payroll.export',
+  checklistView: 'hr.checklist.view',
+  checklistManage: 'hr.checklist.manage',
   policyView: 'hr.policy.view',
   policyManage: 'hr.policy.manage',
   periodManage: 'hr.period.manage',

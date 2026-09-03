@@ -26,6 +26,7 @@ export const HR_CAPABILITIES = {
   approvals: 'approvals',
   attendance: 'attendance',
   rosters: 'rosters',
+  checklists: 'checklists',
   payrollExport: 'payroll_export',
 } as const
 

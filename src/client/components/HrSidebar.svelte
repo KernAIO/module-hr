@@ -70,6 +70,16 @@ const active = (path: string) => pathname === `/${workspaceSlug}${path}`
     active={active('/hr/approvals')}
     label={t('approvals_title')}
   />
+  <!-- Everybody holds `hr.checklist.view`; what they see inside is the server's decision, so the
+       row is gated on the workspace's switch alone. -->
+  {#if has(HR_CAPABILITIES.checklists)}
+    <SidebarItem
+      href={href('/hr/checklists')}
+      icon="list-checks"
+      active={active('/hr/checklists')}
+      label={t('checklists_title')}
+    />
+  {/if}
   <!--
     A permission gate, not a capability one: `hr.report.view` is a separate grant that ships to
     nobody by default, and a row leading to a page that answers 403 is worse than no row. The page

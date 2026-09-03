@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import type { core, Principal } from '@kernhq/contracts'
+import type { core, EventEnvelope, Principal } from '@kernhq/contracts'
 import { CAPABILITIES_KEY, createKernel, type Kernel, type RequestContext, type Tx } from '@kernhq/kernel'
 import { call } from '@orpc/server'
 import { and, eq, inArray, isNull } from 'drizzle-orm'
@@ -16,6 +16,8 @@ import {
   attendanceDays,
   calendarDays,
   calendars,
+  checklistItems,
+  checklists,
   delegations,
   employments,
   leaveBalanceCursor,
@@ -28,21 +30,26 @@ import {
   orgUnits,
   people,
   periods,
+  personDocuments,
+  personHistory,
   policies,
   policyAssignments,
   punches,
   scheduleAssignments,
   schedules,
+  sensitiveAccessLog,
   TENANT_TABLES,
 } from './schema.js'
 import { ApprovalService } from './services/approvals.js'
 import { AttendanceService, NO_SCHEDULE } from './services/attendance.js'
+import { shiftDays } from './services/checklists.js'
 import { todayIn } from './services/db.js'
 import { LedgerService } from './services/ledger.js'
 import { PeopleService } from './services/people.js'
 import { hashConfig, PolicyService } from './services/policies.js'
 import { type EraseResult, PrivacyService } from './services/privacy.js'
 import { ResolveService } from './services/resolve.js'
+import { RetentionSweep } from './services/retention.js'
 
 /**
  * HR against a real Postgres.
@@ -68,7 +75,9 @@ const WS_A = randomUUID()
 const WS_B = randomUUID()
 const ALICE = randomUUID()
 
-const principal = (userId: string, workspaceId: string): Principal =>
+type Role = 'owner' | 'admin' | 'member'
+
+const principal = (userId: string, workspaceId: string, role: Role = 'admin'): Principal =>
   // `unknown` first: `userId` is branded on Principal and a plain string does not overlap it, which
   // is a real difference the test does not need to model. Since tsconfig.test.json started
   // type-checking this file, the cast has to say so rather than pretend the shapes match.
@@ -80,7 +89,7 @@ const principal = (userId: string, workspaceId: string): Principal =>
     locale: 'en',
     instanceAdmin: false,
     service: null,
-    memberships: [{ workspaceId, role: 'admin', roleIds: [], groupIds: [], status: 'active' }],
+    memberships: [{ workspaceId, role, roleIds: [], groupIds: [], status: 'active' }],
     permissionVersion: 0,
   }) as unknown as Principal
 
@@ -95,10 +104,42 @@ const run = inWs(WS_A)
 const INDEXED: core.SearchDocument[] = []
 const UNINDEXED: string[] = []
 
+/** Every notification HR asked core to deliver — who was told, of what, about which row. */
+interface Notified {
+  userId: string
+  workspaceId: string
+  type: string
+  data?: Record<string, unknown>
+}
+const NOTIFIED: Notified[] = []
+/** The notifications of one type a workspace's people received. */
+const told = (workspaceId: string, type: string) =>
+  NOTIFIED.filter((n) => n.workspaceId === workspaceId && n.type === type)
+
+/** Every HR event the module published, in order. Recorded off the in-process bus in `beforeAll`. */
+const EVENTS: EventEnvelope[] = []
+/** The events of one name that carry this checklist. */
+const announced = (name: string, checklistId: string) =>
+  EVENTS.filter((e) => e.name === name && (e.payload as { checklistId?: string }).checklistId === checklistId)
+
+/**
+ * What `settings.getModule` answers for a workspace that wants something other than the default
+ * switchboard below — the capability tests turn `checklists` off for one workspace and nobody else.
+ * The kernel caches module settings for fifteen seconds, so a change here is followed by
+ * `kernel.settings.invalidate` or the next call reads the old answer.
+ */
+const CAPABILITIES_DEFAULT: Record<string, boolean> = { attendance: true, checklists: true }
+const CAPABILITY_OVERRIDES = new Map<string, Record<string, boolean>>()
+
 function registerCoreStubs(k: Kernel) {
   k.broker.register('core', {
     'activity.record': { handler: async () => ({ ok: true }) },
-    'notifications.create': { handler: async () => ({ ok: true }) },
+    'notifications.create': {
+      handler: async (input: Notified) => {
+        NOTIFIED.push(input)
+        return { ok: true }
+      },
+    },
     'search.index': {
       handler: async (input: { documents: core.SearchDocument[] }) => {
         INDEXED.push(...input.documents)
@@ -115,10 +156,14 @@ function registerCoreStubs(k: Kernel) {
     'users.principal': { handler: async (i: { userId: string }) => principal(i.userId, WS_A) },
     'authz.customRolePermissions': { handler: async () => [] },
     'authz.bindings': { handler: async () => [] },
-    // `attendance` is a capability, and it is off by default — every attendance procedure answers
-    // 404 until a workspace switches it on. The stub says it is on, because the tests below call
-    // those procedures the way a workspace that bought the feature does.
-    'settings.getModule': { handler: async () => ({ [CAPABILITIES_KEY]: { attendance: true } }) },
+    // `attendance` and `checklists` are capabilities, and both are off by default — every procedure
+    // behind one answers 404 until a workspace switches it on. The stub says they are on, because
+    // the tests below call those procedures the way a workspace that bought the feature does.
+    'settings.getModule': {
+      handler: async (input: { workspaceId: string }) => ({
+        [CAPABILITIES_KEY]: CAPABILITY_OVERRIDES.get(input.workspaceId) ?? CAPABILITIES_DEFAULT,
+      }),
+    },
     'settings.setModule': { handler: async () => ({ ok: true }) },
   })
 }
@@ -130,9 +175,9 @@ function registerCoreStubs(k: Kernel) {
  * punch guard that answers "You are not clocked in." Nothing below the router can reach them, which
  * is why the attendance tests construct it rather than calling `AttendanceService` directly.
  */
-const asUser = (userId: string, workspaceId = WS_A): RequestContext => ({
+const asUser = (userId: string, workspaceId = WS_A, role: Role = 'admin'): RequestContext => ({
   kernel,
-  principal: principal(userId, workspaceId),
+  principal: principal(userId, workspaceId, role),
   requestId: randomUUID(),
   ip: '127.0.0.1',
   headers: {},
@@ -159,6 +204,9 @@ beforeAll(async () => {
     },
   })
   registerCoreStubs(kernel)
+  await kernel.events.subscribe('hr.checklist.*', (event) => {
+    EVENTS.push(event)
+  })
   await kernel.start()
   hr = implement_(kernel)
 }, 180_000)
@@ -3427,6 +3475,189 @@ describe('the directory in the workspace-wide search index', () => {
   })
 })
 
+describe('the retention sweep', () => {
+  /**
+   * The one act here that re-running nothing can undo, so the whole shape is asserted: a dry run
+   * changes nothing and is recorded; a real run affects exactly what the dry run counted and no more;
+   * a locked period is skipped and said so; a null horizon is not visited; and the nightly job runs
+   * only where a workspace turned the switch on.
+   */
+  const WS_R = randomUUID()
+  const runR = inWs(WS_R)
+  const asHr = managing(WS_R)
+  const sweep = new RetentionSweep()
+  const privacySvc = new PrivacyService()
+  let rita: string
+  let leo: string
+  const OLD = '2024-03-04'
+  const OLD_LOCKED = '2024-06-17'
+  const RECENT = '2026-08-28'
+  const oldStamp = new Date('2024-02-01T10:00:00Z')
+
+  const countPunches = () =>
+    runR(async (tx) => (await tx.select().from(punches).where(eq(punches.workspaceId, WS_R))).length)
+
+  beforeAll(async () => {
+    await hrModule.onWorkspaceEnabled?.(WS_R, kernel)
+    rita = (await createPerson(WS_R, { displayName: 'Rita Retained', hiredOn: '2024-01-08' })).id
+    leo = (await createPerson(WS_R, { displayName: 'Leo Leaver', hiredOn: '2020-01-06' })).id
+    await call(hr.people.offboard, { workspaceId: WS_R, personId: leo, on: '2024-01-31' }, asHr)
+    await runR(async (tx) => {
+      const punch = (businessDate: string, extra: { note?: string; deviceId?: string } = {}) => ({
+        workspaceId: WS_R,
+        personId: rita,
+        direction: 'in',
+        at: new Date(`${businessDate}T06:00:00Z`),
+        businessDate,
+        timezone: 'Europe/Istanbul',
+        ...extra,
+      })
+      await tx
+        .insert(punches)
+        .values([
+          punch(OLD, { note: 'gate 3' }),
+          punch('2024-03-05', { deviceId: randomUUID() }),
+          punch(OLD_LOCKED, { note: 'in a locked month' }),
+          punch(RECENT, { note: 'recent' }),
+        ])
+      await tx.insert(periods).values({
+        workspaceId: WS_R,
+        kind: 'payroll',
+        startsOn: '2024-06-01',
+        endsOn: '2024-06-30',
+        status: 'locked',
+        lockedAt: new Date(),
+      })
+      await tx.insert(attendanceDays).values([
+        { workspaceId: WS_R, personId: rita, businessDate: OLD, status: 'present', workedMinutes: 480 },
+        {
+          workspaceId: WS_R,
+          personId: rita,
+          businessDate: OLD_LOCKED,
+          status: 'present',
+          workedMinutes: 480,
+        },
+        { workspaceId: WS_R, personId: rita, businessDate: RECENT, status: 'present', workedMinutes: 480 },
+      ])
+      await tx.insert(sensitiveAccessLog).values({
+        workspaceId: WS_R,
+        personId: rita,
+        actorUserId: ALICE,
+        fields: ['iban'],
+        via: 'ui',
+        at: oldStamp,
+      })
+      await tx.insert(personHistory).values({
+        workspaceId: WS_R,
+        personId: rita,
+        field: 'phone',
+        from: '+90 1',
+        to: '+90 2',
+        at: oldStamp,
+        source: 'app',
+      })
+      await tx.insert(personDocuments).values({
+        workspaceId: WS_R,
+        personId: rita,
+        fileId: randomUUID(),
+        name: 'Contract.pdf',
+        createdAt: oldStamp,
+      })
+      await privacySvc.setRetention(
+        tx,
+        WS_R,
+        {
+          punchDetail: 365,
+          punches: 365,
+          attendanceDays: 365,
+          personHistory: 365,
+          personDocuments: 365,
+          sensitiveAccessLog: 365,
+          terminatedPeople: 365,
+        },
+        ALICE,
+      )
+    })
+  })
+
+  it('previews without changing a row, and records the preview', async () => {
+    const before = await countPunches()
+    const { run } = await runR((tx) => sweep.run(tx, WS_R, { dryRun: true, actorUserId: ALICE }))
+    expect(run.dryRun).toBe(true)
+    expect(run.error).toBeNull()
+    const byClass = Object.fromEntries(run.perClass.map((c) => [c.class, c]))
+    // `leave` has no horizon and is therefore not visited, not reported as zero.
+    expect(byClass.leave).toBeUndefined()
+    // Three old punches match, one of them in a locked month: two would go.
+    expect(byClass.punches).toMatchObject({ matched: 3, affected: 2, skippedLocked: 1 })
+    expect(byClass.attendanceDays).toMatchObject({ matched: 2, affected: 1, skippedLocked: 1 })
+    expect(byClass.terminatedPeople).toMatchObject({ matched: 1, affected: 1 })
+    expect(byClass.personDocuments).toMatchObject({ matched: 1, affected: 1 })
+    expect(run.personIds).toEqual(expect.arrayContaining([rita, leo]))
+    expect(await countPunches()).toBe(before)
+    const leoRow = await runR((tx) => tx.select().from(people).where(eq(people.id, leo)))
+    expect(leoRow[0]?.erasedAt).toBeNull()
+  })
+
+  it('acts on exactly what the preview counted, skips the locked month, and keeps the recent rows', async () => {
+    const { run } = await runR((tx) => sweep.run(tx, WS_R, { dryRun: false, actorUserId: ALICE }))
+    expect(run.dryRun).toBe(false)
+    const byClass = Object.fromEntries(run.perClass.map((c) => [c.class, c]))
+    expect(byClass.punches).toMatchObject({ affected: 2, skippedLocked: 1 })
+
+    const left = await runR((tx) => tx.select().from(punches).where(eq(punches.workspaceId, WS_R)))
+    expect(left.map((p) => p.businessDate).sort()).toEqual([OLD_LOCKED, RECENT])
+    // The locked month's punch keeps its note too: nothing in a locked period is touched.
+    expect(left.find((p) => p.businessDate === OLD_LOCKED)?.note).toBe('in a locked month')
+
+    const days = await runR((tx) =>
+      tx.select().from(attendanceDays).where(eq(attendanceDays.workspaceId, WS_R)),
+    )
+    expect(days.map((d) => d.businessDate).sort()).toEqual([OLD_LOCKED, RECENT])
+
+    const history = await runR((tx) =>
+      tx.select().from(personHistory).where(eq(personHistory.personId, rita)),
+    )
+    const phone = history.find((h) => h.field === 'phone')
+    expect(phone).toBeDefined()
+    expect(phone?.from).toBeNull()
+    expect(phone?.to).toBeNull()
+
+    expect(
+      await runR((tx) => tx.select().from(personDocuments).where(eq(personDocuments.personId, rita))),
+    ).toEqual([])
+    expect(run.fileIds).toHaveLength(1)
+    expect(
+      await runR((tx) => tx.select().from(sensitiveAccessLog).where(eq(sensitiveAccessLog.personId, rita))),
+    ).toEqual([])
+
+    // The leaver past the horizon is redacted exactly as an erasure would redact him.
+    const [leoRow] = await runR((tx) => tx.select().from(people).where(eq(people.id, leo)))
+    expect(leoRow?.erasedAt).not.toBeNull()
+    expect(leoRow?.displayName).not.toContain('Leo')
+
+    const runs = await runR((tx) => sweep.list(tx, WS_R, 10))
+    expect(runs).toHaveLength(2)
+    expect(runs[0]?.dryRun).toBe(false)
+  })
+
+  it('runs nightly only where the switch is on, and records that run as the job’s', async () => {
+    const job = hrJobs().find((j) => j.name === 'retention-sweep')
+    if (!job) throw new Error('no retention-sweep job')
+    const before = (await runR((tx) => sweep.list(tx, WS_R, 50))).length
+    await job.handler({}, { kernel, id: 'test', attempt: 1 })
+    expect((await runR((tx) => sweep.list(tx, WS_R, 50))).length).toBe(before)
+
+    await runR((tx) => privacySvc.setRetention(tx, WS_R, {}, ALICE, true))
+    await job.handler({}, { kernel, id: 'test', attempt: 1 })
+    const runs = await runR((tx) => sweep.list(tx, WS_R, 50))
+    expect(runs.length).toBe(before + 1)
+    expect(runs[0]?.startedBy).toBeNull()
+    expect(runs[0]?.dryRun).toBe(false)
+    expect(runs[0]?.error).toBeNull()
+  })
+})
+
 describe('a sensitive custom field, written by somebody who may not read it', () => {
   /**
    * `people.update` replaces `custom` whole, and `people.get` strips the sensitive keys from a
@@ -3480,4 +3711,1028 @@ describe('a sensitive custom field, written by somebody who may not read it', ()
     )
     expect(await stored()).toEqual({ [key]: null, desk: 'B-2' })
   })
+})
+
+// =====================================================================================
+// onboarding and offboarding checklists
+// =====================================================================================
+
+/**
+ * The code and reason a call was refused with.
+ *
+ * `call()` from `@orpc/server` runs the handler without the HTTP layer's translation, so a
+ * `KernError` arrives as itself — `reason` on the error for `conflict`, inside `details` for
+ * `badRequest` — and an `ORPCError` (the capability gate) arrives with a code and a `data`. One
+ * helper reads all three shapes so an assertion names the reason rather than matching an English
+ * sentence, which is the same thing a client is supposed to do.
+ */
+async function refused(fn: () => Promise<unknown>): Promise<{ code: string; reason: string | null }> {
+  try {
+    await fn()
+  } catch (err) {
+    const e = err as {
+      code?: string
+      reason?: string
+      details?: Record<string, unknown>
+      data?: Record<string, unknown>
+    }
+    const reason = e.reason ?? e.details?.reason ?? e.data?.reason ?? null
+    return { code: e.code ?? 'UNKNOWN', reason: typeof reason === 'string' ? reason : null }
+  }
+  throw new Error('Expected the call to be refused, but it succeeded')
+}
+
+/** `people.create` as ALICE, in whichever workspace a checklist block owns. */
+const createPerson = (
+  // `randomUUID()`'s template-literal type is what the contract's `z.uuid()` input accepts; a plain
+  // `string` is not, and every workspace constant in this file is one of those.
+  workspaceId: ReturnType<typeof randomUUID>,
+  input: { displayName: string; userId?: string; hiredOn?: string; managerPersonId?: string },
+) => call(hr.people.create, { workspaceId, ...input }, { context: asUser(ALICE, workspaceId) })
+
+/** The id of the item with this title on a checklist — a test names tasks, not positions. */
+const itemOf = (list: { items: Array<{ id: string; title: string }> }, title: string): string => {
+  const item = list.items.find((i) => i.title === title)
+  if (!item) throw new Error(`no item titled “${title}” on the checklist`)
+  return item.id
+}
+
+/**
+ * ALICE, managing HR in a block's workspace.
+ *
+ * A getter rather than a value: these are built at `describe` time, and `kernel` — which `asUser`
+ * closes over — does not exist until `beforeAll`. An eager context carries `kernel: undefined`
+ * into every call and fails as "cannot read 'authz' of undefined", which looks nothing like
+ * "you built this too early".
+ */
+const managing = (workspaceId: ReturnType<typeof randomUUID>) => ({
+  get context(): RequestContext {
+    return asUser(ALICE, workspaceId)
+  },
+})
+
+describe('checklist templates', () => {
+  const WS_T = randomUUID()
+  const asHr = managing(WS_T)
+  let named: string
+  let first: string
+
+  beforeAll(async () => {
+    await hrModule.onWorkspaceEnabled?.(WS_T, kernel)
+    named = (await createPerson(WS_T, { displayName: 'Named Person' })).id
+  }, 60_000)
+
+  it('creates one with an item of every kind, in the order given', async () => {
+    const template = await call(
+      hr.checklists.templates.create,
+      {
+        workspaceId: WS_T,
+        name: 'First week',
+        kind: 'onboarding',
+        items: [
+          { title: 'Read the handbook', assignee: 'person', dueOffsetDays: 1 },
+          { title: 'Book a first 1:1', assignee: 'manager', dueOffsetDays: -3 },
+          { title: 'Order a badge', assignee: 'hr' },
+          { title: 'Pair for a week', assignee: 'specific', assigneePersonId: named },
+        ],
+      },
+      asHr,
+    )
+    first = template.id
+    expect(template.kind).toBe('onboarding')
+    expect(template.isDefault).toBe(false)
+    expect(template.archivedAt).toBeNull()
+    expect(
+      template.items.map((i) => [i.order, i.title, i.assignee, i.assigneePersonId, i.dueOffsetDays]),
+    ).toEqual([
+      [0, 'Read the handbook', 'person', null, 1],
+      [1, 'Book a first 1:1', 'manager', null, -3],
+      [2, 'Order a badge', 'hr', null, 0],
+      [3, 'Pair for a week', 'specific', named, 0],
+    ])
+  })
+
+  it('refuses a specific item that names nobody', async () => {
+    expect(
+      await refused(() =>
+        call(
+          hr.checklists.templates.create,
+          {
+            workspaceId: WS_T,
+            name: 'Nobody',
+            kind: 'onboarding',
+            items: [{ title: 'Pair for a week', assignee: 'specific' }],
+          },
+          asHr,
+        ),
+      ),
+    ).toEqual({ code: 'BAD_REQUEST', reason: 'hr.checklist.assignee_missing' })
+  })
+
+  it('refuses an item that names somebody without being a specific one', async () => {
+    expect(
+      await refused(() =>
+        call(
+          hr.checklists.templates.create,
+          {
+            workspaceId: WS_T,
+            name: 'Somebody',
+            kind: 'onboarding',
+            items: [{ title: 'Read the handbook', assignee: 'person', assigneePersonId: named }],
+          },
+          asHr,
+        ),
+      ),
+    ).toEqual({ code: 'BAD_REQUEST', reason: 'hr.checklist.assignee_unexpected' })
+  })
+
+  it('refuses a specific item naming a person from another workspace', async () => {
+    // An id is a claim. This one is WS_A's, and the template is WS_T's.
+    const stranger = await createPerson(WS_A, { displayName: 'Stranger' })
+    expect(
+      (
+        await refused(() =>
+          call(
+            hr.checklists.templates.create,
+            {
+              workspaceId: WS_T,
+              name: 'Stranger',
+              kind: 'onboarding',
+              items: [{ title: 'Pair for a week', assignee: 'specific', assigneePersonId: stranger.id }],
+            },
+            asHr,
+          ),
+        )
+      ).code,
+    ).toBe('NOT_FOUND')
+  })
+
+  it('replaces the items whole and in order on update', async () => {
+    const before = await call(hr.checklists.templates.list, { workspaceId: WS_T }, asHr)
+    const oldIds = before.find((t) => t.id === first)?.items.map((i) => i.id) ?? []
+    expect(oldIds).toHaveLength(4)
+
+    const updated = await call(
+      hr.checklists.templates.update,
+      {
+        workspaceId: WS_T,
+        templateId: first,
+        items: [
+          { title: 'Collect the laptop', assignee: 'hr', dueOffsetDays: 2 },
+          { title: 'Read the handbook', assignee: 'person', dueOffsetDays: 1 },
+        ],
+      },
+      asHr,
+    )
+    expect(updated.items.map((i) => [i.order, i.title])).toEqual([
+      [0, 'Collect the laptop'],
+      [1, 'Read the handbook'],
+    ])
+    // Replaced, not patched: none of the old rows survive, the one with the same title included.
+    for (const id of oldIds) expect(updated.items.map((i) => i.id)).not.toContain(id)
+    // The name was not in the patch and did not move.
+    expect(updated.name).toBe('First week')
+  })
+
+  it('lets one template be the default of a kind — the previous one loses the flag', async () => {
+    const a = await call(
+      hr.checklists.templates.create,
+      { workspaceId: WS_T, name: 'Default A', kind: 'offboarding', isDefault: true, items: [] },
+      asHr,
+    )
+    expect(a.isDefault).toBe(true)
+    const b = await call(
+      hr.checklists.templates.create,
+      { workspaceId: WS_T, name: 'Default B', kind: 'offboarding', isDefault: true, items: [] },
+      asHr,
+    )
+    expect(b.isDefault).toBe(true)
+
+    // The flags of A and B as `list` reports them — the only place the previous default can be
+    // seen losing the flag, since `create` returns the new one alone.
+    const flags = async () => {
+      const list = await call(hr.checklists.templates.list, { workspaceId: WS_T }, asHr)
+      const of = (id: string) => list.find((t) => t.id === id)?.isDefault
+      return [of(a.id), of(b.id)]
+    }
+    expect(await flags()).toEqual([false, true])
+
+    // And back the other way, through `update`.
+    await call(hr.checklists.templates.update, { workspaceId: WS_T, templateId: a.id, isDefault: true }, asHr)
+    expect(await flags()).toEqual([true, false])
+
+    // Archiving takes the flag with it, so nothing auto-starts from a template nobody can see.
+    const archived = await call(
+      hr.checklists.templates.archive,
+      { workspaceId: WS_T, templateId: a.id },
+      asHr,
+    )
+    expect(archived.isDefault).toBe(false)
+    expect(archived.archivedAt).not.toBeNull()
+    const live = await call(hr.checklists.templates.list, { workspaceId: WS_T }, asHr)
+    expect(live.map((t) => t.id)).not.toContain(a.id)
+    const all = await call(hr.checklists.templates.list, { workspaceId: WS_T, includeArchived: true }, asHr)
+    expect(all.find((t) => t.id === a.id)?.isDefault).toBe(false)
+
+    // An archived template cannot be the default of anything.
+    expect(
+      await refused(() =>
+        call(hr.checklists.templates.update, { workspaceId: WS_T, templateId: a.id, isDefault: true }, asHr),
+      ),
+    ).toEqual({ code: 'CONFLICT', reason: 'hr.checklist.template_archived' })
+
+    // Restored, it is an ordinary template again — and not the default, which archiving cleared.
+    const restored = await call(
+      hr.checklists.templates.archive,
+      { workspaceId: WS_T, templateId: a.id, archived: false },
+      asHr,
+    )
+    expect(restored.archivedAt).toBeNull()
+    expect(restored.isDefault).toBe(false)
+  })
+
+  it('does not exist from another workspace', async () => {
+    const elsewhere = { context: asUser(ALICE, WS_A) }
+    expect(
+      (
+        await refused(() =>
+          call(
+            hr.checklists.templates.update,
+            { workspaceId: WS_A, templateId: first, name: 'Mine now' },
+            elsewhere,
+          ),
+        )
+      ).code,
+    ).toBe('NOT_FOUND')
+    expect(
+      (
+        await refused(() =>
+          call(hr.checklists.templates.archive, { workspaceId: WS_A, templateId: first }, elsewhere),
+        )
+      ).code,
+    ).toBe('NOT_FOUND')
+    const person = await createPerson(WS_A, { displayName: 'Cross Workspace Start' })
+    expect(
+      (
+        await refused(() =>
+          call(hr.checklists.start, { workspaceId: WS_A, personId: person.id, templateId: first }, elsewhere),
+        )
+      ).code,
+    ).toBe('NOT_FOUND')
+  })
+})
+
+describe('starting a checklist', () => {
+  const WS_S = randomUUID()
+  const asHr = managing(WS_S)
+  const MINA = randomUUID()
+  const IVO = randomUUID()
+  const NOOR = randomUUID()
+  let mina: string
+  let ivo: string
+  let noor: string
+  let template: string
+  let started: Awaited<ReturnType<typeof startFor>>
+
+  const startFor = (personId: string, anchorDate?: string) =>
+    call(
+      hr.checklists.start,
+      { workspaceId: WS_S, personId, templateId: template, ...(anchorDate ? { anchorDate } : {}) },
+      asHr,
+    )
+
+  beforeAll(async () => {
+    await hrModule.onWorkspaceEnabled?.(WS_S, kernel)
+    // People first, template second: nothing is a default here, so no hire starts anything.
+    mina = (await createPerson(WS_S, { displayName: 'Mina Manager', userId: MINA })).id
+    ivo = (await createPerson(WS_S, { displayName: 'Ivo IT', userId: IVO })).id
+    noor = (
+      await createPerson(WS_S, {
+        displayName: 'Noor New',
+        userId: NOOR,
+        hiredOn: '2026-09-14',
+        managerPersonId: mina,
+      })
+    ).id
+    template = (
+      await call(
+        hr.checklists.templates.create,
+        {
+          workspaceId: WS_S,
+          name: 'Joining us',
+          kind: 'onboarding',
+          items: [
+            { title: 'Read the handbook', assignee: 'person', dueOffsetDays: 1 },
+            { title: 'Book a first 1:1', assignee: 'manager', dueOffsetDays: -3 },
+            { title: 'Set up the laptop', assignee: 'specific', assigneePersonId: ivo, dueOffsetDays: 0 },
+            { title: 'Order a badge', assignee: 'hr', dueOffsetDays: 7 },
+          ],
+        },
+        asHr,
+      )
+    ).id
+    NOTIFIED.length = 0
+    EVENTS.length = 0
+    started = await startFor(noor)
+  }, 60_000)
+
+  it('resolves every item to a person and a date, counted from the hire date', () => {
+    expect(started.personId).toBe(noor)
+    expect(started.templateId).toBe(template)
+    expect(started.name).toBe('Joining us')
+    expect(started.kind).toBe('onboarding')
+    expect(started.anchorDate).toBe('2026-09-14')
+    expect(started.status).toBe('open')
+    expect(started.startedBy).toBe(ALICE)
+    expect(started.completedAt).toBeNull()
+    expect(started.progress).toEqual({ done: 0, total: 4 })
+    expect(started.items.map((i) => [i.order, i.title, i.assigneePersonId, i.dueOn, i.doneAt])).toEqual([
+      [0, 'Read the handbook', noor, '2026-09-15', null],
+      [1, 'Book a first 1:1', mina, '2026-09-11', null],
+      [2, 'Set up the laptop', ivo, '2026-09-14', null],
+      [3, 'Order a badge', null, '2026-09-21', null],
+    ])
+  })
+
+  it('announces it, and tells the people who have something to do — not the joiner', () => {
+    const events = announced('hr.checklist.started', started.id)
+    expect(events).toHaveLength(1)
+    expect(events[0]?.payload).toEqual({
+      checklistId: started.id,
+      personId: noor,
+      workspaceId: WS_S,
+      kind: 'onboarding',
+    })
+    expect(events[0]?.workspaceId).toBe(WS_S)
+    expect(events[0]?.actorId).toBe(ALICE)
+
+    const assigned = told(WS_S, 'hr.checklist.item_assigned')
+    expect(assigned.map((n) => n.userId).sort()).toEqual([IVO, MINA].sort())
+    for (const n of assigned)
+      expect(n.data).toMatchObject({ checklistId: started.id, personId: noor, kind: 'onboarding' })
+    // The joiner knows they are joining; the pooled item has nobody to tell.
+    expect(assigned.map((n) => n.userId)).not.toContain(NOOR)
+    expect(NOTIFIED.filter((n) => n.workspaceId === WS_S).map((n) => n.type)).toEqual([
+      'hr.checklist.item_assigned',
+      'hr.checklist.item_assigned',
+    ])
+  })
+
+  it('is a copy: editing the template afterwards leaves the running list as it was', async () => {
+    await call(
+      hr.checklists.templates.update,
+      {
+        workspaceId: WS_S,
+        templateId: template,
+        name: 'Joining us, rewritten',
+        items: [{ title: 'Only this now', assignee: 'hr' }],
+      },
+      asHr,
+    )
+    const list = await call(hr.checklists.get, { workspaceId: WS_S, checklistId: started.id }, asHr)
+    expect(list.name).toBe('Joining us')
+    expect(list.items.map((i) => i.title)).toEqual([
+      'Read the handbook',
+      'Book a first 1:1',
+      'Set up the laptop',
+      'Order a badge',
+    ])
+    // And the next list gets the new template.
+    const next = await startFor(noor)
+    expect(next.name).toBe('Joining us, rewritten')
+    expect(next.items.map((i) => i.title)).toEqual(['Only this now'])
+  })
+
+  it('counts from an explicit anchor when given one', async () => {
+    const list = await startFor(noor, '2026-10-01')
+    expect(list.anchorDate).toBe('2026-10-01')
+    expect(list.items[0]?.dueOn).toBe('2026-10-01')
+  })
+
+  it('counts from today for a person whose record has no hire date', async () => {
+    const undated = await createPerson(WS_S, { displayName: 'Undated' })
+    const list = await startFor(undated.id)
+    expect(list.anchorDate).toBe(new Date().toISOString().slice(0, 10))
+  })
+
+  it('refuses to start from an archived template', async () => {
+    await call(hr.checklists.templates.archive, { workspaceId: WS_S, templateId: template }, asHr)
+    expect(await refused(() => startFor(noor))).toEqual({
+      code: 'CONFLICT',
+      reason: 'hr.checklist.template_archived',
+    })
+  })
+
+  it('refuses a person from another workspace', async () => {
+    await call(
+      hr.checklists.templates.archive,
+      { workspaceId: WS_S, templateId: template, archived: false },
+      asHr,
+    )
+    const stranger = await createPerson(WS_A, { displayName: 'Stranger Start' })
+    expect((await refused(() => startFor(stranger.id))).code).toBe('NOT_FOUND')
+  })
+})
+
+describe('who may see and tick what', () => {
+  const WS_V = randomUUID()
+  const asHr = managing(WS_V)
+  const SAM = randomUUID()
+  const MIA = randomUUID()
+  const BOB = randomUUID()
+  const ZED = randomUUID()
+  const member = (userId: string) => ({ context: asUser(userId, WS_V, 'member') })
+  let sam: string
+  let mia: string
+  let bob: string
+  let zed: string
+  /** Sam's list: an item each for Sam, Mia (the manager), Bob (named) and the pool. */
+  let samsList: Awaited<ReturnType<typeof getAsHr>>
+  /** Zed's list: nothing on it for Bob. */
+  let zedsList: Awaited<ReturnType<typeof getAsHr>>
+
+  const getAsHr = (checklistId: string) => call(hr.checklists.get, { workspaceId: WS_V, checklistId }, asHr)
+  const complete = (itemId: string, as: { context: RequestContext }) =>
+    call(hr.checklists.items.complete, { workspaceId: WS_V, itemId }, as)
+  const reopen = (itemId: string, as: { context: RequestContext }) =>
+    call(hr.checklists.items.reopen, { workspaceId: WS_V, itemId }, as)
+
+  beforeAll(async () => {
+    await hrModule.onWorkspaceEnabled?.(WS_V, kernel)
+    mia = (await createPerson(WS_V, { displayName: 'Mia Manager', userId: MIA, hiredOn: '2025-01-06' })).id
+    bob = (await createPerson(WS_V, { displayName: 'Bob Buddy', userId: BOB, hiredOn: '2025-01-06' })).id
+    sam = (
+      await createPerson(WS_V, {
+        displayName: 'Sam Subject',
+        userId: SAM,
+        hiredOn: '2026-01-05',
+        managerPersonId: mia,
+      })
+    ).id
+    zed = (await createPerson(WS_V, { displayName: 'Zed Other', userId: ZED, hiredOn: '2026-01-05' })).id
+    const full = await call(
+      hr.checklists.templates.create,
+      {
+        workspaceId: WS_V,
+        name: 'Everybody has something',
+        kind: 'onboarding',
+        items: [
+          { title: 'Read the handbook', assignee: 'person' },
+          { title: 'Book a 1:1', assignee: 'manager' },
+          { title: 'Order a badge', assignee: 'hr' },
+          { title: 'Pair for a week', assignee: 'specific', assigneePersonId: bob },
+        ],
+      },
+      asHr,
+    )
+    const narrow = await call(
+      hr.checklists.templates.create,
+      {
+        workspaceId: WS_V,
+        name: 'Nothing for Bob',
+        kind: 'onboarding',
+        items: [
+          { title: 'Read the handbook', assignee: 'person' },
+          { title: 'Order a badge', assignee: 'hr' },
+        ],
+      },
+      asHr,
+    )
+    samsList = await call(
+      hr.checklists.start,
+      { workspaceId: WS_V, personId: sam, templateId: full.id },
+      asHr,
+    )
+    zedsList = await call(
+      hr.checklists.start,
+      { workspaceId: WS_V, personId: zed, templateId: narrow.id },
+      asHr,
+    )
+  }, 60_000)
+
+  it('shows a member only the lists about them or with something for them', async () => {
+    const ids = async (as: { context: RequestContext }, mine = false) =>
+      (await call(hr.checklists.list, { workspaceId: WS_V, mine }, as)).map((c) => c.id).sort()
+    expect(await ids(member(BOB))).toEqual([samsList.id])
+    expect(await ids(member(MIA))).toEqual([samsList.id])
+    expect(await ids(member(SAM))).toEqual([samsList.id])
+    expect(await ids(member(ZED))).toEqual([zedsList.id])
+    // A manager sees everything — and `mine` narrows a manager with no HR record to nothing.
+    expect(await ids(asHr)).toEqual([samsList.id, zedsList.id].sort())
+    expect(await ids(asHr, true)).toEqual([])
+    // The summary carries the progress, so a page can draw the bar without the items.
+    const [summary] = await call(hr.checklists.list, { workspaceId: WS_V }, member(BOB))
+    expect(summary?.progress).toEqual({ done: 0, total: 4 })
+  })
+
+  it('answers not found, not forbidden, for a list a member may not see', async () => {
+    expect(
+      (
+        await refused(() =>
+          call(hr.checklists.get, { workspaceId: WS_V, checklistId: zedsList.id }, member(BOB)),
+        )
+      ).code,
+    ).toBe('NOT_FOUND')
+    const visible = await call(
+      hr.checklists.get,
+      { workspaceId: WS_V, checklistId: samsList.id },
+      member(BOB),
+    )
+    expect(visible.items).toHaveLength(4)
+  })
+
+  it('has nothing to reopen on an item still open', async () => {
+    expect(await refused(() => reopen(itemOf(samsList, 'Pair for a week'), member(BOB)))).toEqual({
+      code: 'CONFLICT',
+      reason: 'hr.checklist.not_done',
+    })
+  })
+
+  it('lets the assignee tick their own item and nobody else’s', async () => {
+    const after = await complete(itemOf(samsList, 'Pair for a week'), member(BOB))
+    expect(after.progress).toEqual({ done: 1, total: 4 })
+    const ticked = after.items.find((i) => i.title === 'Pair for a week')
+    expect(ticked?.doneAt).not.toBeNull()
+    expect(ticked?.doneBy).toBe(BOB)
+    expect(after.status).toBe('open')
+
+    // Mia's item is not Bob's and the list is not about Bob: as far as Bob is concerned it is not there.
+    expect((await refused(() => complete(itemOf(samsList, 'Book a 1:1'), member(BOB)))).code).toBe(
+      'NOT_FOUND',
+    )
+    // Sam can see the list — it is about Sam — and still may not tick the manager's task.
+    expect((await refused(() => complete(itemOf(samsList, 'Book a 1:1'), member(SAM)))).code).toBe(
+      'FORBIDDEN',
+    )
+  })
+
+  it('lets the person the list is about tick a pooled item', async () => {
+    const after = await complete(itemOf(samsList, 'Order a badge'), member(SAM))
+    expect(after.items.find((i) => i.title === 'Order a badge')?.doneBy).toBe(SAM)
+    expect(after.progress).toEqual({ done: 2, total: 4 })
+  })
+
+  it('closes the list on the last tick, announces it, and tells whoever started it', async () => {
+    EVENTS.length = 0
+    NOTIFIED.length = 0
+    const notYet = await complete(itemOf(samsList, 'Read the handbook'), member(SAM))
+    expect(notYet.status).toBe('open')
+    expect(announced('hr.checklist.completed', samsList.id)).toHaveLength(0)
+
+    const done = await complete(itemOf(samsList, 'Book a 1:1'), member(MIA))
+    expect(done.status).toBe('done')
+    expect(done.completedAt).not.toBeNull()
+    expect(done.progress).toEqual({ done: 4, total: 4 })
+
+    const events = announced('hr.checklist.completed', samsList.id)
+    expect(events).toHaveLength(1)
+    expect(events[0]?.payload).toEqual({
+      checklistId: samsList.id,
+      personId: sam,
+      workspaceId: WS_V,
+      kind: 'onboarding',
+    })
+    expect(events[0]?.actorId).toBe(MIA)
+
+    const completed = told(WS_V, 'hr.checklist.completed')
+    expect(completed.map((n) => n.userId)).toEqual([ALICE])
+    expect(completed[0]?.data).toMatchObject({ checklistId: samsList.id, personId: sam })
+  })
+
+  it('refuses a second tick on a done item', async () => {
+    expect(await refused(() => complete(itemOf(samsList, 'Book a 1:1'), member(MIA)))).toEqual({
+      code: 'CONFLICT',
+      reason: 'hr.checklist.already_done',
+    })
+  })
+
+  it('reopens the list when any item is reopened', async () => {
+    const open = await reopen(itemOf(samsList, 'Book a 1:1'), member(MIA))
+    expect(open.status).toBe('open')
+    expect(open.completedAt).toBeNull()
+    expect(open.progress).toEqual({ done: 3, total: 4 })
+    const item = open.items.find((i) => i.title === 'Book a 1:1')
+    expect(item?.doneAt).toBeNull()
+    expect(item?.doneBy).toBeNull()
+
+    // And closes again on the next tick — a second completion, announced a second time.
+    EVENTS.length = 0
+    const done = await complete(itemOf(samsList, 'Book a 1:1'), member(MIA))
+    expect(done.status).toBe('done')
+    expect(announced('hr.checklist.completed', samsList.id)).toHaveLength(1)
+  })
+
+  it('refuses every change to a cancelled list', async () => {
+    const template = await call(
+      hr.checklists.templates.create,
+      {
+        workspaceId: WS_V,
+        name: 'Cancel me',
+        kind: 'offboarding',
+        items: [{ title: 'Return the badge', assignee: 'person' }],
+      },
+      asHr,
+    )
+    const list = await call(
+      hr.checklists.start,
+      { workspaceId: WS_V, personId: sam, templateId: template.id },
+      asHr,
+    )
+    const cancelled = await call(hr.checklists.cancel, { workspaceId: WS_V, checklistId: list.id }, asHr)
+    expect(cancelled.status).toBe('cancelled')
+    expect(cancelled.cancelledAt).not.toBeNull()
+    expect(await refused(() => complete(itemOf(list, 'Return the badge'), member(SAM)))).toEqual({
+      code: 'CONFLICT',
+      reason: 'hr.checklist.cancelled',
+    })
+    expect(
+      await refused(() => call(hr.checklists.cancel, { workspaceId: WS_V, checklistId: list.id }, asHr)),
+    ).toEqual({
+      code: 'CONFLICT',
+      reason: 'hr.checklist.cancelled',
+    })
+  })
+
+  it('reopens a done list when a task is added, tells the person it is handed to, and closes it when the last open task is removed', async () => {
+    const before = await getAsHr(samsList.id)
+    expect(before.status).toBe('done')
+
+    const reopened = await call(
+      hr.checklists.items.add,
+      {
+        workspaceId: WS_V,
+        checklistId: samsList.id,
+        title: 'Return the parking permit',
+        dueOn: '2026-02-01',
+      },
+      asHr,
+    )
+    expect(reopened.status).toBe('open')
+    expect(reopened.completedAt).toBeNull()
+    expect(reopened.progress).toEqual({ done: 4, total: 5 })
+    const added = reopened.items.find((i) => i.title === 'Return the parking permit')
+    expect(added?.order).toBe(4)
+    expect(added?.assigneePersonId).toBeNull()
+    expect(added?.dueOn).toBe('2026-02-01')
+
+    NOTIFIED.length = 0
+    const handed = await call(
+      hr.checklists.items.assign,
+      { workspaceId: WS_V, itemId: added!.id, assigneePersonId: bob },
+      asHr,
+    )
+    expect(handed.items.find((i) => i.id === added!.id)?.assigneePersonId).toBe(bob)
+    expect(told(WS_V, 'hr.checklist.item_assigned').map((n) => n.userId)).toEqual([BOB])
+    // Handing it to the same person again is not news.
+    NOTIFIED.length = 0
+    await call(
+      hr.checklists.items.assign,
+      { workspaceId: WS_V, itemId: added!.id, assigneePersonId: bob },
+      asHr,
+    )
+    expect(told(WS_V, 'hr.checklist.item_assigned')).toHaveLength(0)
+    // A member cannot hand tasks around.
+    expect(
+      (
+        await refused(() =>
+          call(
+            hr.checklists.items.assign,
+            { workspaceId: WS_V, itemId: added!.id, assigneePersonId: mia },
+            member(BOB),
+          ),
+        )
+      ).code,
+    ).toBe('FORBIDDEN')
+
+    const closed = await call(hr.checklists.items.remove, { workspaceId: WS_V, itemId: added!.id }, asHr)
+    expect(closed.status).toBe('done')
+    expect(closed.progress).toEqual({ done: 4, total: 4 })
+    expect(closed.items.map((i) => i.id)).not.toContain(added!.id)
+  })
+
+  it('lets the person the list is about untick a pooled item they ticked by mistake', async () => {
+    // The same rule as ticking: a pooled item on your own list is yours to tick and yours to take
+    // back. A bystander still meets the list as though it were not there.
+    const fresh = await getAsHr(zedsList.id)
+    const badge = itemOf(fresh, 'Order a badge')
+    if (!fresh.items.find((i) => i.id === badge)?.doneAt) await complete(badge, member(ZED))
+    const reopened = await reopen(badge, member(ZED))
+    expect(reopened.items.find((i) => i.id === badge)?.doneAt).toBeNull()
+    expect(reopened.status).toBe('open')
+    await expect(reopen(badge, member(BOB))).rejects.toMatchObject({ code: 'NOT_FOUND' })
+  })
+})
+
+describe('the lists a hire and a leaver get', () => {
+  const WS_H = randomUUID()
+  const asHr = managing(WS_H)
+  let onboarding: string
+
+  const listsOf = (personId: string) =>
+    inWs(WS_H)((tx) =>
+      tx
+        .select()
+        .from(checklists)
+        .where(and(eq(checklists.workspaceId, WS_H), eq(checklists.personId, personId)))
+        .orderBy(checklists.startedAt),
+    )
+
+  beforeAll(async () => {
+    await hrModule.onWorkspaceEnabled?.(WS_H, kernel)
+    onboarding = (
+      await call(
+        hr.checklists.templates.create,
+        {
+          workspaceId: WS_H,
+          name: 'Welcome',
+          kind: 'onboarding',
+          isDefault: true,
+          items: [
+            { title: 'Read the handbook', assignee: 'person' },
+            { title: 'Order a badge', assignee: 'hr', dueOffsetDays: 3 },
+          ],
+        },
+        asHr,
+      )
+    ).id
+    await call(
+      hr.checklists.templates.create,
+      {
+        workspaceId: WS_H,
+        name: 'Farewell',
+        kind: 'offboarding',
+        isDefault: true,
+        items: [
+          { title: 'Collect the laptop', assignee: 'manager', dueOffsetDays: -1 },
+          { title: 'Close the accounts', assignee: 'hr' },
+        ],
+      },
+      asHr,
+    )
+  }, 60_000)
+
+  it('starts the default onboarding list for a hire, counted from the hire date', async () => {
+    EVENTS.length = 0
+    const hire = await createPerson(WS_H, { displayName: 'Hana Hire', hiredOn: '2026-09-21' })
+    const lists = await call(hr.checklists.list, { workspaceId: WS_H, personId: hire.id }, asHr)
+    expect(lists).toHaveLength(1)
+    expect(lists[0]).toMatchObject({
+      kind: 'onboarding',
+      templateId: onboarding,
+      name: 'Welcome',
+      anchorDate: '2026-09-21',
+      status: 'open',
+      startedBy: ALICE,
+      progress: { done: 0, total: 2 },
+    })
+    const full = await call(hr.checklists.get, { workspaceId: WS_H, checklistId: lists[0]!.id }, asHr)
+    expect(full.items.map((i) => [i.title, i.assigneePersonId, i.dueOn])).toEqual([
+      ['Read the handbook', hire.id, '2026-09-21'],
+      ['Order a badge', null, '2026-09-24'],
+    ])
+    expect(announced('hr.checklist.started', lists[0]!.id)).toHaveLength(1)
+  })
+
+  it('starts nothing when no template of that kind is the default', async () => {
+    await call(hr.checklists.templates.archive, { workspaceId: WS_H, templateId: onboarding }, asHr)
+    const hire = await createPerson(WS_H, { displayName: 'Nobody Waits', hiredOn: '2026-09-21' })
+    expect(await listsOf(hire.id)).toEqual([])
+
+    // Restored — and made the default again by hand, because archiving cleared the flag.
+    await call(
+      hr.checklists.templates.archive,
+      { workspaceId: WS_H, templateId: onboarding, archived: false },
+      asHr,
+    )
+    await call(
+      hr.checklists.templates.update,
+      { workspaceId: WS_H, templateId: onboarding, isDefault: true },
+      asHr,
+    )
+  })
+
+  it('starts the default offboarding list when somebody is offboarded, counted from the last day', async () => {
+    const leaver = await createPerson(WS_H, { displayName: 'Lars Leaver', hiredOn: '2025-03-01' })
+    EVENTS.length = 0
+    await call(hr.people.offboard, { workspaceId: WS_H, personId: leaver.id, on: '2026-10-31' }, asHr)
+    const lists = await call(
+      hr.checklists.list,
+      { workspaceId: WS_H, personId: leaver.id, kind: 'offboarding' },
+      asHr,
+    )
+    expect(lists).toHaveLength(1)
+    expect(lists[0]).toMatchObject({
+      name: 'Farewell',
+      anchorDate: '2026-10-31',
+      status: 'open',
+      startedBy: ALICE,
+    })
+    const full = await call(hr.checklists.get, { workspaceId: WS_H, checklistId: lists[0]!.id }, asHr)
+    // No manager on the employment: the manager's item lands in the pool rather than refusing the list.
+    expect(full.items.map((i) => [i.title, i.assigneePersonId, i.dueOn])).toEqual([
+      ['Collect the laptop', null, '2026-10-30'],
+      ['Close the accounts', null, '2026-10-31'],
+    ])
+    expect(announced('hr.checklist.started', lists[0]!.id)).toHaveLength(1)
+    // The hire's onboarding list is untouched by the leaving.
+    expect((await listsOf(leaver.id)).map((l) => l.kind).sort()).toEqual(['offboarding', 'onboarding'])
+  })
+
+  it('does not start a second offboarding list while one is open', async () => {
+    const leaver = await createPerson(WS_H, { displayName: 'Lena Leaver', hiredOn: '2025-03-01' })
+    const farewell = (await call(hr.checklists.templates.list, { workspaceId: WS_H }, asHr)).find(
+      (t) => t.kind === 'offboarding',
+    )
+    // The leaving began earlier, by hand, from the same template.
+    const early = await call(
+      hr.checklists.start,
+      { workspaceId: WS_H, personId: leaver.id, templateId: farewell!.id, anchorDate: '2026-11-30' },
+      asHr,
+    )
+    await call(hr.people.offboard, { workspaceId: WS_H, personId: leaver.id, on: '2026-11-30' }, asHr)
+    const lists = await call(
+      hr.checklists.list,
+      { workspaceId: WS_H, personId: leaver.id, kind: 'offboarding' },
+      asHr,
+    )
+    expect(lists.map((l) => l.id)).toEqual([early.id])
+
+    // Once that one is cancelled, the next leaving event starts one again.
+    await call(hr.checklists.cancel, { workspaceId: WS_H, checklistId: early.id }, asHr)
+    await call(hr.people.offboard, { workspaceId: WS_H, personId: leaver.id, on: '2026-12-15' }, asHr)
+    const after = await call(
+      hr.checklists.list,
+      { workspaceId: WS_H, personId: leaver.id, kind: 'offboarding' },
+      asHr,
+    )
+    expect(after.map((l) => [l.status, l.anchorDate]).sort()).toEqual([
+      ['cancelled', '2026-11-30'],
+      ['open', '2026-12-15'],
+    ])
+  })
+
+  it('starts nothing while the capability is off, and every checklist procedure is not found', async () => {
+    CAPABILITY_OVERRIDES.set(WS_H, { attendance: true, checklists: false })
+    kernel.settings.invalidate(WS_H, 'hr')
+    try {
+      const hire = await createPerson(WS_H, { displayName: 'Quiet Hire', hiredOn: '2026-09-21' })
+      expect(await listsOf(hire.id)).toEqual([])
+      expect((await refused(() => call(hr.checklists.list, { workspaceId: WS_H }, asHr))).code).toBe(
+        'NOT_FOUND',
+      )
+      expect(
+        (await refused(() => call(hr.checklists.templates.list, { workspaceId: WS_H }, asHr))).code,
+      ).toBe('NOT_FOUND')
+    } finally {
+      CAPABILITY_OVERRIDES.delete(WS_H)
+      kernel.settings.invalidate(WS_H, 'hr')
+    }
+    // Switched back on, the same hire gets a list — so the silence above was the switch, not the template.
+    const hire = await createPerson(WS_H, { displayName: 'Loud Hire', hiredOn: '2026-09-21' })
+    expect((await listsOf(hire.id)).map((l) => l.kind)).toEqual(['onboarding'])
+  })
+
+  it('starts the leaver’s list when somebody is moved to offboarding, dated from the planned last day', async () => {
+    // `people.update` carries `status` now — until it did, no API call could reach the state that
+    // starts this list. The move to `offboarding` starts it; the later `offboard` finds one open
+    // and starts nothing more.
+    const leaving = (await createPerson(WS_H, { displayName: 'Nur Notice', hiredOn: '2024-02-05' })).id
+    await call(
+      hr.people.update,
+      { workspaceId: WS_H, personId: leaving, status: 'offboarding', terminatedOn: '2026-10-30' },
+      asHr,
+    )
+    const afterMove = await listsOf(leaving)
+    const offboardingLists = afterMove.filter((c) => c.kind === 'offboarding')
+    expect(offboardingLists).toHaveLength(1)
+    expect(offboardingLists[0]?.anchorDate).toBe('2026-10-30')
+    expect(offboardingLists[0]?.status).toBe('open')
+
+    await call(hr.people.offboard, { workspaceId: WS_H, personId: leaving, on: '2026-10-30' }, asHr)
+    expect((await listsOf(leaving)).filter((c) => c.kind === 'offboarding')).toHaveLength(1)
+  })
+})
+
+describe('the overdue sweep', () => {
+  const WS_O = randomUUID()
+  const asHr = managing(WS_O)
+  const PAT = randomUUID()
+  const QUINN = randomUUID()
+  const today = new Date().toISOString().slice(0, 10)
+  let pat: string
+  let quinn: string
+  let list: Awaited<ReturnType<typeof startDated>>
+  let late: string
+  let notYet: string
+
+  const startDated = (personId: string, templateId: string, anchorDate: string) =>
+    call(hr.checklists.start, { workspaceId: WS_O, personId, templateId, anchorDate }, asHr)
+  const sweep = () => {
+    const job = hrJobs().find((j) => j.name === 'checklist-overdue')
+    if (!job) throw new Error('the checklist-overdue job is gone')
+    return job.handler({}, { kernel, id: 'test', attempt: 1 })
+  }
+  const overdue = () => told(WS_O, 'hr.checklist.item_overdue')
+  const markerOf = async (itemId: string) => {
+    const [row] = await inWs(WS_O)((tx) =>
+      tx
+        .select({ at: checklistItems.overdueNotifiedAt })
+        .from(checklistItems)
+        .where(eq(checklistItems.id, itemId)),
+    )
+    return row?.at ?? null
+  }
+
+  beforeAll(async () => {
+    await hrModule.onWorkspaceEnabled?.(WS_O, kernel)
+    pat = (await createPerson(WS_O, { displayName: 'Pat', userId: PAT })).id
+    quinn = (await createPerson(WS_O, { displayName: 'Quinn', userId: QUINN })).id
+    const template = await call(
+      hr.checklists.templates.create,
+      {
+        workspaceId: WS_O,
+        name: 'Dated',
+        kind: 'onboarding',
+        items: [
+          { title: 'Late', assignee: 'specific', assigneePersonId: pat, dueOffsetDays: 0 },
+          { title: 'Not yet', assignee: 'hr', dueOffsetDays: 30 },
+        ],
+      },
+      asHr,
+    )
+    // Anchored two days ago, so "Late" was due the day before yesterday and "Not yet" is weeks off.
+    list = await startDated(pat, template.id, shiftDays(today, -2))
+    late = itemOf(list, 'Late')
+    notYet = itemOf(list, 'Not yet')
+    NOTIFIED.length = 0
+  }, 60_000)
+
+  it('tells the assignee once, and marks the item', async () => {
+    await sweep()
+    const sent = overdue()
+    expect(sent).toHaveLength(1)
+    expect(sent[0]?.userId).toBe(PAT)
+    expect(sent[0]?.data).toMatchObject({
+      checklistId: list.id,
+      itemId: late,
+      personId: pat,
+      kind: 'onboarding',
+      dueOn: shiftDays(today, -2),
+    })
+    expect(await markerOf(late)).not.toBeNull()
+    expect(await markerOf(notYet)).toBeNull()
+  }, 30_000)
+
+  it('says nothing the second time', async () => {
+    NOTIFIED.length = 0
+    await sweep()
+    expect(overdue()).toHaveLength(0)
+  }, 30_000)
+
+  it('tells the next person the item is handed to', async () => {
+    await call(hr.checklists.items.assign, { workspaceId: WS_O, itemId: late, assigneePersonId: quinn }, asHr)
+    expect(await markerOf(late)).toBeNull()
+    NOTIFIED.length = 0
+    await sweep()
+    expect(overdue().map((n) => n.userId)).toEqual([QUINN])
+    expect(await markerOf(late)).not.toBeNull()
+  }, 30_000)
+
+  it('tells them again after the item is reopened', async () => {
+    await call(hr.checklists.items.complete, { workspaceId: WS_O, itemId: late }, asHr)
+    await call(hr.checklists.items.reopen, { workspaceId: WS_O, itemId: late }, asHr)
+    expect(await markerOf(late)).toBeNull()
+    NOTIFIED.length = 0
+    await sweep()
+    expect(overdue().map((n) => n.userId)).toEqual([QUINN])
+  }, 30_000)
+
+  it('tells whoever started the list about a pooled item, and nobody about a done one', async () => {
+    // A task in HR's pool, due yesterday: nobody holds it, so the person who started the list hears.
+    const added = await call(
+      hr.checklists.items.add,
+      { workspaceId: WS_O, checklistId: list.id, title: 'Pooled and late', dueOn: shiftDays(today, -1) },
+      asHr,
+    )
+    const pooled = itemOf(added, 'Pooled and late')
+    // And a late task that was ticked in time is not late.
+    await call(hr.checklists.items.complete, { workspaceId: WS_O, itemId: late }, asHr)
+    NOTIFIED.length = 0
+    await sweep()
+    expect(overdue().map((n) => [n.userId, (n.data as { itemId?: string }).itemId])).toEqual([
+      [ALICE, pooled],
+    ])
+  }, 30_000)
+
+  it('leaves a cancelled list alone', async () => {
+    const other = await call(
+      hr.checklists.items.add,
+      { workspaceId: WS_O, checklistId: list.id, title: 'Cancelled and late', dueOn: shiftDays(today, -1) },
+      asHr,
+    )
+    await call(hr.checklists.cancel, { workspaceId: WS_O, checklistId: other.id }, asHr)
+    NOTIFIED.length = 0
+    await sweep()
+    expect(overdue()).toHaveLength(0)
+  }, 30_000)
 })

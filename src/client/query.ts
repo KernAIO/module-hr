@@ -122,6 +122,12 @@ export const hrKeys = {
   /** The horizons with their counts. One read per workspace; the settings screen is the only asker. */
   retention: (ws: string) => ['hr', 'retention', ws] as const,
   /**
+   * Every retention sweep that ran. Keyed by the entity name the server announces
+   * (`changed(ws, 'retention_run', …)`), so a run finishing on the nightly job or in somebody
+   * else's tab refreshes the list rather than leaving it a reload behind.
+   */
+  retentionRuns: (ws: string) => ['hr', 'retention_run', ws] as const,
+  /**
    * Who read one person's sensitive fields. Keyed by the subject, because the same panel asks about
    * different people and a viewer's own log must never be served a colleague's from cache.
    */
@@ -162,6 +168,25 @@ export const hrKeys = {
   reportAbsence: (ws: string, input: ReportRangeInput) => ['hr', 'report-absence', ws, input] as const,
   reportLeaveBalance: (ws: string, input: ReportBalanceInput) =>
     ['hr', 'report-leave-balance', ws, input] as const,
+  /**
+   * Checklists are keyed by the entity the server announces — `router.ts` calls
+   * `changed(ws, 'checklist' | 'checklist_template', …)` after every write — so a tick on one
+   * screen reaches every other list, panel section and widget through the realtime client's
+   * `[module, entity]` invalidation rather than through a reload.
+   *
+   * The filters are part of the key: an open-only list and an all-status list are different rows
+   * from the server, and sharing one key would show a filter the other's answer for as long as the
+   * refetch takes.
+   */
+  checklists: (ws: string, filters?: Record<string, unknown>) =>
+    filters
+      ? (['hr', 'checklist', ws, 'list', filters] as const)
+      : (['hr', 'checklist', ws, 'list'] as const),
+  checklist: (ws: string, id: string) => ['hr', 'checklist', ws, 'one', id] as const,
+  /** The open lists with something for the reader to do, items included — the widget and My tasks. */
+  myChecklistTasks: (ws: string) => ['hr', 'checklist', ws, 'mine'] as const,
+  checklistTemplates: (ws: string, includeArchived = false) =>
+    ['hr', 'checklist_template', ws, includeArchived ? 'with-archived' : 'live'] as const,
 } as const
 
 /** What narrows a day-sheet report: the range, the slice, and how many rows to draw. */

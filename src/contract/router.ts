@@ -18,6 +18,15 @@ import {
   ScheduleAssignment,
   ScheduleWeek,
 } from './attendance.js'
+import {
+  Checklist,
+  ChecklistItemInput,
+  ChecklistKind,
+  ChecklistStatus,
+  ChecklistSummary,
+  ChecklistTemplate,
+  ChecklistTemplateInput,
+} from './checklists.js'
 import { PayrollExport, PayrollExportPreview } from './exports.js'
 import {
   DayPart,
@@ -66,7 +75,8 @@ import {
 } from './policies.js'
 import {
   ErasureReport,
-  HrRetention,
+  RetentionPatch,
+  RetentionRun,
   RetentionSettings,
   SensitiveAccess,
   SubjectAccessBundle,
@@ -175,6 +185,18 @@ export const hrContract = {
           photoFileId: z.uuid().nullish(),
           timezone: TimeZone.nullish(),
           custom: z.record(z.string(), z.unknown()).optional(),
+          /**
+           * The lifecycle, short of the end of it: `onboarding`, `active`, `on_leave` and
+           * `offboarding` are states somebody moves a person between by hand. `terminated` is not
+           * here — ending employment closes the open employment and office rows as well, and that
+           * is `offboard` below. Moving somebody to `offboarding` starts the default offboarding
+           * checklist, anchored on `terminatedOn` when it is known; until this field existed no
+           * API call could reach that state at all.
+           */
+          status: PersonStatus.exclude(['terminated']).optional(),
+          hiredOn: IsoDate.nullish(),
+          /** The planned last day, which a leaver's checklist counts from. */
+          terminatedOn: IsoDate.nullish(),
         }),
       )
       .output(Person),
@@ -1638,6 +1660,105 @@ export const hrContract = {
     },
   },
 
+  // ---------------------------------------------------------------- checklists
+  /**
+   * Onboarding and offboarding checklists, behind the `checklists` capability.
+   *
+   * Templates are workspace configuration and take `hr.checklist.manage`. Reading a checklist is
+   * `hr.checklist.view`, which every member holds — but the handler narrows: without `manage`, a
+   * reader sees the checklists about *themselves* and the ones with an item assigned to them, and
+   * nothing else. Ticking an item is the assignee's or a manager's; the handler decides, because
+   * "whose item is this" is a fact about the row and not about a key.
+   */
+  checklists: {
+    templates: {
+      list: baseContract
+        .route({ method: 'GET', path: '/checklists/templates', tags: t })
+        .input(ws.extend({ includeArchived: z.boolean().default(false) }))
+        .output(z.array(ChecklistTemplate)),
+      create: baseContract
+        .route({ method: 'POST', path: '/checklists/templates', tags: t })
+        .input(ws.extend(ChecklistTemplateInput.shape))
+        .output(ChecklistTemplate),
+      /**
+       * Everything, items included. The item list is replaced whole and in the order given — a
+       * template is a document somebody edits, not a set of rows somebody patches — and none of
+       * it reaches a checklist already started.
+       */
+      update: baseContract
+        .route({ method: 'PATCH', path: '/checklists/templates/{templateId}', tags: t })
+        .input(ws.extend({ templateId: z.uuid(), ...ChecklistTemplateInput.partial().shape }))
+        .output(ChecklistTemplate),
+      archive: baseContract
+        .route({ method: 'POST', path: '/checklists/templates/{templateId}/archive', tags: t })
+        .input(ws.extend({ templateId: z.uuid(), archived: z.boolean().default(true) }))
+        .output(ChecklistTemplate),
+    },
+    /**
+     * Open and finished checklists, newest first, without their items.
+     *
+     * `mine` is the self-service view — about me, or with something for me to do — and is the
+     * whole answer for a reader without `hr.checklist.manage` whatever else they asked for.
+     */
+    list: baseContract
+      .route({ method: 'GET', path: '/checklists', tags: t })
+      .input(
+        ws.extend({
+          personId: z.uuid().optional(),
+          status: ChecklistStatus.optional(),
+          kind: ChecklistKind.optional(),
+          mine: z.boolean().default(false),
+          limit: z.number().int().min(1).max(200).default(50),
+        }),
+      )
+      .output(z.array(ChecklistSummary)),
+    get: baseContract
+      .route({ method: 'GET', path: '/checklists/{checklistId}', tags: t })
+      .input(ws.extend({ checklistId: z.uuid() }))
+      .output(Checklist),
+    /**
+     * Start one from a template, for a person, dated from an anchor.
+     *
+     * The anchor defaults to the person's hire date for onboarding and their leaving date for
+     * offboarding, and to today when the record has neither. Assignees are resolved now, from
+     * the employment in force today; the template's items are copied and never read again.
+     */
+    start: baseContract
+      .route({ method: 'POST', path: '/checklists', tags: t })
+      .input(ws.extend({ personId: z.uuid(), templateId: z.uuid(), anchorDate: IsoDate.optional() }))
+      .output(Checklist),
+    /** Nothing is deleted: the list stays, marked cancelled, with whatever was ticked. */
+    cancel: baseContract
+      .route({ method: 'POST', path: '/checklists/{checklistId}/cancel', tags: t })
+      .input(ws.extend({ checklistId: z.uuid() }))
+      .output(Checklist),
+    items: {
+      /** Tick it. The assignee, or anybody who may manage checklists; a note is optional. */
+      complete: baseContract
+        .route({ method: 'POST', path: '/checklists/items/{itemId}/complete', tags: t })
+        .input(ws.extend({ itemId: z.uuid(), note: z.string().max(1000).nullish() }))
+        .output(Checklist),
+      reopen: baseContract
+        .route({ method: 'POST', path: '/checklists/items/{itemId}/reopen', tags: t })
+        .input(ws.extend({ itemId: z.uuid() }))
+        .output(Checklist),
+      /** Hand it to somebody, or back to the pool with `null`. The new assignee is told. */
+      assign: baseContract
+        .route({ method: 'POST', path: '/checklists/items/{itemId}/assign', tags: t })
+        .input(ws.extend({ itemId: z.uuid(), assigneePersonId: z.uuid().nullable() }))
+        .output(Checklist),
+      /** A task that was never on the template — this joiner needs a parking permit. */
+      add: baseContract
+        .route({ method: 'POST', path: '/checklists/{checklistId}/items', tags: t })
+        .input(ws.extend({ checklistId: z.uuid(), ...ChecklistItemInput.shape }))
+        .output(Checklist),
+      remove: baseContract
+        .route({ method: 'DELETE', path: '/checklists/items/{itemId}', tags: t })
+        .input(ws.extend({ itemId: z.uuid() }))
+        .output(Checklist),
+    },
+  },
+
   // ---------------------------------------------------------------- privacy
   privacy: {
     /**
@@ -1738,12 +1859,36 @@ export const hrContract = {
         .output(RetentionSettings),
       /**
        * Set them. A field left out is unchanged; a field sent as `null` goes back to "keep
-       * indefinitely", which is what every class ships as.
+       * indefinitely", which is what every class ships as. `sweepEnabled` left out is unchanged
+       * too — a screen saving horizons must not switch the sweep on or off behind somebody's back.
        */
       set: baseContract
         .route({ method: 'PUT', path: '/privacy/retention', tags: t })
-        .input(ws.extend({ retention: HrRetention.partial() }))
+        .input(ws.extend({ retention: RetentionPatch.default({}), sweepEnabled: z.boolean().optional() }))
         .output(RetentionSettings),
+
+      /**
+       * Sweep now, or say what a sweep would do.
+       *
+       * **`dryRun` defaults to true**, for the reason `privacy.erase` gives: this is agent-callable
+       * the day it ships, and the call made with no arguments has to be the harmless one. A dry run
+       * writes nothing but its own record. The act is one transaction per workspace — every class
+       * commits or none does — and it is recorded either way, with what each class matched, what
+       * was affected and what sat in a locked period and was left alone. Nothing runs for a class
+       * with no horizon. The nightly job calls the same code with the same flag off.
+       */
+      run: baseContract
+        .route({ method: 'POST', path: '/privacy/retention/run', tags: t })
+        .input(ws.extend({ dryRun: z.boolean().default(true) }))
+        .output(RetentionRun),
+
+      runs: {
+        /** Every sweep this workspace has run, newest first. Dry runs and failures included. */
+        list: baseContract
+          .route({ method: 'GET', path: '/privacy/retention/runs', tags: t })
+          .input(ws.extend({ limit: z.number().int().min(1).max(200).default(50) }))
+          .output(z.array(RetentionRun)),
+      },
     },
   },
 }

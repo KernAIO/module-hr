@@ -36,6 +36,32 @@ export const hrEvents = {
       on: z.iso.date(),
     }),
   ),
+  /**
+   * A checklist began for somebody, and one finished.
+   *
+   * `started` is what an IT or facilities module reacts to — "somebody is joining on the 14th" is
+   * the moment to order a laptop — and `completed` is the moment the same module may close its own
+   * ticket. Both carry the kind, so a subscriber that only cares about leavers filters on the
+   * payload rather than fetching the row.
+   */
+  checklistStarted: defineEvent(
+    'hr.checklist.started',
+    z.object({
+      checklistId: z.uuid(),
+      personId: z.uuid(),
+      workspaceId: WorkspaceId,
+      kind: z.enum(['onboarding', 'offboarding']),
+    }),
+  ),
+  checklistCompleted: defineEvent(
+    'hr.checklist.completed',
+    z.object({
+      checklistId: z.uuid(),
+      personId: z.uuid(),
+      workspaceId: WorkspaceId,
+      kind: z.enum(['onboarding', 'offboarding']),
+    }),
+  ),
   employmentChanged: defineEvent(
     'hr.employment.changed',
     z.object({

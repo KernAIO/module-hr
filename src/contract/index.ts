@@ -9,6 +9,7 @@
 export * from './approvals.js'
 export * from './attendance.js'
 export * from './capabilities.js'
+export * from './checklists.js'
 export * from './events.js'
 export * from './exports.js'
 export * from './leave.js'

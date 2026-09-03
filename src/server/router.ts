@@ -90,6 +90,7 @@ import { forViewer, HrAccessService, seesRecordOf, visibleSet } from './services
 import { ApprovalService, type SubjectAppliers } from './services/approvals.js'
 import { AttendanceService } from './services/attendance.js'
 import { accessLogSort, HrAuditService } from './services/audit.js'
+import { ChecklistService, type ChecklistViewer, type Started } from './services/checklists.js'
 import { inForceOn, todayIso } from './services/db.js'
 import {
   assembleExport,
@@ -121,6 +122,12 @@ import {
   round2,
 } from './services/reports.js'
 import { DEFAULT_WORKING_WEEK, ResolveService } from './services/resolve.js'
+import {
+  announceRetentionSweep,
+  RetentionSweep,
+  type SweepOutcome,
+  toRetentionRun,
+} from './services/retention.js'
 import { type ResolvedRosterDay, RosterService, rosterRefusal } from './services/rosters.js'
 import { HrSearchService } from './services/search.js'
 
@@ -649,12 +656,64 @@ export function implement_(kernel: Kernel) {
    */
   const approvals = new ApprovalService(kernel, subjects.appliersFor(null))
   const privacy = new PrivacyService()
+  const sweep = new RetentionSweep(privacy)
   const reports = new ReportsService(resolve)
   const rosters = new RosterService()
   const payroll = new PayrollExportService(reports)
   const audit = new HrAuditService(kernel, access)
   const search = new HrSearchService(kernel)
+  const checklistSvc = new ChecklistService(kernel, resolve)
   const db = kernel.database
+
+  /**
+   * Who is asking, as far as a checklist cares: may they manage, and which HR record is theirs.
+   *
+   * Resolved before the transaction opens — `authz.can` is a broker call — and the person lookup is
+   * its own short transaction for the same reason every other settings read here is.
+   */
+  const checklistViewer = async (context: RequestContext, workspaceId: string): Promise<ChecklistViewer> => {
+    const manage = await kernel.authz.can(context.principal, 'hr.checklist.manage', {
+      kind: 'workspace',
+      workspaceId,
+    })
+    const userId = context.principal.userId
+    const personId = userId
+      ? ((await db.withWorkspace(workspaceId, (tx) => svc.byUserId(tx, workspaceId, userId)))?.id ?? null)
+      : null
+    return { manage, personId }
+  }
+
+  /** Everything a started checklist announces, once the transaction that started it has committed. */
+  const announceStarted = async (workspaceId: WorkspaceId, started: Started, actorUserId: string | null) => {
+    const { checklist } = started
+    await kernel.emit(
+      hrEvents.checklistStarted,
+      { checklistId: checklist.id, personId: checklist.personId, workspaceId, kind: checklist.kind },
+      { workspaceId, actorId: actorUserId ?? undefined },
+    )
+    await changed(workspaceId, 'checklist', checklist.id, 'created')
+    await checklistSvc.notifyAssigned(workspaceId, checklist, started.assigneePersonIds, actorUserId)
+  }
+
+  /**
+   * The automatic start a hire or a leaver triggers.
+   *
+   * Its own transaction after the person's has committed: the capability is a broker read that
+   * must not sit inside the write, and a checklist for a person whose row rolled back is a list
+   * about nobody. `startDefault` answers null when there is no default template or one is already
+   * running, and null here is nothing to announce.
+   */
+  const autoStart = async (
+    workspaceId: WorkspaceId,
+    input: { personId: string; kind: 'onboarding' | 'offboarding'; anchorDate: string },
+    actorUserId: string | null,
+  ) => {
+    if (!(await kernel.capabilities(workspaceId, MODULE_ID)).has('checklists')) return
+    const started = await db.withWorkspace(workspaceId, (tx) =>
+      checklistSvc.startDefault(tx, workspaceId, { ...input, actorUserId }),
+    )
+    if (started) await announceStarted(workspaceId, started, actorUserId)
+  }
   const settingsOf = (workspaceId: string) => kernel.settings.module(workspaceId, MODULE_ID, HrSettings)
 
   /**
@@ -675,6 +734,18 @@ export function implement_(kernel: Kernel) {
     await kernel.realtime.change(workspaceId, { module: MODULE_ID, entity, id, op })
     if (entity === 'person') await search.reindex(workspaceId, id)
   }
+
+  /**
+   * What a retention sweep announces once its transaction has committed.
+   *
+   * The run itself, always — a dry run is a row the runs list should show without a reload. On a
+   * real run, every person `terminatedPeople` redacted is a different directory record now and is
+   * announced as one, which also takes them out of the search index; everybody else a row was
+   * deleted for gets the change attendance screens listen to, since punches and day sheets are
+   * the classes that move most. Shared with the nightly job through `announceRetentionSweep`.
+   */
+  const announceSweep = (workspaceId: string, outcome: SweepOutcome) =>
+    announceRetentionSweep(kernel, search, workspaceId, outcome)
 
   return os.router({
     // ================================================================= people
@@ -894,6 +965,12 @@ export function implement_(kernel: Kernel) {
           { workspaceId: input.workspaceId, actorId: context.principal.userId },
         )
         await changed(input.workspaceId, 'person', row.id, 'created')
+        // A hire starts the default onboarding checklist, counted from the hire date.
+        await autoStart(
+          input.workspaceId,
+          { personId: row.id, kind: 'onboarding', anchorDate: row.hiredOn ?? todayIso() },
+          context.principal.userId ?? null,
+        )
         return PeopleService.toPerson(row)
       }),
 
@@ -926,13 +1003,37 @@ export function implement_(kernel: Kernel) {
             .where(and(eq(people.workspaceId, workspaceId), eq(people.id, personId)))
             .returning()
           await svc.record(tx, workspaceId, personId, context.principal.userId ?? null, history)
-          return { updated: updated!, fields: history.map((h) => h.field) }
+          return { updated: updated!, fields: history.map((h) => h.field), before }
         })
         await kernel.emit(
           hrEvents.personUpdated,
           { personId, workspaceId, fields: row.fields },
           { workspaceId, actorId: context.principal.userId },
         )
+        // A lifecycle move is its own event, for the reason `personStatusChanged` gives: the things
+        // that react to one do not want to sift every profile edit to find it. `on` is the planned
+        // last day for a leaver and today for every other move, which is when it became true.
+        if (row.before.status !== row.updated.status)
+          await kernel.emit(
+            hrEvents.personStatusChanged,
+            {
+              personId,
+              workspaceId,
+              from: row.before.status,
+              to: row.updated.status,
+              on: (row.updated.status === 'offboarding' && row.updated.terminatedOn) || todayIso(),
+            },
+            { workspaceId, actorId: context.principal.userId },
+          )
+        // Moving somebody to `offboarding` is the moment a leaver's checklist begins, counted from
+        // the leaving date when it is known. `people.offboard` starts one too and `startDefault`
+        // refuses a second while the first is open, so the two paths cannot make two lists.
+        if (row.before.status !== 'offboarding' && row.updated.status === 'offboarding')
+          await autoStart(
+            workspaceId,
+            { personId, kind: 'offboarding', anchorDate: row.updated.terminatedOn ?? todayIso() },
+            context.principal.userId ?? null,
+          )
         await changed(workspaceId, 'person', personId, 'updated')
         return PeopleService.toPerson(row.updated)
       }),
@@ -998,6 +1099,13 @@ export function implement_(kernel: Kernel) {
             { workspaceId: input.workspaceId, actorId: context.principal.userId },
           )
           await changed(input.workspaceId, 'person', input.personId, 'updated')
+          // The leaver's checklist, counted from the last day — unless one is already running
+          // from the move to `offboarding`, in which case that one stands.
+          await autoStart(
+            input.workspaceId,
+            { personId: input.personId, kind: 'offboarding', anchorDate: input.on },
+            context.principal.userId ?? null,
+          )
           return PeopleService.toPerson(row.updated)
         }),
 
@@ -4966,6 +5074,208 @@ export function implement_(kernel: Kernel) {
       },
     },
 
+    // ================================================================= checklists
+    /**
+     * Onboarding and offboarding checklists, behind the `checklists` capability.
+     *
+     * Templates take `hr.checklist.manage`. Everything else takes `hr.checklist.view`, which every
+     * member holds, and the service narrows by viewer: a manager sees all, anybody else sees the
+     * lists about themselves and the items assigned to them. The narrowing lives in
+     * `ChecklistService.visibleTo` so `list` and `get` cannot disagree about it.
+     */
+    checklists: {
+      templates: {
+        list: scoped.checklists.templates.list
+          .use(cap('checklists'))
+          .use(requires('hr.checklist.manage'))
+          .handler(({ input }) =>
+            db.withWorkspace(input.workspaceId, (tx) =>
+              checklistSvc.listTemplates(tx, input.workspaceId, input.includeArchived),
+            ),
+          ),
+        create: scoped.checklists.templates.create
+          .use(cap('checklists'))
+          .use(requires('hr.checklist.manage'))
+          .handler(async ({ input }) => {
+            const { workspaceId, ...template } = input
+            const row = await db.withWorkspace(workspaceId, (tx) =>
+              checklistSvc.createTemplate(tx, workspaceId, template),
+            )
+            await changed(workspaceId, 'checklist_template', row.id, 'created')
+            return row
+          }),
+        update: scoped.checklists.templates.update
+          .use(cap('checklists'))
+          .use(requires('hr.checklist.manage'))
+          .handler(async ({ input }) => {
+            const { workspaceId, templateId, ...patch } = input
+            const row = await db.withWorkspace(workspaceId, (tx) =>
+              checklistSvc.updateTemplate(tx, workspaceId, templateId, patch),
+            )
+            await changed(workspaceId, 'checklist_template', row.id, 'updated')
+            return row
+          }),
+        archive: scoped.checklists.templates.archive
+          .use(cap('checklists'))
+          .use(requires('hr.checklist.manage'))
+          .handler(async ({ input }) => {
+            const row = await db.withWorkspace(input.workspaceId, (tx) =>
+              checklistSvc.archiveTemplate(tx, input.workspaceId, input.templateId, input.archived),
+            )
+            await changed(input.workspaceId, 'checklist_template', row.id, 'updated')
+            return row
+          }),
+      },
+
+      list: scoped.checklists.list
+        .use(cap('checklists'))
+        .use(requires('hr.checklist.view'))
+        .handler(async ({ input, context }) => {
+          const viewer = await checklistViewer(context, input.workspaceId)
+          return db.withWorkspace(input.workspaceId, (tx) =>
+            checklistSvc.list(tx, input.workspaceId, viewer, {
+              ...(input.personId ? { personId: input.personId } : {}),
+              ...(input.status ? { status: input.status } : {}),
+              ...(input.kind ? { kind: input.kind } : {}),
+              mine: input.mine,
+              limit: input.limit,
+            }),
+          )
+        }),
+
+      get: scoped.checklists.get
+        .use(cap('checklists'))
+        .use(requires('hr.checklist.view'))
+        .handler(async ({ input, context }) => {
+          const viewer = await checklistViewer(context, input.workspaceId)
+          return db.withWorkspace(input.workspaceId, (tx) =>
+            checklistSvc.get(tx, input.workspaceId, input.checklistId, viewer),
+          )
+        }),
+
+      start: scoped.checklists.start
+        .use(cap('checklists'))
+        .use(requires('hr.checklist.manage'))
+        .handler(async ({ input, context }) => {
+          const actorUserId = context.principal.userId ?? null
+          const started = await db.withWorkspace(input.workspaceId, (tx) =>
+            checklistSvc.start(tx, input.workspaceId, {
+              personId: input.personId,
+              templateId: input.templateId,
+              ...(input.anchorDate ? { anchorDate: input.anchorDate } : {}),
+              actorUserId,
+            }),
+          )
+          await announceStarted(input.workspaceId, started, actorUserId)
+          return started.checklist
+        }),
+
+      cancel: scoped.checklists.cancel
+        .use(cap('checklists'))
+        .use(requires('hr.checklist.manage'))
+        .handler(async ({ input }) => {
+          const row = await db.withWorkspace(input.workspaceId, (tx) =>
+            checklistSvc.cancel(tx, input.workspaceId, input.checklistId),
+          )
+          await changed(input.workspaceId, 'checklist', row.id, 'updated')
+          return row
+        }),
+
+      items: {
+        complete: scoped.checklists.items.complete
+          .use(cap('checklists'))
+          .use(requires('hr.checklist.view'))
+          .handler(async ({ input, context }) => {
+            const viewer = await checklistViewer(context, input.workspaceId)
+            const actorUserId = context.principal.userId ?? null
+            const ticked = await db.withWorkspace(input.workspaceId, (tx) =>
+              checklistSvc.complete(
+                tx,
+                input.workspaceId,
+                input.itemId,
+                input.note ?? null,
+                viewer,
+                actorUserId,
+              ),
+            )
+            await changed(input.workspaceId, 'checklist', ticked.checklist.id, 'updated')
+            if (ticked.completedNow) {
+              const { checklist } = ticked
+              await kernel.emit(
+                hrEvents.checklistCompleted,
+                {
+                  checklistId: checklist.id,
+                  personId: checklist.personId,
+                  workspaceId: input.workspaceId,
+                  kind: checklist.kind,
+                },
+                { workspaceId: input.workspaceId, actorId: actorUserId ?? undefined },
+              )
+              await checklistSvc.notifyCompleted(input.workspaceId, checklist, actorUserId)
+            }
+            return ticked.checklist
+          }),
+        reopen: scoped.checklists.items.reopen
+          .use(cap('checklists'))
+          .use(requires('hr.checklist.view'))
+          .handler(async ({ input, context }) => {
+            const viewer = await checklistViewer(context, input.workspaceId)
+            const ticked = await db.withWorkspace(input.workspaceId, (tx) =>
+              checklistSvc.reopen(tx, input.workspaceId, input.itemId, viewer),
+            )
+            await changed(input.workspaceId, 'checklist', ticked.checklist.id, 'updated')
+            return ticked.checklist
+          }),
+        assign: scoped.checklists.items.assign
+          .use(cap('checklists'))
+          .use(requires('hr.checklist.manage'))
+          .handler(async ({ input, context }) => {
+            const actorUserId = context.principal.userId ?? null
+            const result = await db.withWorkspace(input.workspaceId, (tx) =>
+              checklistSvc.assign(tx, input.workspaceId, input.itemId, input.assigneePersonId),
+            )
+            await changed(input.workspaceId, 'checklist', result.checklist.id, 'updated')
+            if (result.notifyPersonId)
+              await checklistSvc.notifyAssigned(
+                input.workspaceId,
+                result.checklist,
+                [result.notifyPersonId],
+                actorUserId,
+              )
+            return result.checklist
+          }),
+        add: scoped.checklists.items.add
+          .use(cap('checklists'))
+          .use(requires('hr.checklist.manage'))
+          .handler(async ({ input, context }) => {
+            const { workspaceId, checklistId, ...item } = input
+            const actorUserId = context.principal.userId ?? null
+            const result = await db.withWorkspace(workspaceId, (tx) =>
+              checklistSvc.addItem(tx, workspaceId, checklistId, item),
+            )
+            await changed(workspaceId, 'checklist', result.checklist.id, 'updated')
+            if (result.notifyPersonId)
+              await checklistSvc.notifyAssigned(
+                workspaceId,
+                result.checklist,
+                [result.notifyPersonId],
+                actorUserId,
+              )
+            return result.checklist
+          }),
+        remove: scoped.checklists.items.remove
+          .use(cap('checklists'))
+          .use(requires('hr.checklist.manage'))
+          .handler(async ({ input }) => {
+            const row = await db.withWorkspace(input.workspaceId, (tx) =>
+              checklistSvc.removeItem(tx, input.workspaceId, input.itemId),
+            )
+            await changed(input.workspaceId, 'checklist', row.id, 'updated')
+            return row
+          }),
+      },
+    },
+
     // ================================================================= privacy
     /**
      * Subject access, erasure and retention.
@@ -5198,19 +5508,21 @@ export function implement_(kernel: Kernel) {
 
       retention: {
         /**
-         * The horizons, and what is already past them.
+         * The horizons, what is already past them, and whether the nightly sweep acts on them.
          *
-         * `sweepEnabled` is a literal `false` in the contract, and it says the thing this feature
-         * must not imply: nothing in HR deletes on a timer. The horizons are read here, to count
-         * what has passed one, and by `privacy.erase`, to say under which horizon each surviving
-         * class was kept. An unattended job that prunes personnel records is the one act in this
-         * module that cannot be undone by re-running anything, so it ships off, with a dry run and
-         * a per-run report naming every person it touched — and until it exists, saying so in the
-         * response is what keeps this screen from promising it.
+         * The horizons are read in three places: here, to count what has passed one; by
+         * `privacy.erase`, to say under which horizon each surviving class was kept; and by
+         * `RetentionSweep`, which acts on them — nightly where `sweepEnabled` is true, and on
+         * demand through `run` below. The count and the sweep are one predicate per class, so the
+         * number beside a horizon on the settings screen is the number the sweep will report as
+         * matched.
          */
         get: scoped.privacy.retention.get.use(requires('hr.privacy.manage')).handler(({ input }) =>
           db.withWorkspace(input.workspaceId, async (tx) => {
-            const { retention, updatedAt, updatedBy } = await privacy.retention(tx, input.workspaceId)
+            const { retention, updatedAt, updatedBy, sweepEnabled } = await privacy.retention(
+              tx,
+              input.workspaceId,
+            )
             const counts = input.withCounts
               ? await privacy.retentionCounts(tx, input.workspaceId, retention)
               : null
@@ -5223,18 +5535,19 @@ export function implement_(kernel: Kernel) {
               })),
               updatedAt: updatedAt?.toISOString() ?? null,
               updatedBy,
-              sweepEnabled: false as const,
+              sweepEnabled,
             }
           }),
         ),
 
         set: scoped.privacy.retention.set.use(requires('hr.privacy.manage')).handler(({ input, context }) =>
           db.withWorkspace(input.workspaceId, async (tx) => {
-            const { retention, updatedAt, updatedBy } = await privacy.setRetention(
+            const { retention, updatedAt, updatedBy, sweepEnabled } = await privacy.setRetention(
               tx,
               input.workspaceId,
               input.retention,
               context.principal.userId ?? null,
+              input.sweepEnabled,
             )
             // The counts are not recomputed on a write: a screen that has just changed a horizon
             // asks for them again, and doing eight counts inside the write transaction would hold
@@ -5248,10 +5561,57 @@ export function implement_(kernel: Kernel) {
               })),
               updatedAt: updatedAt?.toISOString() ?? null,
               updatedBy,
-              sweepEnabled: false as const,
+              sweepEnabled,
             }
           }),
         ),
+
+        /**
+         * Sweep now, or preview one. The same code the nightly job runs, in one transaction.
+         *
+         * A run that throws has rolled back and touched nothing; it is recorded afterwards, in its
+         * own transaction, as a run with an error, and the error is then rethrown so the screen
+         * that pressed the button hears it too. Announcements happen after the commit, for the
+         * reason every other write here gives: a realtime change for a preview nobody committed
+         * would blank cards across the workspace for nothing.
+         */
+        run: scoped.privacy.retention.run
+          .use(requires('hr.privacy.manage'))
+          .handler(async ({ input, context }) => {
+            const { workspaceId } = input
+            const startedAt = new Date()
+            const actorUserId = context.principal.userId ?? null
+            let outcome: SweepOutcome
+            try {
+              outcome = await db.withWorkspace(workspaceId, (tx) =>
+                sweep.run(tx, workspaceId, { dryRun: input.dryRun, actorUserId, startedAt }),
+              )
+            } catch (err) {
+              const message = err instanceof Error ? err.message : String(err)
+              const failed = await db.withWorkspace(workspaceId, (tx) =>
+                sweep.recordFailure(tx, workspaceId, {
+                  startedAt,
+                  dryRun: input.dryRun,
+                  actorUserId,
+                  error: message,
+                }),
+              )
+              await changed(workspaceId, 'retention_run', failed.id, 'created')
+              throw err
+            }
+            await announceSweep(workspaceId, outcome)
+            return toRetentionRun(outcome.run)
+          }),
+
+        runs: {
+          list: scoped.privacy.retention.runs.list
+            .use(requires('hr.privacy.manage'))
+            .handler(({ input }) =>
+              db.withWorkspace(input.workspaceId, async (tx) =>
+                (await sweep.list(tx, input.workspaceId, input.limit)).map(toRetentionRun),
+              ),
+            ),
+        },
       },
     },
   })
