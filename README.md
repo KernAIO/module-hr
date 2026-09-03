@@ -76,7 +76,7 @@ The capabilities, and what each one puts behind itself:
   in it, or a person with no employment covering their days — a draft is the one escape, and a draft
   stamps itself in the manifest, the filename and every row.
 
-Two things are not capabilities, on purpose:
+Three things are not capabilities, on purpose:
 
 - **Reports** — attendance, overtime, absence and leave balances, each stating its own denominator
   ("47 hours · 12 of 38 people · 1–31 October · Istanbul office"), which permission produced it,
