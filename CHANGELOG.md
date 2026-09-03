@@ -1,5 +1,11 @@
 # @kernhq/module-hr
 
+## 0.23.1
+
+### Patch Changes
+
+- test(hr): bless the permission matrix
+
 ## 0.23.0
 
 ### Minor Changes
