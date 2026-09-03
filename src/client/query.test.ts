@@ -22,8 +22,33 @@ describe('hrKeys', () => {
       hrKeys.offices('ws'),
       hrKeys.clockState('ws'),
       hrKeys.approvalInbox('ws'),
+      hrKeys.costCenters('ws'),
     ])
       expect(key[0]).toBe('hr')
+  })
+
+  /**
+   * A settings screen asks for the archived rows too, and the pickers elsewhere must never be
+   * served that answer — an archived employer offered as the one to file a payroll under is the
+   * defect these three keys exist to prevent.
+   */
+  it('keeps a list that includes archived rows out of the picker’s cache entry', () => {
+    expect(hrKeys.entitiesAll('ws')).not.toEqual(hrKeys.entities('ws'))
+    expect(hrKeys.officesAll('ws')).not.toEqual(hrKeys.offices('ws'))
+    expect(hrKeys.orgUnitsAll('ws')).not.toEqual(hrKeys.orgUnits('ws'))
+  })
+
+  /**
+   * `router.ts` announces `cost_center` and `legal_entity` after every write and the realtime
+   * client invalidates by the `[module, entity]` prefix, so a key spelt any other way — `entities`,
+   * say, after the screen rather than after the announcement — is never refetched when somebody
+   * else adds one.
+   */
+  it('names the keys after the entity the server announces', () => {
+    expect(hrKeys.costCenters('ws')).toEqual(['hr', 'cost_center', 'ws'])
+    expect(hrKeys.entities('ws')).toEqual(['hr', 'legal_entity', 'ws'])
+    // The suffix is what keeps it a separate cache; the prefix is what gets it invalidated.
+    expect(hrKeys.entitiesAll('ws')).toEqual(['hr', 'legal_entity', 'ws', 'with-archived'])
   })
 })
 

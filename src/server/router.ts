@@ -1826,19 +1826,28 @@ export function implement_(kernel: Kernel) {
           .use(requires('hr.entity.manage'))
           .handler(async ({ input }) => {
             const row = await db.withWorkspace(input.workspaceId, async (tx) => {
-              const [created] = await tx
-                .insert(costCenters)
-                .values({
-                  id: uuidv7(),
-                  workspaceId: input.workspaceId,
-                  code: input.code,
-                  name: input.name,
-                  officeId: input.officeId ?? null,
-                  orgUnitId: input.orgUnitId ?? null,
-                  legalEntityId: input.legalEntityId ?? null,
-                })
-                .returning()
-              return created!
+              try {
+                const [created] = await tx
+                  .insert(costCenters)
+                  .values({
+                    id: uuidv7(),
+                    workspaceId: input.workspaceId,
+                    code: input.code,
+                    name: input.name,
+                    officeId: input.officeId ?? null,
+                    orgUnitId: input.orgUnitId ?? null,
+                    legalEntityId: input.legalEntityId ?? null,
+                  })
+                  .returning()
+                return created!
+              } catch (err) {
+                // A code is how a cost centre is referred to everywhere outside this table, so the
+                // index holds it unique per workspace — archived rows included, because the code of
+                // an archived centre is still the one an old export names. Without this the driver's
+                // duplicate key escapes as a 500 and the person typing the form is told nothing.
+                if (!isUniqueViolation(err, 'hr_cost_centers_ws_code_uq')) throw err
+                throw KernError.conflict('That code is already used by another cost centre.')
+              }
             })
             await changed(input.workspaceId, 'cost_center', row.id, 'created')
             return { ...row, archivedAt: null }

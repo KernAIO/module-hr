@@ -29,6 +29,7 @@ import {
 import { createMutation, createQuery, useQueryClient } from '@tanstack/svelte-query'
 import { getHrApi } from '../api-instance.js'
 import { HR_CAPABILITIES } from '../capabilities.js'
+import { countryOptions } from '../countries.js'
 import { t } from '../i18n.js'
 import type { Office } from '../index.js'
 import { canHr } from '../permissions.js'
@@ -87,40 +88,9 @@ const count = (n: number) => formatCount(n, Number.MAX_SAFE_INTEGER)
 /**
  * Every country the runtime can name, in the reader's own language.
  *
- * There is no `Intl.supportedValuesOf('region')`, so the set is found by asking `DisplayNames`
- * about all 676 two-letter codes and keeping the ones it answers with a name rather than handing
- * the code back. That costs a fraction of a millisecond once per locale, and it means the list is
- * the same CLDR data the rest of the interface uses instead of a table in this file that goes
- * stale the next time a country changes its name.
+ * The list lives in `countries.ts`, which the legal-entity screen shares: two settings pages
+ * offering two different sets of countries is the kind of difference nobody reports.
  */
-const COUNTRY_CACHE = new Map<string, SelectOption[]>()
-/** Codes `DisplayNames` names that ISO 3166-1 does not: unions, outlying areas, reserved codes. */
-const NOT_COUNTRIES = new Set(['AC', 'CP', 'DG', 'EA', 'EU', 'EZ', 'IC', 'QO', 'TA', 'UN', 'XA', 'XB', 'ZZ'])
-
-function countryOptions(locale: string): SelectOption[] {
-  const cached = COUNTRY_CACHE.get(locale)
-  if (cached) return cached
-  const options: SelectOption[] = []
-  try {
-    const names = new Intl.DisplayNames(locale, { type: 'region' })
-    for (let first = 65; first <= 90; first++) {
-      for (let second = 65; second <= 90; second++) {
-        const code = String.fromCharCode(first, second)
-        if (NOT_COUNTRIES.has(code)) continue
-        const label = names.of(code)
-        if (!label || label === code) continue
-        options.push({ value: code, label })
-      }
-    }
-    options.sort((a, b) => a.label.localeCompare(b.label, locale))
-  } catch {
-    // A runtime without region display names must not take the form down with it; the code itself
-    // is still a valid answer, and the office being edited keeps whatever it already had.
-  }
-  COUNTRY_CACHE.set(locale, options)
-  return options
-}
-
 const countries = $derived(countryOptions(messageLocale()))
 const countryNames = $derived(new Map(countries.map((c) => [c.value, c.label])))
 const countryLabel = (code: string): string => countryNames.get(code) ?? code
@@ -223,14 +193,19 @@ const calendarsQuery = createQuery(() => ({
 
 /**
  * `[module, entity, …scope]`, the shape `hrKeys` uses. Spelled here rather than in `query.ts`
- * because these two are the only screens that ask, and both belong to offices.
+ * because this screen is the only one that asks.
  */
-const entitiesKey = (ws: string) => ['hr', 'entities', ws] as const
 const officePeopleKey = (ws: string, officeId: string, primaryOnly: boolean) =>
   ['hr', 'office-people', ws, officeId, primaryOnly ? 'primary' : 'all'] as const
 
+/**
+ * `hrKeys.entities`, not a local spelling of it. This picker is the same live-employers cache the
+ * reports and accrual screens read, so a second key here would be a second copy that a write to
+ * either never refreshes — and the shared one is spelt after the `legal_entity` the router
+ * announces, which is what gets it invalidated at all.
+ */
 const entitiesQuery = createQuery(() => ({
-  queryKey: entitiesKey(workspaceId),
+  queryKey: hrKeys.entities(workspaceId),
   enabled: Boolean(workspaceId) && hasEntities && draft !== null,
   queryFn: () => api.entities.list({ workspaceId, includeArchived: false }),
 }))

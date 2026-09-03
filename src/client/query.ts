@@ -15,6 +15,13 @@ export const hrKeys = {
   employment: (ws: string, personId: string) => ['hr', 'employment', ws, personId] as const,
   orgUnits: (ws: string) => ['hr', 'org-units', ws] as const,
   offices: (ws: string) => ['hr', 'offices', ws] as const,
+  /**
+   * Offices with the archived ones, as the cost-centre list needs them: a budget booked against an
+   * office that has since been archived still has to say which office, or the row reads as attached
+   * to nothing. Its own entry for the same reason `orgUnitsAll` is one — a query that asks for more
+   * cannot share a key with the pickers that must never offer it.
+   */
+  officesAll: (ws: string) => ['hr', 'offices', ws, 'with-archived'] as const,
   calendars: (ws: string) => ['hr', 'calendars', ws] as const,
   calendarDays: (ws: string, calendarId: string, from: string, to: string) =>
     ['hr', 'calendar-days', ws, calendarId, from, to] as const,
@@ -47,7 +54,35 @@ export const hrKeys = {
    */
   calendarPackPreview: (ws: string, calendarId: string, packKey: string, year: number) =>
     ['hr', 'calendar-pack-preview', ws, calendarId, packKey, year] as const,
-  entities: (ws: string) => ['hr', 'entities', ws] as const,
+  /**
+   * The live employers, as every picker wants them.
+   *
+   * Spelt `legal_entity` because that is the entity `router.ts` announces after a write, and the
+   * realtime client invalidates by the `[module, entity]` prefix — a key named after the screen
+   * would never be refetched when somebody else adds an employer.
+   */
+  entities: (ws: string) => ['hr', 'legal_entity', ws] as const,
+  /**
+   * The employers, archived ones included, as only the settings screen wants them.
+   *
+   * Its own entry rather than `entities`: the pickers on offices, periods and accrual cache that
+   * one and must never be handed an archived employer to assign somebody to. This screen fetches
+   * both and splits them, so the archived toggle costs no round trip — the same split
+   * `orgUnitsAll` makes, for the same reason.
+   *
+   * Spelt `legal_entity` for the reason `entities` is, and the `with-archived` suffix keeps it a
+   * separate cache while still sitting under the `['hr', 'legal_entity']` prefix a write
+   * invalidates — so both are refetched, and neither is served the other's answer.
+   */
+  entitiesAll: (ws: string) => ['hr', 'legal_entity', ws, 'with-archived'] as const,
+  /**
+   * Cost centres, archived ones included; the settings screen is the only asker.
+   *
+   * Spelt `cost_center` because that is the entity `router.ts` announces after a write, and the
+   * realtime client invalidates by the `[module, entity]` prefix — a key named after the screen
+   * would never be refetched when somebody else adds one.
+   */
+  costCenters: (ws: string) => ['hr', 'cost_center', ws] as const,
   officePeople: (ws: string, officeId: string, primaryOnly: boolean) =>
     ['hr', 'office-people', ws, officeId, primaryOnly ? 'primary' : 'all'] as const,
   /**

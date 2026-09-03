@@ -112,8 +112,14 @@ const periodsQuery = createQuery(() => ({
 /** Payroll periods only: the server refuses an attendance period, and offering one would be a trap. */
 const payrollPeriods = $derived((periodsQuery.data?.items ?? []).filter((p) => p.kind === 'payroll'))
 
+/**
+ * `entitiesAll`, not `entities`: this screen asks for the archived employers too, and the pickers
+ * on offices and accrual cache the same procedure without them. Sharing the key meant whichever
+ * screen rendered first decided what the other one saw — an archived employer offered as the one to
+ * assign an office to, or a payroll period that could not name the employer it was filed under.
+ */
 const entitiesQuery = createQuery(() => ({
-  queryKey: hrKeys.entities(workspaceId),
+  queryKey: hrKeys.entitiesAll(workspaceId),
   enabled: Boolean(workspaceId) && hasEntities,
   queryFn: () => api.entities.list({ workspaceId, includeArchived: true }),
 }))

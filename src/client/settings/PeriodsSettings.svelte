@@ -26,7 +26,7 @@ import { getHrApi } from '../api-instance.js'
 import { HR_CAPABILITIES } from '../capabilities.js'
 import { t } from '../i18n.js'
 import { canHr } from '../permissions.js'
-import { isoDate } from '../query.js'
+import { hrKeys, isoDate } from '../query.js'
 
 /**
  * The lock that makes a filed month stay filed.
@@ -78,7 +78,6 @@ const KINDS: Kind[] = ['payroll', 'attendance']
  * because this is the only screen that asks.
  */
 const periodsKey = (ws: string) => ['hr', 'periods', ws] as const
-const entitiesKey = (ws: string) => ['hr', 'entities', ws] as const
 
 /**
  * Every period in one read.
@@ -104,8 +103,14 @@ const periods = $derived(periodsQuery.data?.items ?? [])
 const loading = $derived(!workspaceId || periodsQuery.isLoading)
 const stale = $derived(periodsQuery.isError && periods.length > 0)
 
+/**
+ * `entitiesAll`, not `entities`: this screen asks for the archived employers too — a period filed
+ * under one is still a period somebody must be able to read — and the pickers on offices and
+ * accrual cache the same procedure without them. Sharing the key let whichever screen rendered
+ * first decide what the other one saw.
+ */
 const entitiesQuery = createQuery(() => ({
-  queryKey: entitiesKey(workspaceId),
+  queryKey: hrKeys.entitiesAll(workspaceId),
   enabled: Boolean(workspaceId) && hasEntities,
   queryFn: () => api.entities.list({ workspaceId, includeArchived: true }),
 }))

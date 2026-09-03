@@ -200,7 +200,16 @@ export const hrCapabilityProcedures: Record<string, readonly string[]> = {
     'offices.unassign',
     'offices.people',
   ],
-  legal_entities: ['entities.list', 'entities.get', 'entities.create', 'entities.update', 'entities.archive'],
+  legal_entities: [
+    'entities.list',
+    'entities.get',
+    'entities.create',
+    'entities.update',
+    'entities.archive',
+    'entities.costCenters.list',
+    'entities.costCenters.create',
+    'entities.costCenters.archive',
+  ],
   calendars: [
     'calendars.list',
     'calendars.get',

@@ -347,6 +347,24 @@ export const hrClientModule = defineClientModule({
       component: () => import('./settings/OfficesSettings.svelte'),
     },
     {
+      // Between offices and calendars, because it answers the question the office form asks and
+      // cannot: an office picks its legal entity from a list only this page can fill, and until it
+      // existed that list was empty on every workspace. Payroll depends on the same list.
+      id: 'entities',
+      get label() {
+        return t('settings_entities')
+      },
+      icon: 'building-2',
+      scope: 'workspace',
+      // View, not manage: reading the list is `hr.entity.view` (owner and admin), and gating the
+      // page on manage would leave an admin with no surface listing employers at all. The write
+      // buttons inside the page carry the manage check themselves.
+      permission: HR_PERMISSIONS.entityView,
+      capability: HR_CAPABILITIES.legalEntities,
+      order: 15,
+      component: () => import('./settings/EntitiesSettings.svelte'),
+    },
+    {
       id: 'calendars',
       get label() {
         return t('settings_calendars')

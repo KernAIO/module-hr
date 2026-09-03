@@ -32,6 +32,7 @@ import type {
   Calendar,
   CalendarDay,
   CalendarDayKind,
+  CostCenter,
   CustomFieldDef,
   Employment,
   LegalEntity,
@@ -285,6 +286,44 @@ export function createMockHrApi() {
       taxNo: 'NL812345678B01',
       country: 'NL',
       currency: 'EUR',
+      archivedAt: null,
+    },
+  ]
+
+  /**
+   * Three cost centres, attached three different ways.
+   *
+   * All three attachments are optional in the contract, and a demo where every row names all of
+   * them would hide that — so one is a department inside the Turkish employer, one is a department
+   * with no office of its own, and one is a whole office. The org unit ids are the ones `seedUnit`
+   * uses further down; `id()` is a pure function, so naming them here is safe.
+   */
+  const costCenters: Row<CostCenter>[] = [
+    {
+      id: id('0c01'),
+      code: 'CC-ENG',
+      name: 'Engineering',
+      officeId: id('e001'),
+      orgUnitId: id('0a02'),
+      legalEntityId: id('1e01'),
+      archivedAt: null,
+    },
+    {
+      id: id('0c02'),
+      code: 'CC-PC',
+      name: 'People & Culture',
+      officeId: null,
+      orgUnitId: id('0a06'),
+      legalEntityId: id('1e01'),
+      archivedAt: null,
+    },
+    {
+      id: id('0c03'),
+      code: 'CC-AMS',
+      name: 'Amsterdam',
+      officeId: id('e002'),
+      orgUnitId: null,
+      legalEntityId: id('1e02'),
       archivedAt: null,
     },
   ]
@@ -3068,7 +3107,120 @@ export function createMockHrApi() {
         workspaceId: string
         includeArchived?: boolean
       }) =>
-        entities.filter((e) => includeArchived || e.archivedAt === null).map((e) => ({ ...e, workspaceId })),
+        entities
+          .filter((e) => includeArchived || e.archivedAt === null)
+          // The router orders by name, and the settings screen draws the list in the order it
+          // arrives — so a mock in insertion order would put a new employer somewhere the real API
+          // never does.
+          .sort((a, b) => a.name.localeCompare(b.name))
+          .map((e) => ({ ...e, workspaceId })),
+
+      get: async ({ workspaceId, entityId }: { workspaceId: string; entityId: string }) => {
+        const found = entities.find((e) => e.id === entityId)
+        if (!found) refuse('NOT_FOUND', 'Legal entity not found')
+        return { ...found, workspaceId }
+      },
+
+      create: async (input: {
+        workspaceId: string
+        name: string
+        country: string
+        registrationNo?: string | null
+        taxNo?: string | null
+        currency?: string | null
+      }) => {
+        const created: Row<LegalEntity> = {
+          id: crypto.randomUUID(),
+          name: input.name,
+          registrationNo: input.registrationNo ?? null,
+          taxNo: input.taxNo ?? null,
+          country: input.country,
+          currency: input.currency ?? null,
+          archivedAt: null,
+        }
+        entities.push(created)
+        return { ...created, workspaceId: input.workspaceId }
+      },
+
+      update: async (input: {
+        workspaceId: string
+        entityId: string
+        name?: string
+        country?: string
+        registrationNo?: string | null
+        taxNo?: string | null
+        currency?: string | null
+      }) => {
+        const found = entities.find((e) => e.id === input.entityId)
+        if (!found) refuse('NOT_FOUND', 'Legal entity not found')
+        // `!== undefined`, not truthiness: the router patches every key it was handed, and `null` is
+        // how a registration number is cleared. Dropping it would make the field unclearable.
+        if (input.name !== undefined) found.name = input.name
+        if (input.country !== undefined) found.country = input.country
+        if (input.registrationNo !== undefined) found.registrationNo = input.registrationNo
+        if (input.taxNo !== undefined) found.taxNo = input.taxNo
+        if (input.currency !== undefined) found.currency = input.currency
+        return { ...found, workspaceId: input.workspaceId }
+      },
+
+      // Archived, never deleted: an office, a period and a payroll export all name their employer,
+      // and a row whose employer has vanished is a filing nobody can explain.
+      archive: async ({ entityId }: { workspaceId: string; entityId: string }) => {
+        const found = entities.find((e) => e.id === entityId)
+        // The router's `update` touches no rows for an unknown id and still answers `ok`. Refusing
+        // keeps the demo's own state honest, and no screen can reach it — archiving is only ever
+        // offered on a row already on the page.
+        if (!found) refuse('NOT_FOUND', 'Legal entity not found')
+        found.archivedAt = iso()
+        return { ok: true as const }
+      },
+
+      costCenters: {
+        list: async ({
+          workspaceId,
+          includeArchived = false,
+        }: {
+          workspaceId: string
+          includeArchived?: boolean
+        }) =>
+          costCenters
+            .filter((c) => includeArchived || c.archivedAt === null)
+            // By code, as the router orders them.
+            .sort((a, b) => a.code.localeCompare(b.code))
+            .map((c) => ({ ...c, workspaceId })),
+
+        create: async (input: {
+          workspaceId: string
+          code: string
+          name: string
+          officeId?: string | null
+          orgUnitId?: string | null
+          legalEntityId?: string | null
+        }) => {
+          // The unique index on (workspace, code), as the server would refuse it. Archived rows
+          // count: the index does not exclude them, so a code freed by archiving is not free.
+          if (costCenters.some((c) => c.code === input.code))
+            refuse('CONFLICT', 'That code is already used by another cost centre.')
+          const created: Row<CostCenter> = {
+            id: crypto.randomUUID(),
+            code: input.code,
+            name: input.name,
+            officeId: input.officeId ?? null,
+            orgUnitId: input.orgUnitId ?? null,
+            legalEntityId: input.legalEntityId ?? null,
+            archivedAt: null,
+          }
+          costCenters.push(created)
+          return { ...created, workspaceId: input.workspaceId }
+        },
+
+        archive: async ({ costCenterId }: { workspaceId: string; costCenterId: string }) => {
+          const found = costCenters.find((c) => c.id === costCenterId)
+          if (!found) refuse('NOT_FOUND', 'Cost centre not found')
+          found.archivedAt = iso()
+          return { ok: true as const }
+        },
+      },
     },
 
     calendars: {

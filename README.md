@@ -21,8 +21,8 @@ back with the switch.
 
 The capabilities, and what each one puts behind itself:
 
-- **People** (always on) — the directory, employment records, departments, positions, cost centres,
-  reporting lines and the org chart. A person is HR's noun; an account is core's. Plenty of employees
+- **People** (always on) — the directory, employment records, departments, positions, reporting
+  lines and the org chart. A person is HR's noun; an account is core's. Plenty of employees
   never sign in, so a person may have no account, and an account leaving the workspace clears the
   link and keeps the record — employment history outlives an account, and "she left, so we deleted
   her file" is the answer that fails an audit.
@@ -32,7 +32,9 @@ The capabilities, and what each one puts behind itself:
   to it. Switching this on reveals the list; it migrates nothing.
 - **Legal entities** — several employing companies in one workspace, for a group operating across
   borders. Payroll periods and the payroll export are per entity, because two entities are two
-  filings, in two currencies, to two authorities.
+  filings, in two currencies, to two authorities. **Cost centres** sit behind the same switch: the
+  budget hours are booked against, optionally following an office, a department or an employer, and
+  carried into the payroll file as a code.
 - **Holiday calendars** — public holidays, company closures and the working week. **Country packs**
   for Türkiye, Germany, the United Kingdom, the United States, the Netherlands and Iran ship as
   data a workspace applies one year at a time and then edits; a pack is a default, not legal advice,
