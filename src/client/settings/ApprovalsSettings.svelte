@@ -222,7 +222,7 @@ let formError = $state<string | null>(null)
  * because this is the only screen that asks — the same reason the office roster key is spelled in
  * `OfficesSettings`.
  */
-const chainsKey = (ws: string) => ['hr', 'approval-chains', ws] as const
+const chainsKey = (ws: string) => ['hr', 'approval_chain', ws] as const
 
 /**
  * Every subject type at once, not the filtered call.

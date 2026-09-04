@@ -62,7 +62,7 @@ const current = $derived(currentQuery.data)
 let showHistory = $state(false)
 
 const historyQuery = createQuery(() => ({
-  queryKey: ['hr', 'employment-history', workspaceId, personId] as const,
+  queryKey: ['hr', 'person', workspaceId, 'employment-history', personId] as const,
   enabled: showHistory && Boolean(workspaceId && personId) && mayView,
   queryFn: () => api.employment.history({ workspaceId, personId }),
 }))
@@ -82,12 +82,12 @@ let changing = $state(false)
  * readable.
  */
 const unitsQuery = createQuery(() => ({
-  queryKey: ['hr', 'org-units', workspaceId, 'with-archived'] as const,
+  queryKey: ['hr', 'org_unit', workspaceId, 'with-archived'] as const,
   enabled: Boolean(workspaceId) && mayView && mayReadOrg,
   queryFn: () => api.org.units.tree({ workspaceId, includeArchived: true }),
 }))
 const positionsQuery = createQuery(() => ({
-  queryKey: ['hr', 'positions', workspaceId, 'with-archived'] as const,
+  queryKey: ['hr', 'position', workspaceId, 'with-archived'] as const,
   enabled: Boolean(workspaceId) && mayView && mayReadOrg,
   queryFn: () => api.org.positions.list({ workspaceId, includeArchived: true }),
 }))

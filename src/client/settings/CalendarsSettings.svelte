@@ -171,7 +171,7 @@ const days = $derived(daysQuery.data ?? [])
  * against it, so showing it here is what makes a working-week or holiday edit verifiable.
  */
 const workingDaysQuery = createQuery(() => ({
-  queryKey: ['hr', 'calendar-working-days', workspaceId, selectedId, from, to] as const,
+  queryKey: ['hr', 'calendar', workspaceId, 'working-days', selectedId, from, to] as const,
   enabled: Boolean(workspaceId && selectedId),
   queryFn: () => api.calendars.workingDays({ workspaceId, calendarId: selectedId, from, to }),
 }))
@@ -529,7 +529,7 @@ function openPack() {
 }
 
 const previewQuery = createQuery(() => ({
-  queryKey: ['hr', 'calendar-pack-preview', workspaceId, selectedId, packInput, year] as const,
+  queryKey: ['hr', 'calendar', workspaceId, 'pack-preview', selectedId, packInput, year] as const,
   enabled: Boolean(packOpen && workspaceId && selectedId && packInput),
   // A pack key that does not exist is a typo, not a network blip: answer at once instead of
   // retrying three times behind a spinner.

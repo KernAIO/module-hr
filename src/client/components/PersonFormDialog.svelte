@@ -164,7 +164,7 @@ const create = createMutation(() => ({
     createdId = person.id
     if (fieldsSaved) toast.success(t('person_created', { name: person.displayName }))
     else toast.error(t('person_created_fields_error', { name: person.displayName }))
-    void queryClient.invalidateQueries({ queryKey: ['hr', 'people'] })
+    void queryClient.invalidateQueries({ queryKey: ['hr', 'person'] })
     reset()
     shown = false
     dismiss()

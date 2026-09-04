@@ -140,7 +140,7 @@ const units = $derived((unitsQuery.data ?? []) as UnitRow[])
  * because this screen is the only one that asks for positions, the same way the offices settings
  * page spells its own two.
  */
-const positionsKey = (ws: string) => ['hr', 'positions', ws] as const
+const positionsKey = (ws: string) => ['hr', 'position', ws] as const
 
 const positionsQuery = createQuery(() => ({
   queryKey: positionsKey(workspaceId),

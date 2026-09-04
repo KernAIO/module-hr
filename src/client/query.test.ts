@@ -7,7 +7,7 @@ describe('hrKeys', () => {
   it('scopes a balance by person, so two people do not share a cache entry', () => {
     expect(hrKeys.leaveBalance('ws', 'alice')).not.toEqual(hrKeys.leaveBalance('ws', 'bob'))
     // No person means "me", and that must be its own entry rather than colliding with a named one.
-    expect(hrKeys.leaveBalance('ws', undefined)).toEqual(['hr', 'leave-balance', 'ws', 'me'])
+    expect(hrKeys.leaveBalance('ws', undefined)).toEqual(['hr', 'leave_balance', 'ws', 'me'])
   })
 
   it('scopes attendance by range, so changing the month refetches', () => {
@@ -49,6 +49,153 @@ describe('hrKeys', () => {
     expect(hrKeys.entities('ws')).toEqual(['hr', 'legal_entity', 'ws'])
     // The suffix is what keeps it a separate cache; the prefix is what gets it invalidated.
     expect(hrKeys.entitiesAll('ws')).toEqual(['hr', 'legal_entity', 'ws', 'with-archived'])
+  })
+
+  /**
+   * The screen's own word, where it survives at all, sits *after* the entity.
+   *
+   * That is the whole shape rule: `['hr', <entity>, <workspace>, …whatever tells two questions
+   * apart]`. Put the word second and the `[module, entity]` prefix stops reaching the key, which is
+   * the defect `realtime-keys.test.ts` guards the module against; put it third and both hold.
+   */
+  it('keeps a screen’s own word after the entity, never in its place', () => {
+    expect(hrKeys.me('ws')).toEqual(['hr', 'person', 'ws', 'me'])
+    expect(hrKeys.clockState('ws')).toEqual(['hr', 'attendance_day', 'ws', 'clock-state'])
+    expect(hrKeys.calendarDays('ws', 'cal', '2026-01-01', '2026-01-31')).toEqual([
+      'hr',
+      'calendar',
+      'ws',
+      'days',
+      'cal',
+      '2026-01-01',
+      '2026-01-31',
+    ])
+  })
+
+  /**
+   * The one key deliberately off an announced entity, and the reason is the opposite of every other
+   * key's: the server logs a `sensitive_access_log` row for each read, so a key under `person`
+   * would let a colleague's unrelated write make the cache perform — and record — a disclosure the
+   * viewer never asked for. Staleness is the safer failure on this panel, so it sits under its own
+   * segment and is refetched by the reveal and by this screen's own write.
+   */
+  it('keeps the sensitive panel off the broadly-announced person prefix', () => {
+    expect(hrKeys.sensitive('ws', 'alice')).toEqual(['hr', 'sensitive', 'ws', 'alice'])
+    expect(hrKeys.sensitive('ws', 'alice')[1]).not.toBe('person')
+    // Still scoped by subject: one person's fields must never be served from another's entry.
+    expect(hrKeys.sensitive('ws', 'alice')).not.toEqual(hrKeys.sensitive('ws', 'bob'))
+  })
+
+  /**
+   * `'me'` is a scope word, not an id.
+   *
+   * `hrKeys.me` and `hrKeys.person(ws, 'me')` would build the same tuple, and nothing in the type
+   * system says they must not. What keeps them apart is that a person id is a uuidv7 the server
+   * minted, so the literal can never be one — the same convention `leaveBalance`, `leaveRequests`,
+   * `attendanceDays` and `rosterDays` spell as `personId ?? 'me'`. A real id therefore lands
+   * somewhere else, which is what this pins.
+   */
+  it('keeps a real person id clear of the reserved “me” entry', () => {
+    expect(hrKeys.person('ws', '00000000-0000-1000-8000-000000000000')).not.toEqual(hrKeys.me('ws'))
+    expect(hrKeys.leaveBalance('ws', '00000000-0000-1000-8000-000000000000')).not.toEqual(
+      hrKeys.leaveBalance('ws', undefined),
+    )
+  })
+
+  /**
+   * No two helpers may build the same tuple.
+   *
+   * Renaming fifty keys onto twenty-six entity names is exactly the change that collapses two
+   * different questions onto one cache entry — and the symptom is not an error but one screen
+   * quietly showing another's answer. Every helper is built here with representative arguments and
+   * the results compared pairwise, so a collision fails a test rather than a demo.
+   */
+  it('builds a distinct key for every helper', () => {
+    const ws = 'ws'
+    const range = { from: '2026-01-01', to: '2026-01-31', by: 'workspace' as const, limit: 50 }
+    const balanceInput = { asOf: '2026-01-31', by: 'workspace' as const, limit: 50 }
+    const built: Array<[string, readonly unknown[]]> = [
+      ['people', hrKeys.people(ws)],
+      ['people(filtered)', hrKeys.people(ws, { q: 'ada' })],
+      ['person', hrKeys.person(ws, 'p1')],
+      ['me', hrKeys.me(ws)],
+      ['resolution', hrKeys.resolution(ws, 'p1')],
+      ['employment', hrKeys.employment(ws, 'p1')],
+      ['employmentHistory', hrKeys.employmentHistory(ws, 'p1')],
+      ['documents', hrKeys.documents(ws, 'p1')],
+      ['sensitive', hrKeys.sensitive(ws, 'p1')],
+      ['accessLog', hrKeys.accessLog(ws, 'p1')],
+      ['officePeople', hrKeys.officePeople(ws, 'o1', true)],
+      ['officePeople(all)', hrKeys.officePeople(ws, 'o1', false)],
+      ['orgUnits', hrKeys.orgUnits(ws)],
+      ['orgUnitsAll', hrKeys.orgUnitsAll(ws)],
+      ['positions', hrKeys.positions(ws)],
+      ['offices', hrKeys.offices(ws)],
+      ['officesAll', hrKeys.officesAll(ws)],
+      ['entities', hrKeys.entities(ws)],
+      ['entitiesAll', hrKeys.entitiesAll(ws)],
+      ['costCenters', hrKeys.costCenters(ws)],
+      ['fields', hrKeys.fields(ws)],
+      ['calendars', hrKeys.calendars(ws)],
+      ['calendar', hrKeys.calendar(ws, 'cal')],
+      ['calendarDays', hrKeys.calendarDays(ws, 'cal', range.from, range.to)],
+      ['calendarWorkingDays', hrKeys.calendarWorkingDays(ws, 'cal', range.from, range.to)],
+      ['calendarPackPreview', hrKeys.calendarPackPreview(ws, 'cal', 'ir', 2026)],
+      ['leaveTypes', hrKeys.leaveTypes(ws)],
+      ['leaveBalance(me)', hrKeys.leaveBalance(ws, undefined)],
+      ['leaveBalance(p1)', hrKeys.leaveBalance(ws, 'p1')],
+      ['leaveRequests(me)', hrKeys.leaveRequests(ws, undefined)],
+      ['leaveRequests(p1)', hrKeys.leaveRequests(ws, 'p1')],
+      ['leaveCalendar', hrKeys.leaveCalendar(ws, range.from, range.to)],
+      ['leaveLedger', hrKeys.leaveLedger(ws, 'p1', 'lt1', 2026)],
+      ['clockState', hrKeys.clockState(ws)],
+      ['attendanceDays(me)', hrKeys.attendanceDays(ws, undefined, range.from, range.to)],
+      ['attendanceDays(p1)', hrKeys.attendanceDays(ws, 'p1', range.from, range.to)],
+      ['schedules', hrKeys.schedules(ws)],
+      ['periods', hrKeys.periods(ws)],
+      ['payrollExportPreview', hrKeys.payrollExportPreview(ws, 'le1', 'per1', true)],
+      ['payrollExportPreview(final)', hrKeys.payrollExportPreview(ws, 'le1', 'per1', false)],
+      ['approvalInbox(pending)', hrKeys.approvalInbox(ws)],
+      ['approvalInbox(decided)', hrKeys.approvalInbox(ws, 'decided')],
+      ['approvalChains', hrKeys.approvalChains(ws)],
+      ['delegations', hrKeys.delegations(ws)],
+      ['retention', hrKeys.retention(ws)],
+      ['retentionRuns', hrKeys.retentionRuns(ws)],
+      ['rosterShifts', hrKeys.rosterShifts(ws)],
+      ['rosterPatterns', hrKeys.rosterPatterns(ws)],
+      ['rosterAssignments', hrKeys.rosterAssignments(ws)],
+      ['rosterAssignments(p1)', hrKeys.rosterAssignments(ws, 'p1')],
+      ['rosterDays(me)', hrKeys.rosterDays(ws, undefined, range.from, range.to)],
+      ['rosterDays(p1)', hrKeys.rosterDays(ws, 'p1', range.from, range.to)],
+      ['rosterCoverage', hrKeys.rosterCoverage(ws, range.from, range.to)],
+      ['rosterCoverage(office)', hrKeys.rosterCoverage(ws, range.from, range.to, 'o1')],
+      ['reportAttendance', hrKeys.reportAttendance(ws, range)],
+      ['reportOvertime', hrKeys.reportOvertime(ws, range)],
+      ['reportAbsence', hrKeys.reportAbsence(ws, range)],
+      ['reportLeaveBalance', hrKeys.reportLeaveBalance(ws, balanceInput)],
+      ['checklists', hrKeys.checklists(ws)],
+      ['checklists(filtered)', hrKeys.checklists(ws, { status: 'open' })],
+      ['checklist', hrKeys.checklist(ws, 'c1')],
+      ['myChecklistTasks', hrKeys.myChecklistTasks(ws)],
+      ['checklistTemplates', hrKeys.checklistTemplates(ws)],
+      ['checklistTemplates(archived)', hrKeys.checklistTemplates(ws, true)],
+    ]
+    // Every helper is represented, so adding one without a sample here is caught rather than
+    // silently left out of the comparison.
+    expect(new Set(built.map(([name]) => name)).size).toBe(built.length)
+    expect(new Set(built.map(([, key]) => key[1])).size).toBeGreaterThanOrEqual(20)
+    for (const name of Object.keys(hrKeys))
+      expect(built.some(([label]) => label === name || label.startsWith(`${name}(`))).toBe(true)
+
+    const seen = new Map<string, string>()
+    const collisions: string[] = []
+    for (const [name, key] of built) {
+      const serialised = JSON.stringify(key)
+      const first = seen.get(serialised)
+      if (first) collisions.push(`${first} and ${name} both build ${serialised}`)
+      else seen.set(serialised, name)
+    }
+    expect(collisions).toEqual([])
   })
 })
 

@@ -58,7 +58,7 @@ const mayView = $derived(canHr('documentView'))
 const mayManage = $derived(canHr('documentManage'))
 
 const documentsQuery = createQuery(() => ({
-  queryKey: ['hr', 'documents', workspaceId, personId] as const,
+  queryKey: ['hr', 'person', workspaceId, 'documents', personId] as const,
   enabled: enabled && mayView && Boolean(workspaceId && personId),
   queryFn: () => api.documents.list({ workspaceId, personId }),
 }))

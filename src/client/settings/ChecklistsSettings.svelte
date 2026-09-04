@@ -194,9 +194,15 @@ const defaultOf = (kind: ChecklistKind): ChecklistTemplate | null =>
  * template saved last year may name somebody who has since left, and a row that cannot say who
  * it names is a row nobody can read. Only while the editor is open: a settings page nobody has
  * opened a dialog on has no reason to pull two hundred people.
+ *
+ * Its own marker, because this is the one asker that fetches *unfiltered*. `ChecklistsPage`,
+ * `StartChecklistDialog` and `ChecklistItems` all ask for `status: ['active', 'onboarding',
+ * 'offboarding']`, and a shared key is one cache entry: whichever mounted first would decide what
+ * the others were served — this directory losing the departed people it exists to name, or those
+ * three pickers offering somebody who has left as the person to hand a task to.
  */
 const directoryQuery = createQuery(() => ({
-  queryKey: hrKeys.people(workspaceId, { forChecklists: true }),
+  queryKey: hrKeys.people(workspaceId, { forChecklistsAll: true }),
   enabled: Boolean(workspaceId) && draft !== null,
   queryFn: () => api.people.list({ workspaceId, limit: 200 }),
 }))

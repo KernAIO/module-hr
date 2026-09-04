@@ -73,7 +73,7 @@ const balanceQuery = createQuery(() => ({
 const balance = $derived(balanceQuery.data?.find((row) => row.leaveTypeId === leaveTypeId))
 
 const simQuery = createQuery(() => ({
-  queryKey: ['hr', 'leave-sim', workspaceId, leaveTypeId, startsOn, endsOn] as const,
+  queryKey: ['hr', 'leave_balance', workspaceId, 'leave-sim', leaveTypeId, startsOn, endsOn] as const,
   enabled: Boolean(workspaceId && leaveTypeId && startsOn && endsOn && open),
   queryFn: () =>
     api.leave.requests.simulate({
@@ -195,9 +195,10 @@ const create = createMutation(() => ({
     }),
   onSuccess: () => {
     toast.success(t('leave_submitted'))
-    void queryClient.invalidateQueries({ queryKey: ['hr', 'leave-balance'] })
-    void queryClient.invalidateQueries({ queryKey: ['hr', 'leave-requests'] })
-    void queryClient.invalidateQueries({ queryKey: ['hr', 'leave-calendar'] })
+    // Two prefixes cover four screens: the balance, this dialog's preview and the ledger all sit
+    // under `leave_balance`, the request list and the team calendar under `leave_request`.
+    void queryClient.invalidateQueries({ queryKey: ['hr', 'leave_balance'] })
+    void queryClient.invalidateQueries({ queryKey: ['hr', 'leave_request'] })
     reason = ''
     close()
   },
@@ -218,10 +219,10 @@ const create = createMutation(() => ({
     // A refusal is the server saying the preview on screen is not what it sees — most often
     // because the same days were booked from somewhere else, or a holiday moved into the range.
     // So re-read the preview and the balance it is measured against, exactly as a request that
-    // landed does; without this every retry earns the same toast with no route to the truth.
-    void queryClient.invalidateQueries({ queryKey: ['hr', 'leave-sim'] })
-    void queryClient.invalidateQueries({ queryKey: ['hr', 'leave-balance'] })
-    void queryClient.invalidateQueries({ queryKey: ['hr', 'leave-requests'] })
+    // landed does; without this every retry earns the same toast with no route to the truth. Both
+    // sit under the `leave_balance` prefix, which is why one line reaches them.
+    void queryClient.invalidateQueries({ queryKey: ['hr', 'leave_balance'] })
+    void queryClient.invalidateQueries({ queryKey: ['hr', 'leave_request'] })
   },
   onSettled: () => {
     submitting = false

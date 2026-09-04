@@ -194,9 +194,12 @@ const calendarsQuery = createQuery(() => ({
 /**
  * `[module, entity, …scope]`, the shape `hrKeys` uses. Spelled here rather than in `query.ts`
  * because this screen is the only one that asks.
+ *
+ * `person`, not `office`: a roster changes when somebody is assigned, unassigned or renamed, and
+ * `offices.assign` announces the person it moved rather than the office it moved them to.
  */
 const officePeopleKey = (ws: string, officeId: string, primaryOnly: boolean) =>
-  ['hr', 'office-people', ws, officeId, primaryOnly ? 'primary' : 'all'] as const
+  ['hr', 'person', ws, 'office-people', officeId, primaryOnly ? 'primary' : 'all'] as const
 
 /**
  * `hrKeys.entities`, not a local spelling of it. This picker is the same live-employers cache the

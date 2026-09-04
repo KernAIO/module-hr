@@ -83,6 +83,9 @@ const customRows = $derived.by(() => {
 })
 
 const sensitiveQuery = createQuery(() => ({
+  // `sensitive`, not `person`: the module's one deliberate exception to the entity rule, because a
+  // refetch here writes a `sensitive_access_log` row and a colleague's unrelated person write must
+  // not make the cache perform a disclosure the viewer never asked for. See `hrKeys.sensitive`.
   queryKey: ['hr', 'sensitive', workspaceId, personId] as const,
   // The permission *and* the disclosure: a query fired on render would decrypt and send these
   // fields to a screen nobody has asked to look at.
@@ -176,6 +179,8 @@ const save = createMutation(() => ({
   },
   onSuccess: () => {
     toast.success(t('person_updated'))
+    // This screen's own write, so this is the invalidation the panel does get: nothing else
+    // reaches the `sensitive` segment, and that is the point of keeping it off the `person` prefix.
     void queryClient.invalidateQueries({ queryKey: ['hr', 'sensitive', workspaceId, personId] })
     void queryClient.invalidateQueries({ queryKey: ['hr', 'person', workspaceId, personId] })
     editing = false

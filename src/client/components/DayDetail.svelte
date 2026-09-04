@@ -57,9 +57,10 @@ const canRequest = $derived(canHr('attendancePunch'))
  * would make that promise a lie the first time somebody used it.
  */
 const punchesQuery = createQuery(() => ({
-  // The same literal shape `hrKeys` builds — `['hr', entity, workspace, …scope]` — so the module's
-  // blanket `['hr']` invalidation after a punch, a void or a correction reaches it.
-  queryKey: ['hr', 'punches', workspaceId, 'me', day.businessDate] as const,
+  // The same literal shape `hrKeys` builds — `['hr', entity, workspace, …scope]`. Punches are part
+  // of the day sheet the server announces, so `attendance_day` with `punches` as the scope: the
+  // module's blanket `['hr']` invalidation reaches it, and so does anybody else's punch or void.
+  queryKey: ['hr', 'attendance_day', workspaceId, 'punches', 'me', day.businessDate] as const,
   enabled: Boolean(workspaceId),
   queryFn: () =>
     api.attendance.punches.list({

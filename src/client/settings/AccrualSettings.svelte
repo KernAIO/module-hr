@@ -184,7 +184,7 @@ const days = (n: number) => formatDays(n, messageLocale())
 let showArchived = $state(false)
 
 const policiesQuery = createQuery(() => ({
-  queryKey: ['hr', 'policies', workspaceId, 'accrual', showArchived] as const,
+  queryKey: ['hr', 'policy', workspaceId, 'accrual', showArchived] as const,
   enabled: Boolean(workspaceId),
   queryFn: () => api.policies.list({ workspaceId, kind: 'accrual', includeArchived: showArchived }),
 }))
@@ -219,7 +219,7 @@ function configOf(policy: PolicyRow): AccrualConfig | null {
  * carry-forward rows. `showArchived` is shared, because it is one control at the top of the page.
  */
 const carryQuery = createQuery(() => ({
-  queryKey: ['hr', 'policies', workspaceId, 'carry_forward', showArchived] as const,
+  queryKey: ['hr', 'policy', workspaceId, 'carry_forward', showArchived] as const,
   enabled: Boolean(workspaceId),
   queryFn: () => api.policies.list({ workspaceId, kind: 'carry_forward', includeArchived: showArchived }),
 }))
@@ -776,7 +776,7 @@ const unitsQuery = createQuery(() => ({
   queryFn: () => api.org.units.tree({ workspaceId, includeArchived: false }),
 }))
 const positionsQuery = createQuery(() => ({
-  queryKey: ['hr', 'positions', workspaceId] as const,
+  queryKey: ['hr', 'position', workspaceId] as const,
   enabled: Boolean(workspaceId) && hasOrg && needsSubjects('position'),
   queryFn: () => api.org.positions.list({ workspaceId, includeArchived: false }),
 }))
@@ -1004,7 +1004,7 @@ let runTo = $state(lastMonth.to)
 const runRangeValid = $derived(Boolean(runFrom && runTo && runFrom <= runTo))
 
 const previewQuery = createQuery(() => ({
-  queryKey: ['hr', 'accrual-preview', workspaceId, runFrom, runTo] as const,
+  queryKey: ['hr', 'leave_balance', workspaceId, 'accrual-preview', runFrom, runTo] as const,
   enabled: Boolean(runOpen && workspaceId && runRangeValid),
   // A period that computes to nothing is an answer, not a network blip: no point retrying it three
   // times behind a spinner while somebody waits to read numbers.

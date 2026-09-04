@@ -116,9 +116,9 @@ const archived = $derived(types.filter((type) => type.archivedAt))
 let showArchived = $state(false)
 
 const invalidate = () => {
-  void queryClient.invalidateQueries({ queryKey: ['hr', 'leave-types'] })
+  void queryClient.invalidateQueries({ queryKey: ['hr', 'leave_type'] })
   // A balance row carries its type's name and unit, so a rename has to reach the tiles too.
-  void queryClient.invalidateQueries({ queryKey: ['hr', 'leave-balance'] })
+  void queryClient.invalidateQueries({ queryKey: ['hr', 'leave_balance'] })
 }
 
 // ---------------------------------------------------------------- the form

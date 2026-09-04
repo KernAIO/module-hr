@@ -84,9 +84,10 @@ const days = $derived(daysQuery.data?.items ?? [])
  * reason they already raised.
  */
 const correctionsQuery = createQuery(() => ({
-  // The same literal shape `hrKeys` builds — `['hr', entity, workspace, …scope]` — so the module's
-  // blanket `['hr']` invalidation after a correction reaches it.
-  queryKey: ['hr', 'regularizations', workspaceId, 'me', 'pending'] as const,
+  // The same literal shape `hrKeys` builds — `['hr', entity, workspace, …scope]`, spelt after the
+  // `regularization` the server announces — so the module's blanket `['hr']` invalidation after a
+  // correction reaches it, and so does a colleague's filing.
+  queryKey: ['hr', 'regularization', workspaceId, 'me', 'pending'] as const,
   enabled: Boolean(workspaceId),
   queryFn: () => api.attendance.regularizations.list({ workspaceId, status: ['pending'], limit: 100 }),
 }))

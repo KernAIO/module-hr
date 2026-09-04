@@ -77,7 +77,7 @@ const KINDS: Kind[] = ['payroll', 'attendance']
  * `[module, entity, …scope]`, the shape `hrKeys` uses. Spelled here rather than in `query.ts`
  * because this is the only screen that asks.
  */
-const periodsKey = (ws: string) => ['hr', 'periods', ws] as const
+const periodsKey = (ws: string) => ['hr', 'period', ws] as const
 
 /**
  * Every period in one read.
