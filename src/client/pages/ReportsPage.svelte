@@ -337,31 +337,31 @@ const failure = (error: unknown) => explainRefusal(error, t('rep_error'))
 
     <div class="controls">
       {#if active === 'balances'}
-        <Field label={t('rep_as_of')} class="ctl">
+        <Field label={t('rep_as_of')} class="filter">
           {#snippet children(id)}
             <Input {id} type="date" size="sm" bind:value={asOf} />
           {/snippet}
         </Field>
       {:else}
-        <Field label={t('rep_from')} class="ctl">
+        <Field label={t('rep_from')} class="filter">
           {#snippet children(id)}
             <Input {id} type="date" size="sm" bind:value={from} />
           {/snippet}
         </Field>
-        <Field label={t('rep_to')} class="ctl">
+        <Field label={t('rep_to')} class="filter">
           {#snippet children(id)}
             <Input {id} type="date" size="sm" bind:value={to} min={from} />
           {/snippet}
         </Field>
       {/if}
       {#if hasOffices || hasEntities}
-        <Field label={t('rep_slice')} class="ctl wide">
+        <Field label={t('rep_slice')} class="filter wide">
           {#snippet children(id)}
             <Select {id} size="sm" options={sliceOptions} bind:value={slice} ariaLabel={t('rep_slice')} />
           {/snippet}
         </Field>
       {/if}
-      <Field label={t('rep_limit')} class="ctl">
+      <Field label={t('rep_limit')} class="filter">
         {#snippet children(id)}
           <Select {id} size="sm" options={limitOptions} bind:value={limit} ariaLabel={t('rep_limit')} />
         {/snippet}
@@ -383,7 +383,7 @@ const failure = (error: unknown) => explainRefusal(error, t('rep_error'))
           <div class="scroll" aria-busy={attendanceQuery.isFetching}>
             <Table
               dense
-              columns="minmax(180px, 1.6fr) 64px 100px 100px 84px 84px 96px 96px 110px"
+              columns="minmax(180px, 1.6fr) 64px 100px 100px 84px 84px 96px 96px 128px"
               ariaLabel={t('rep_tab_attendance')}
             >
               <TableHeader>
@@ -637,10 +637,15 @@ const failure = (error: unknown) => explainRefusal(error, t('rep_error'))
   gap: 12px;
   margin-block: 16px 12px;
 }
-.controls :global(.ctl) {
+/*
+ * Not `.ctl`: that is also the name of the control wrapper inside `Field`, a column — so the same
+ * rule reached it and `flex-basis: 160px` became a 160px-tall control, which put a blank band
+ * between the filters and the report.
+ */
+.controls :global(.filter) {
   flex: 0 1 160px;
 }
-.controls :global(.ctl.wide) {
+.controls :global(.filter.wide) {
   flex-basis: 220px;
 }
 /*

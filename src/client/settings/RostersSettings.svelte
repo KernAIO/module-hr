@@ -86,13 +86,21 @@ const DURATION_WORDS = {
 const duration = (minutes: number) => formatDuration(minutes, DURATION_WORDS, messageLocale())
 const number = (n: number) => new Intl.NumberFormat(messageLocale()).format(n)
 
-/** A shift as a range, end on the next day when it crosses midnight, in the reader's order. */
-const shiftRange = (shift: Pick<RosterShift, 'start' | 'end'>) =>
-  formatDateRange(
-    `${anchorDay(0)}T${shift.start}:00`,
-    `${anchorDay(crossesMidnight(shift) ? 1 : 0)}T${shift.end}:00`,
-    { hour: '2-digit', minute: '2-digit' },
-  )
+/**
+ * A shift as a range, in the reader's order.
+ *
+ * A shift that crosses midnight is two clock times, not two dates: `formatRange` given an end on
+ * the next day prints both dates in full — "1/1/2024, 10:00 PM – 1/2/2024, 6:00 AM", with the
+ * anchor day showing as if it meant something — so the two ends are formatted on their own and
+ * the "+1" beside the range says which day the second one is.
+ */
+const shiftRange = (shift: Pick<RosterShift, 'start' | 'end'>) => {
+  const time = { hour: '2-digit', minute: '2-digit' } as const
+  if (!crossesMidnight(shift))
+    return formatDateRange(`${anchorDay(0)}T${shift.start}:00`, `${anchorDay(0)}T${shift.end}:00`, time)
+  const clock = new Intl.DateTimeFormat(messageLocale(), time)
+  return `${clock.format(new Date(`${anchorDay(0)}T${shift.start}:00`))} – ${clock.format(new Date(`${anchorDay(1)}T${shift.end}:00`))}`
+}
 
 const colorName = (hex: string | null) => {
   const key = rosterColorKey(hex)
