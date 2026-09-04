@@ -383,7 +383,7 @@ const failure = (error: unknown) => explainRefusal(error, t('rep_error'))
           <div class="scroll" aria-busy={attendanceQuery.isFetching}>
             <Table
               dense
-              columns="minmax(180px, 1.6fr) 64px 100px 100px 84px 84px 96px 96px 128px"
+              columns="minmax(160px, 1.4fr) 56px 88px 88px 72px 64px 88px 96px 124px"
               ariaLabel={t('rep_tab_attendance')}
             >
               <TableHeader>

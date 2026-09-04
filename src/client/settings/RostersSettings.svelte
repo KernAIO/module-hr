@@ -98,7 +98,9 @@ const shiftRange = (shift: Pick<RosterShift, 'start' | 'end'>) => {
   const time = { hour: '2-digit', minute: '2-digit' } as const
   if (!crossesMidnight(shift))
     return formatDateRange(`${anchorDay(0)}T${shift.start}:00`, `${anchorDay(0)}T${shift.end}:00`, time)
-  const clock = new Intl.DateTimeFormat(messageLocale(), time)
+  // `numeric`, not `2-digit`: the same-day range above renders "6:00 AM", and a column that reads
+  // "6:00 AM" on one row and "06:00 AM" on the next looks like two different clocks
+  const clock = new Intl.DateTimeFormat(messageLocale(), { hour: 'numeric', minute: '2-digit' })
   return `${clock.format(new Date(`${anchorDay(0)}T${shift.start}:00`))} – ${clock.format(new Date(`${anchorDay(1)}T${shift.end}:00`))}`
 }
 
