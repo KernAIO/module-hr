@@ -1,5 +1,11 @@
 # @kernhq/module-hr
 
+## 0.23.4
+
+### Patch Changes
+
+- fix(client): fit the attendance report at a laptop width; one clock for shift hours
+
 ## 0.23.3
 
 ### Patch Changes
