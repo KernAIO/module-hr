@@ -1,5 +1,12 @@
 # @kernhq/module-hr
 
+## 0.23.5
+
+### Patch Changes
+
+- 25d0ff3: Two checklist strings that rendered as their keys have words now: the due-date field when adding
+  an item, and the empty state when a filter matches no checklist.
+
 ## 0.23.4
 
 ### Patch Changes
