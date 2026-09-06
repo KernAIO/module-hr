@@ -177,11 +177,19 @@ const PEOPLE: PersonSeed[] = [
   },
 ]
 
+/**
+ * Every `icon` here has to be a name in `@kernhq/ui`'s registry, not a lucide name.
+ *
+ * The registry is a hand-maintained subset — 156 icons — and an unregistered name renders as a
+ * blank square with nothing thrown. `scripts/check-icons.mjs` is what catches it, and it caught
+ * `palmtree`, `thermometer`, `baby` and `circle-minus` in this file: all four are real lucide
+ * icons and none of them is in Kern.
+ */
 const LEAVE_TYPES = [
-  { key: 'annual', name: 'Annual leave', color: '#3aa17e', icon: 'palmtree', paid: true, order: 0 },
-  { key: 'sick', name: 'Sick leave', color: '#d64545', icon: 'thermometer', paid: true, order: 1 },
-  { key: 'parental', name: 'Parental leave', color: '#8a6fd1', icon: 'baby', paid: true, order: 2 },
-  { key: 'unpaid', name: 'Unpaid leave', color: '#8b8578', icon: 'circle-minus', paid: false, order: 3 },
+  { key: 'annual', name: 'Annual leave', color: '#3aa17e', icon: 'tree-palm', paid: true, order: 0 },
+  { key: 'sick', name: 'Sick leave', color: '#d64545', icon: 'activity', paid: true, order: 1 },
+  { key: 'parental', name: 'Parental leave', color: '#8a6fd1', icon: 'users', paid: true, order: 2 },
+  { key: 'unpaid', name: 'Unpaid leave', color: '#8b8578', icon: 'circle-dashed', paid: false, order: 3 },
 ]
 
 /** Leave to book, as offsets in days from today. */
