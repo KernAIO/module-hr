@@ -1,5 +1,11 @@
 # @kernhq/module-hr
 
+## 0.24.3
+
+### Patch Changes
+
+- chore(renovate): drop dead @kernhq automerge rule
+
 ## 0.24.2
 
 ### Patch Changes
