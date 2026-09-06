@@ -1,5 +1,11 @@
 # @kernhq/module-hr
 
+## 0.23.9
+
+### Patch Changes
+
+- build(deps): raise @kernhq/testing to ^0.1.14
+
 ## 0.23.8
 
 ### Patch Changes
