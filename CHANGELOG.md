@@ -1,5 +1,11 @@
 # @kernhq/module-hr
 
+## 0.23.8
+
+### Patch Changes
+
+- test: fail on a tenant table with no policy, not only an unforced one
+
 ## 0.23.7
 
 ### Patch Changes
