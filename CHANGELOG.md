@@ -1,5 +1,11 @@
 # @kernhq/module-hr
 
+## 0.24.4
+
+### Patch Changes
+
+- chore: check the packed tarball can resolve its own imports
+
 ## 0.24.3
 
 ### Patch Changes
