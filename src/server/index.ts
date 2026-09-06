@@ -11,6 +11,7 @@ import {
   hrPermissions,
   MODULE_ID,
 } from '../contract/index.js'
+import { seedHrDemo } from './demo.js'
 import { hrJobs } from './jobs.js'
 import { COUNTRY_PACKS, packDays } from './packs/index.js'
 import { implement_ } from './router.js'
@@ -139,6 +140,8 @@ export const hrModule = defineServerModule({
    * Idempotent: it runs again when somebody switches HR off and back on, and must not make a second
    * default office.
    */
+  demo: { seed: seedHrDemo },
+
   onWorkspaceEnabled: async (workspaceId: string, kernel: Kernel) => {
     const settings = await kernel.settings.module(workspaceId, MODULE_ID, HrSettings)
     await kernel.database.withWorkspace(workspaceId, async (tx) => {
