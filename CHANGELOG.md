@@ -1,5 +1,11 @@
 # @kernhq/module-hr
 
+## 0.23.10
+
+### Patch Changes
+
+- build: force one @kernhq/kernel copy with pnpm.overrides
+
 ## 0.23.9
 
 ### Patch Changes
