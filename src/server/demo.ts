@@ -221,8 +221,17 @@ export async function seedHrDemo(ctx: DemoSeedContext): Promise<DemoSeedSummary>
   return kernel.database.withWorkspace(
     workspaceId,
     async (tx) => {
-      // See the tracker's seeder for why the guard reads the table rather than a marker row.
-      const [existing] = await tx.select({ id: people.id }).from(people).limit(1)
+      /*
+       * See the tracker's seeder for why the guard reads the table rather than a marker row — and
+       * why `workspace_id` is in the predicate instead of being left to row-level security. An
+       * unscoped guard sees another workspace's people on any database whose owner can bypass a
+       * policy, and reports an empty workspace as used.
+       */
+      const [existing] = await tx
+        .select({ id: people.id })
+        .from(people)
+        .where(eq(people.workspaceId, workspaceId))
+        .limit(1)
       if (existing) return { skipped: true }
 
       const [office] = await tx
