@@ -87,6 +87,12 @@
     }
   },
   "packageManager": "pnpm@10.30.3",
+  "pnpm": {
+    "overrides": {
+      "@kernhq/contracts": "$@kernhq/contracts",
+      "@kernhq/kernel": "$@kernhq/kernel"
+    }
+  },
   "engines": {
     "node": ">=24"
   },
