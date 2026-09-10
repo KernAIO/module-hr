@@ -7,7 +7,7 @@ import { accrueForPeriod, carryExpiryDate, carryForward, carryHasLapsed } from '
 import { daysInMonth } from '../policy/calendar.js'
 // The appliers, not the router: `hrSubjects` is a module-level factory in `router.ts` precisely so
 // a job can reach what used to live inside `implement_`'s closure. Nothing here builds a router.
-import { hrSubjects } from './router.js'
+import { announceDecisionSubjects, hrSubjects } from './router.js'
 import {
   attendanceDays,
   checklistItems,
@@ -673,59 +673,70 @@ export function hrJobs(): JobDef[] {
            * reason belonging to a single workspace's data; now it can, and an unguarded loop would
            * let that workspace stop every other workspace's deadlines, hourly, indefinitely.
            *
-           * Nothing is swallowed by this: the sweep is one transaction, so a workspace that throws
-           * has changed nothing and is swept again on the next tick, and the error is logged rather
-           * than counted.
+           * Everything one workspace does is inside the guard, not just the transaction. What
+           * follows the commit talks to the broker, the realtime gateway and the database again —
+           * `announceDecisionSubjects` opens a `withWorkspace` of its own — so each of them can
+           * fail for one tenant, and the collateral damage of an unguarded one is the same:
+           * every workspace after this one goes unswept.
+           *
+           * What is swallowed is bounded by where the throw lands. Before the commit, nothing
+           * happened and the next tick sweeps it again. After it, the decisions stand — the steps
+           * are marked handled, so they will not be swept twice — and what is lost is the telling:
+           * an event, a redraw or a notice. That is logged rather than counted, and an approver
+           * sees the outcome on their next load.
            */
-          let sweep: Awaited<ReturnType<typeof approvals.sweepTimeouts>>
           try {
-            sweep = await kernel.database.withWorkspace(workspaceId, (tx) =>
+            const sweep = await kernel.database.withWorkspace(workspaceId, (tx) =>
               approvals.sweepTimeouts(tx, workspaceId, now),
+            )
+            if (!sweep.touchedRequestIds.length) continue
+
+            for (const decision of sweep.decided)
+              await kernel.emit(
+                hrEvents.approvalDecided,
+                {
+                  requestId: decision.requestId,
+                  workspaceId,
+                  subjectType: decision.subjectType,
+                  subjectId: decision.subjectId,
+                  status: decision.status,
+                },
+                // No actor, which is the point: the event stream is the other half of the audit
+                // trail and it must not name somebody who did not decide this.
+                { workspaceId, actorId: null },
+              )
+
+            for (const requestId of sweep.touchedRequestIds)
+              await kernel.realtime.change(workspaceId, {
+                module: MODULE_ID,
+                entity: 'approval',
+                id: requestId,
+                op: 'updated',
+              })
+
+            // The appliers ran inside the sweep's transaction, which has committed by now, so the
+            // leave and the day sheets they moved are announced the same way `approvals.decide`
+            // announces them. A deadline and a person must leave a screen in the same state.
+            if (sweep.decided.length) await announceDecisionSubjects(kernel, workspaceId, sweep.decided)
+
+            const delivered = await approvals.deliverNotices(sweep.notices)
+            kernel.log.info(
+              {
+                module: 'hr',
+                workspaceId,
+                reminded: sweep.reminded,
+                escalated: sweep.escalated,
+                autoApproved: sweep.autoApproved,
+                delivered,
+              },
+              'approval deadlines swept',
             )
           } catch (err) {
             kernel.log.error(
               { module: 'hr', workspaceId, err: (err as Error).message },
               'approval deadline sweep failed; other workspaces continue',
             )
-            continue
           }
-          if (!sweep.touchedRequestIds.length) continue
-
-          for (const decision of sweep.decided)
-            await kernel.emit(
-              hrEvents.approvalDecided,
-              {
-                requestId: decision.requestId,
-                workspaceId,
-                subjectType: decision.subjectType,
-                subjectId: decision.subjectId,
-                status: decision.status,
-              },
-              // No actor, which is the point: the event stream is the other half of the audit trail
-              // and it must not name somebody who did not decide this.
-              { workspaceId, actorId: null },
-            )
-
-          for (const requestId of sweep.touchedRequestIds)
-            await kernel.realtime.change(workspaceId, {
-              module: MODULE_ID,
-              entity: 'approval',
-              id: requestId,
-              op: 'updated',
-            })
-
-          const delivered = await approvals.deliverNotices(sweep.notices)
-          kernel.log.info(
-            {
-              module: 'hr',
-              workspaceId,
-              reminded: sweep.reminded,
-              escalated: sweep.escalated,
-              autoApproved: sweep.autoApproved,
-              delivered,
-            },
-            'approval deadlines swept',
-          )
         }
       },
     },

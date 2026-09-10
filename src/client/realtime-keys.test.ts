@@ -86,9 +86,13 @@ function endOfCall(text: string, from: number): number {
  * let any object literal anywhere in `src/server` widen what the client is allowed to spell, which
  * is the one thing this file exists to hold shut.
  *
- * The helper itself passes `entity` as a variable, and it is the only place that does. Add a
- * hand-maintained supplement, with the file and line that justifies it, the day another call site
- * starts computing the name.
+ * Two places build `entity` as a variable rather than spelling it, and only one of them costs
+ * anything. The `changed` wrapper is free: the regex above reads its *call sites*, and those spell
+ * the name. `announceDecisionSubjects` in `router.ts` is not — it collects the frames a decision
+ * owes into a map and sends every one of them through a single local `announce(entity, id)`, so
+ * nothing it announces is spelt anywhere either scan looks. Those names are listed by hand in
+ * `ANNOUNCED_VIA_VARIABLE` below and folded into `all`, which is the supplement this note always
+ * anticipated. Any further site that computes the name goes in the same list.
  */
 function announcedEntities(): { viaHelper: Set<string>; viaLiteral: Set<string>; all: Set<string> } {
   // Tests excluded: a fixture's entity name is not an announcement, and inventing one there would
@@ -104,7 +108,27 @@ function announcedEntities(): { viaHelper: Set<string>; viaLiteral: Set<string>;
     const span = text.slice(body, endOfCall(text, body))
     for (const m of span.matchAll(/\bentity:\s*'([a-z_]+)'/g)) viaLiteral.add(m[1]!)
   }
-  return { viaHelper, viaLiteral, all: new Set([...viaHelper, ...viaLiteral]) }
+  return {
+    viaHelper,
+    viaLiteral,
+    all: new Set([...viaHelper, ...viaLiteral, ...Object.keys(ANNOUNCED_VIA_VARIABLE)]),
+  }
+}
+
+/**
+ * What `announceDecisionSubjects` announces, and which branch of it sends each one.
+ *
+ * Hand-maintained because the scans above cannot read it: that function builds `entity` as a
+ * variable, which is the second call site the note above anticipated. It is short on purpose —
+ * a list that grows is a sign the extraction should be doing the work instead — and the test below
+ * holds every entry to the source, so an entry whose branch is deleted fails here rather than
+ * standing as cover for a name nothing announces any more.
+ */
+const ANNOUNCED_VIA_VARIABLE: Record<string, string> = {
+  leave_request: 'the leave branch: the request the decision settled',
+  leave_balance: 'the leave branch: the balance the decision moved, under the workspace id',
+  regularization: 'the regularization branch: the correction the decision settled',
+  attendance_day: 'both branches: the day sheets an approved decision rebuilt, by person',
 }
 
 /** The second segment of every `['hr', '…'` key literal the client builds, and the files it is in. */
@@ -272,7 +296,7 @@ const DERIVED_KEYS: Record<string, DerivedKey> = {
   },
   'leave-calendar': {
     entity: 'leave_request',
-    why: 'who is away is the approved requests; filing and cancelling announce those',
+    why: 'who is away is the approved requests; filing, deciding and cancelling all announce those',
     probe: () => hrKeys.leaveCalendar('ws', '2026-01-01', '2026-01-31'),
     word: 'calendar',
   },
@@ -315,9 +339,12 @@ const DERIVED_KEYS: Record<string, DerivedKey> = {
     why: [
       'counted off the day sheets, which every punch announces — the dominant write. It is not the',
       'whole population: `services/reports.ts` also left-joins approved `leave_request_days` to tell',
-      'an absence from a day off, and that leg moves only on a `leave_request` announcement. An',
-      'approval decision announces `approval` and nothing else, so a colleague approving leave does',
-      'not reach this report until the server announces the request it decided.',
+      'an absence from a day off, and those rows move on a leave write rather than a punch. A',
+      'decision announces `attendance_day` for the person whose leave it was, so an approval — by a',
+      'colleague or by a deadline — does arrive here. Two writes still do not, and they are the',
+      'residual: a filing whose chain resolves to nobody is approved on the way in, and a',
+      'cancellation rewrites those same days back. Both announce under `leave_request`, and an',
+      'announcement reaches only keys named after its own entity.',
     ].join(' '),
     probe: () => hrKeys.reportAbsence('ws', RANGE),
   },
@@ -330,9 +357,13 @@ const DERIVED_KEYS: Record<string, DerivedKey> = {
     entity: 'leave_balance',
     why: [
       'the balances as at a date: an adjustment and an accrual run write the ledger it sums and both',
-      'announce leave_balance, which are the dominant writes. `services/reports.ts` also aggregates',
-      'the live pending and approved requests on top, and only a `leave_request` announcement moves',
-      'those — so a colleague filing or having leave approved is the residual this prefix misses.',
+      'announce leave_balance. So do filing, deciding and cancelling, and the reason is not the',
+      'ledger — `services/reports.ts` sums the live `pending` and `approved` requests on top of it,',
+      'so a rejection, which writes no ledger row at all, moves this screen simply by taking a',
+      'request out of `pending`. Every status change is a change here, which is why each of those',
+      'three announces `leave_balance` beside its own entity. The residual is the retention sweep:',
+      'it deletes ledger rows and whole requests and announces `person` and `attendance_day` for',
+      'them, neither of which reaches this prefix.',
     ].join(' '),
     probe: () => hrKeys.reportLeaveBalance('ws', BALANCE),
   },
@@ -355,9 +386,9 @@ const DERIVED_KEYS: Record<string, DerivedKey> = {
     entity: 'retention_run',
     why: [
       'the counts beside each horizon are what a sweep changes, and a run announces retention_run.',
-      'The horizons themselves are covered by no prefix: `privacy.retention.set` announces nothing',
-      'at all, so a second admin’s save reaches this screen only on a reload — what refreshes it is',
-      'a sweep and the screen’s own write, which invalidates the key directly.',
+      'The horizons themselves move only in `privacy.retention.set`, which announces retention_run',
+      'too — one settings row per workspace, announced under the workspace id — so this one prefix',
+      'carries both halves of the screen and a second admin’s save arrives without a reload.',
     ].join(' '),
     probe: () => hrKeys.retention('ws'),
     // `retention` survives only inside the entity name; the screen's own word became `settings`.
@@ -408,6 +439,19 @@ describe('realtime query keys', () => {
         used: true,
         explained: true,
       })
+  })
+
+  /**
+   * The hand-maintained supplement is held to the source it stands in for, in the direction that
+   * can rot: an entry whose branch is gone widens what the client may spell, silently, and nothing
+   * else in this file would notice. Each name is a literal argument to the local `announce` inside
+   * `announceDecisionSubjects`, which is what makes it greppable at all.
+   */
+  it('keeps no supplement entry the helper has stopped announcing', () => {
+    const text = read(sources(serverDir, ['.ts'], (name) => name.endsWith('.test.ts')))
+    const sent = new Set([...text.matchAll(/\bannounce\('([a-z_]+)'/g)].map((m) => m[1]!))
+    const stale = Object.keys(ANNOUNCED_VIA_VARIABLE).filter((entity) => !sent.has(entity))
+    expect(stale).toEqual([])
   })
 
   it('maps every derived key onto an entity that is announced, with a reason', () => {

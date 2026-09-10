@@ -627,6 +627,107 @@ export function hrSubjects(deps: {
 }
 
 /**
+ * What a *final* decision moved besides the request itself.
+ *
+ * The engine announces `approval`, and that is only the request row. The appliers above move rows
+ * under entirely different prefixes — a booked leave and the balance it consumed, a rebuilt
+ * regularization and the day sheet beneath it — and realtime invalidation is a prefix match, so a
+ * key can only be reached by an announcement of its own entity. Without this, a colleague's
+ * approval left every other open screen showing yesterday.
+ *
+ * Both paths that run an applier — `approvals.decide` below and the deadline sweep in `jobs.ts` —
+ * announce through here, so the two cannot drift: a deadline that books leave has to redraw the
+ * screens a person approving it redraws.
+ *
+ * Raw `kernel.realtime.change` rather than `implement_`'s `changed`, which folds a search reindex
+ * into a `person` announcement — nothing a decision moves is a person, and this is module-level
+ * anyway, where that helper does not exist.
+ */
+export async function announceDecisionSubjects(
+  kernel: Kernel,
+  workspaceId: string,
+  decisions: Array<{ subjectType: string; subjectId: string; status: string }>,
+): Promise<void> {
+  /**
+   * Whose day sheets each decision moved.
+   *
+   * Day sheets are announced by person and never by date — `punches.void` and the retention sweep
+   * both do it that way — and the person is not on the decision, so it is read back. One batched
+   * read per subject table, not one per decision: the deadline sweep hands this up to five hundred
+   * at once. Reading here is safe because every caller runs this *after* its transaction has
+   * committed, which is the only place this module sends an announcement from; the rows are
+   * settled by then.
+   *
+   * Only the **approved** ones are read, which is what `status` is for. A rejection writes the
+   * subject's own row and stops — `applyLeaveDecision` and `applyRegularizationDecision` both do —
+   * so no punch was voided and no leave day became `approved`, and every reader of those days
+   * (`services/reports.ts`, `services/attendance.ts`) filters on that word.
+   */
+  const approvedSubjectIds = (subjectType: string) =>
+    decisions.filter((d) => d.subjectType === subjectType && d.status === 'approved').map((d) => d.subjectId)
+  const regularizationIds = approvedSubjectIds('regularization')
+  const leaveIds = approvedSubjectIds('leave')
+  const personOfRegularization = new Map<string, string>()
+  const personOfLeave = new Map<string, string>()
+  if (regularizationIds.length || leaveIds.length)
+    await kernel.database.withWorkspace(workspaceId, async (tx) => {
+      if (regularizationIds.length) {
+        const rows = await tx
+          .select({ id: regularizations.id, personId: regularizations.personId })
+          .from(regularizations)
+          .where(
+            and(eq(regularizations.workspaceId, workspaceId), inArray(regularizations.id, regularizationIds)),
+          )
+        for (const row of rows) personOfRegularization.set(row.id, row.personId)
+      }
+      if (leaveIds.length) {
+        const rows = await tx
+          .select({ id: leaveRequests.id, personId: leaveRequests.personId })
+          .from(leaveRequests)
+          .where(and(eq(leaveRequests.workspaceId, workspaceId), inArray(leaveRequests.id, leaveIds)))
+        for (const row of rows) personOfLeave.set(row.id, row.personId)
+      }
+    })
+
+  /**
+   * Every frame the batch owes, collected before any of it is sent.
+   *
+   * One frame is a *workspace-wide* invalidation — `@kernhq/ui` turns it into
+   * `invalidateQueries({ queryKey: [module, entity] })` on every open tab — so a sweep that
+   * decides five hundred leaves would publish five hundred identical `leave_balance` frames and
+   * ask every screen in the workspace to refetch five hundred times for one answer. The entity and
+   * the id are what make a frame distinct, so the pair is what is kept.
+   */
+  const frames = new Map<string, { entity: string; id: string }>()
+  const announce = (entity: string, id: string) => frames.set(`${entity}:${id}`, { entity, id })
+
+  for (const decision of decisions) {
+    if (decision.subjectType === 'leave') {
+      announce('leave_request', decision.subjectId)
+      // A balance is announced under the workspace rather than under a row, because that is how
+      // every other balance movement in this file announces itself — see `accrual.run`. A rejection
+      // announces it too, and not defensively: `services/reports.ts` sums the live `pending` and
+      // `approved` requests on top of the ledger, so leaving `pending` moves the number by itself.
+      announce('leave_balance', workspaceId)
+      // The day sheets are a third prefix again. An approval moves `leave_request_days` to
+      // `approved`, which is the leg `services/reports.ts` left-joins to tell an absence from a day
+      // off — and that report is keyed under `attendance_day`, where no leave frame ever lands.
+      const personId = personOfLeave.get(decision.subjectId)
+      if (personId) announce('attendance_day', personId)
+    } else if (decision.subjectType === 'regularization') {
+      announce('regularization', decision.subjectId)
+      // Only where the correction was applied: the map holds the approved ones alone, because a
+      // rejected correction voided no punch and rebuilt no day.
+      const personId = personOfRegularization.get(decision.subjectId)
+      if (personId) announce('attendance_day', personId)
+    }
+  }
+
+  for (const { entity, id } of frames.values())
+    await kernel.realtime.change(workspaceId, { module: MODULE_ID, entity, id, op: 'updated' })
+}
+
+/**
  * The router.
  *
  * Three middlewares, and `module.test.ts` fails if any is missing where it belongs:
@@ -3163,6 +3264,12 @@ export function implement_(kernel: Kernel) {
               })
             }
             await changed(input.workspaceId, 'regularization', filed.row.id, 'created')
+            // A chain that resolved to nobody applied the correction inside the transaction above:
+            // punches voided, punches written, the day rebuilt. None of the screens showing that
+            // day sit under `regularization`. Announced here rather than through
+            // `announceDecisionSubjects`, which would repeat the frame on the line above.
+            if (filed.row.status === 'approved')
+              await changed(input.workspaceId, 'attendance_day', filed.row.personId, 'updated')
             return toRegularization(filed.row)
           }),
       },
@@ -4080,6 +4187,12 @@ export function implement_(kernel: Kernel) {
               })
             }
             await changed(input.workspaceId, 'leave_request', result.request.id, 'created')
+            // And the balances, which are a prefix of their own: a chain that resolved to nobody
+            // approved this on the way in and consumed the ledger, and even a request left pending
+            // moves what every balance screen shows — `services/reports.ts` sums the live `pending`
+            // requests alongside the ledger. Announced here rather than through
+            // `announceDecisionSubjects`, which would repeat the `leave_request` frame above.
+            await changed(input.workspaceId, 'leave_balance', input.workspaceId, 'updated')
             return toLeaveRequest(result.request)
           }),
 
@@ -4087,7 +4200,7 @@ export function implement_(kernel: Kernel) {
           .use(cap('leave'))
           .use(requires('hr.leave.request'))
           .handler(async ({ input, context }) => {
-            const row = await db.withWorkspace(input.workspaceId, async (tx) => {
+            const { row, approvalRequestId } = await db.withWorkspace(input.workspaceId, async (tx) => {
               const request = await loadRequest(tx, input.workspaceId, input.requestId)
               // A reason beside the sentence, because the sentence is English and the reason is what
               // a client can translate. Two states, not one: "withdrawn" is the requester taking it
@@ -4115,6 +4228,23 @@ export function implement_(kernel: Kernel) {
                       todayIso(),
                     )
 
+              // Read before it moves, because `approvals.cancel` updates by subject and returns
+              // nothing: the approvals inbox is keyed `['hr', 'approval', workspaceId, status]`,
+              // so without this id a request an approver is looking at goes on offering itself
+              // until they reload. Nothing to find for an approved request — the row it would have
+              // moved stopped being pending when it was decided.
+              const [inflight] = await tx
+                .select({ id: approvalRequests.id })
+                .from(approvalRequests)
+                .where(
+                  and(
+                    eq(approvalRequests.workspaceId, input.workspaceId),
+                    eq(approvalRequests.subjectType, 'leave'),
+                    eq(approvalRequests.subjectId, request.id),
+                    eq(approvalRequests.status, 'pending'),
+                  ),
+                )
+                .limit(1)
               await approvals.cancel(tx, input.workspaceId, 'leave', request.id)
               const next = request.status === 'approved' ? 'withdrawn' : 'cancelled'
               await tx
@@ -4126,7 +4256,7 @@ export function implement_(kernel: Kernel) {
                 .set({ status: next, decidedAt: new Date(), updatedAt: new Date() })
                 .where(eq(leaveRequests.id, request.id))
                 .returning()
-              return updated!
+              return { row: updated!, approvalRequestId: inflight?.id ?? null }
             })
             await kernel.emit(
               hrEvents.leaveDecided,
@@ -4141,6 +4271,14 @@ export function implement_(kernel: Kernel) {
               { workspaceId: input.workspaceId, actorId: context.principal.userId },
             )
             await changed(input.workspaceId, 'leave_request', row.id, 'updated')
+            // The reversal above wrote ledger entries, so every balance screen is out of date and
+            // none of them sit under `leave_request`. Required for a pending cancellation too, and
+            // not out of caution: `services/reports.ts` sums the live `pending` requests on top of
+            // the ledger, so withdrawing one before anybody decided it moves that column exactly as
+            // a reversal moves the ledger.
+            await changed(input.workspaceId, 'leave_balance', input.workspaceId, 'updated')
+            // And the approval it withdrew from under its approvers, if one was still in flight.
+            if (approvalRequestId) await changed(input.workspaceId, 'approval', approvalRequestId, 'updated')
             return toLeaveRequest(row)
           }),
       },
@@ -4316,6 +4454,17 @@ export function implement_(kernel: Kernel) {
           { workspaceId: input.workspaceId, actorId: context.principal.userId },
         )
         await changed(input.workspaceId, 'approval', outcome.request.id, 'updated')
+        // A request that is still pending moved nothing but itself — an intermediate step was
+        // signed off and the applier above never ran. A final one moved its subject, and the
+        // screens showing that subject are named after the subject, not after the approval.
+        if (outcome.request.status !== 'pending')
+          await announceDecisionSubjects(kernel, input.workspaceId, [
+            {
+              subjectType: outcome.request.subjectType,
+              subjectId: outcome.request.subjectId,
+              status: outcome.request.status,
+            },
+          ])
         return outcome.hydrated
       }),
 
@@ -5540,31 +5689,40 @@ export function implement_(kernel: Kernel) {
           }),
         ),
 
-        set: scoped.privacy.retention.set.use(requires('hr.privacy.manage')).handler(({ input, context }) =>
-          db.withWorkspace(input.workspaceId, async (tx) => {
-            const { retention, updatedAt, updatedBy, sweepEnabled } = await privacy.setRetention(
-              tx,
-              input.workspaceId,
-              input.retention,
-              context.principal.userId ?? null,
-              input.sweepEnabled,
-            )
-            // The counts are not recomputed on a write: a screen that has just changed a horizon
-            // asks for them again, and doing eight counts inside the write transaction would hold
-            // it open across the most expensive queries in this file.
-            return {
-              workspaceId: input.workspaceId,
-              classes: RETENTION_CLASSES.map((cls) => ({
-                class: cls,
-                days: retention[cls],
-                dueNow: null,
-              })),
-              updatedAt: updatedAt?.toISOString() ?? null,
-              updatedBy,
-              sweepEnabled,
-            }
+        set: scoped.privacy.retention.set
+          .use(requires('hr.privacy.manage'))
+          .handler(async ({ input, context }) => {
+            const settings = await db.withWorkspace(input.workspaceId, async (tx) => {
+              const { retention, updatedAt, updatedBy, sweepEnabled } = await privacy.setRetention(
+                tx,
+                input.workspaceId,
+                input.retention,
+                context.principal.userId ?? null,
+                input.sweepEnabled,
+              )
+              // The counts are not recomputed on a write: a screen that has just changed a horizon
+              // asks for them again, and doing eight counts inside the write transaction would hold
+              // it open across the most expensive queries in this file.
+              return {
+                workspaceId: input.workspaceId,
+                classes: RETENTION_CLASSES.map((cls) => ({
+                  class: cls,
+                  days: retention[cls],
+                  dueNow: null,
+                })),
+                updatedAt: updatedAt?.toISOString() ?? null,
+                updatedBy,
+                sweepEnabled,
+              }
+            })
+            // Announced as `retention_run`, and under the workspace id, because both are what the
+            // settings screen is keyed on: there is one settings row per workspace — `setRetention`
+            // upserts on `workspaceId` — and the screen deliberately rides the `retention_run`
+            // prefix so a sweep's counts refresh it. A horizon save changes the same card, so it
+            // announces the same thing; otherwise a second admin's save arrives only on a reload.
+            await changed(input.workspaceId, 'retention_run', input.workspaceId, 'updated')
+            return settings
           }),
-        ),
 
         /**
          * Sweep now, or preview one. The same code the nightly job runs, in one transaction.
